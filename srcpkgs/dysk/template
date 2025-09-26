@@ -1,0 +1,15 @@
+# Template file for 'dysk'
+pkgname=dysk
+version=3.1.0
+revision=1
+build_style=cargo
+cargo_bins="dysk"
+short_desc="Filesystem lister like df, but better"
+maintainer="Lars Grahmann <void@lars.earth>"
+license="MIT"
+homepage="https://dystroy.org/dysk"
+distfiles="https://github.com/Canop/dysk/archive/refs/tags/v${version}.tar.gz"
+checksum=dbf81a3f22282c6e9b3205b00c6e58e54d85e5ed163b1384076f4eb4aa4f5e0f
+
+hostmakedepends="cargo rust"
+archs="x86_64"
