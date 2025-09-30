@@ -1,23 +1,45 @@
-# Template file for 'lrc_tty'
 pkgname=lrc_tty
-version=0.4.2
+version=0.5
 revision=2
-hostmakedepends="zig pkg-config dbus-devel"
+hostmakedepends="pkg-config dbus-devel"
 depends="dbus-libs"
 nostrip=yes
 short_desc="Terminal lyric viewer for MPRIS players"
 maintainer="larsgrah <void@lars.earth>"
 license="GPL-3.0-only"
 homepage="https://github.com/larsgrah/lrc_tty"
-distfiles="https://github.com/larsgrah/lrc_tty/archive/refs/tags/v${version}.tar.gz"
-checksum=34ebf8771355083e54ed4ce151c890cf9740f95bbcd674cf2e8ee75a2143bde6
-wrksrc="${pkgname}-${version}"
+
+zig_ver=0.15.1
+_arch="${XBPS_TARGET_MACHINE%%-*}"; : "${_arch:=$(uname -m)}"
+case "$_arch" in
+  x86_64)  zig_url="https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz" ;;
+  aarch64) zig_url="https://ziglang.org/download/${zig_ver}/zig-aarch64-linux-${zig_ver}.tar.xz" ;;
+  *) echo "unsupported arch: $_arch"; return 1 ;;
+esac
+
+tag="v${version}"
+distfiles="
+ https://github.com/larsgrah/lrc_tty/archive/refs/tags/${tag}.tar.gz
+ ${zig_url}
+"
+
+checksum="fb1bfa68808361b029d879b4096b7070c7ece45d1289906265fa895ac77fab41
+ c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
+
+wrksrc="${pkgname}-${tag}"
 
 do_build() {
-	zig build -Doptimize=ReleaseSafe
+    if [ "${XBPS_TARGET_LIBC:-glibc}" = "musl" ]; then echo "upstream Zig binary needs glibc"; return 1; fi
+    zdir="$(ls -1d "$wrksrc"/../zig-*linux-"${zig_ver}" 2>/dev/null | head -n1)"
+    [ -n "$zdir" ] || { echo "Zig dir not found next to wrksrc; run: ./xbps-src -f extract ${pkgname}"; return 1; }
+    export PATH="$zdir:$PATH"
+    export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
+    zig version
+    cd lrc_tty-${version}
+    zig build -Doptimize=ReleaseSafe
 }
 
 do_install() {
-	vbin zig-out/bin/lrc_tty
+    vbin lrc_tty-${version}/zig-out/bin/lrc_tty
 }
 
