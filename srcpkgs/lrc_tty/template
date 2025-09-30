@@ -1,8 +1,9 @@
 # Template file for 'lrc_tty'
 pkgname=lrc_tty
 version=0.4.2
-revision=1
+revision=2
 hostmakedepends="zig pkg-config dbus-devel"
+depends="dbus-libs"
 nostrip=yes
 short_desc="Terminal lyric viewer for MPRIS players"
 maintainer="larsgrah <void@lars.earth>"
