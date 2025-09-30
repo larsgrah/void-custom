@@ -1,0 +1,41 @@
+# Template file for 'chef-workstation'
+pkgname=chef-workstation
+version=25.5.1084
+revision=1
+archs="x86_64"
+wrksrc="${pkgname}-${version}"
+short_desc="Chef Workstation (chef-run, chef, knife, etc.)"
+maintainer="Lars <void@lars.earth>"
+license="Apache-2.0"
+homepage="https://docs.chef.io/workstation/"
+distfiles="https://packages.chef.io/files/stable/${pkgname}/${version}/el/8/${pkgname}-${version}-1.el8.x86_64.rpm"
+checksum=b05a8326fccae06778e330e000466a2517e5ec946a5acde28d63c4707d4930df
+
+nocross=yes
+nopie=yes
+nossp=yes
+nostrip=yes
+python_version=3
+
+
+hostmakedepends="libarchive rpm cpio"
+
+do_install() {
+    local fname="${pkgname}-${version}-1.el8.x86_64.rpm"
+    local df="${XBPS_SRCDISTDIR}/${pkgname}-${version}/${fname}"
+
+    mkdir -p "${DESTDIR}"
+
+    if command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xf "$df" -C "${DESTDIR}"
+    else
+        ( cd "${DESTDIR}" && rpm2cpio "$df" | cpio -idmv )
+    fi
+
+    mkdir -p "${DESTDIR}/usr/bin"
+    for f in "${DESTDIR}/opt/${pkgname}/bin/"*; do
+        ln -sf "/opt/${pkgname}/bin/$(basename "$f")" \
+               "${DESTDIR}/usr/bin/$(basename "$f")"
+    done
+}
+
