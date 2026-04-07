@@ -1,13 +1,13 @@
-pkgname=lrc_tty
-version=0.6
+pkgname=jmusic
+version=0.1.0
 revision=1
-hostmakedepends="pkg-config dbus-devel"
-depends="dbus-libs"
+hostmakedepends="pkg-config gtk4-devel"
+depends="gtk4"
 nostrip=yes
-short_desc="Terminal lyric viewer for MPRIS players"
+short_desc="Music player with album grid UI and MPRIS support"
 maintainer="larsgrah <void@lars.earth>"
 license="GPL-3.0-only"
-homepage="https://github.com/larsgrah/lrc_tty"
+homepage="https://github.com/larsgrah/jmusic"
 
 zig_ver=0.15.1
 _arch="${XBPS_TARGET_MACHINE%%-*}"; : "${_arch:=$(uname -m)}"
@@ -19,11 +19,11 @@ esac
 
 tag="v${version}"
 distfiles="
- https://github.com/larsgrah/lrc_tty/archive/refs/tags/${tag}.tar.gz
+ https://github.com/larsgrah/jmusic/archive/refs/tags/${tag}.tar.gz
  ${zig_url}
 "
 
-checksum="6cf5d568f72c5c2db996197d8bc39aef839beb75462b1feef369b14d777bfece
+checksum="011515a018a2f6f8a8c0f83b84d30e6efdadef04c5f7396eef2e29797d732d05
  c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
 
 do_build() {
@@ -33,11 +33,11 @@ do_build() {
     export PATH="$zdir:$PATH"
     export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
     zig version
-    cd lrc_tty-${version}
+    cd jmusic-${version}
     zig build -Doptimize=ReleaseSafe
 }
 
 do_install() {
-    vbin lrc_tty-${version}/zig-out/bin/lrc_tty
+    vbin jmusic-${version}/zig-out/bin/jmusic
+    vinstall jmusic-${version}/assets/jmusic.desktop 644 usr/share/applications
 }
-
