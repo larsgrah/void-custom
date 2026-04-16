@@ -1,5 +1,5 @@
 pkgname=jmusic
-version=0.1.0
+version=0.3.0
 revision=1
 hostmakedepends="pkg-config gtk4-devel"
 depends="gtk4"
@@ -23,7 +23,7 @@ distfiles="
  ${zig_url}
 "
 
-checksum="011515a018a2f6f8a8c0f83b84d30e6efdadef04c5f7396eef2e29797d732d05
+checksum="901b0331527e786cadec5697fd5ea18cfa650dc136f92784d891e22ee007a0d8
  c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
 
 do_build() {
