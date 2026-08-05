@@ -1,0 +1,51 @@
+--- a/src/render/decorations/CHyprGroupBarDecoration.hpp
++++ b/src/render/decorations/CHyprGroupBarDecoration.hpp
+@@ -60,8 +60,16 @@
+ 
+     std::optional<bool>       m_bLastVisibilityStatus;
+ 
++    // the title textures are rendered with pango and are the single most
++    // expensive thing the group bar does, so they are kept between frames.
++    // they are keyed on the title alone, so a change in scale or bar width
++    // has to drop them wholesale
++    float                     m_lastTexScale    = 0.0F;
++    float                     m_lastTexBarWidth = 0.0F;
++
+     CTitleTex*                textureFromTitle(const std::string&);
+     void                      invalidateTextures();
++    void                      pruneUnusedTextures();
+ 
+     CBox                      assignedBoxGlobal();
+     bool                      visible();
+--- a/src/render/decorations/CHyprGroupBarDecoration.cpp
++++ b/src/render/decorations/CHyprGroupBarDecoration.cpp
+@@ -266,8 +266,27 @@
+             xoff += *PINNERGAP + m_barWidth;
+     }
+ 
+-    if (*PRENDERTITLES)
+-        invalidateTextures();
++    if (*PRENDERTITLES) {
++        // upstream clears every title texture here, so the next frame
++        // re-renders every label through pango again. with a group on
++        // screen that is most of hyprland's idle cpu. keep them and drop
++        // only the ones that left the group, so the cache stays bounded
++        if (m_lastTexScale != pMonitor->m_scale || m_lastTexBarWidth != m_barWidth) {
++            m_lastTexScale    = pMonitor->m_scale;
++            m_lastTexBarWidth = m_barWidth;
++            invalidateTextures();
++        } else
++            pruneUnusedTextures();
++    }
++}
++
++void CHyprGroupBarDecoration::pruneUnusedTextures() {
++    std::erase_if(m_titleTexs.titleTexs, [this](const auto& tex) {
++        return std::ranges::none_of(m_dwGroupMembers, [&tex](const auto& ref) {
++            const auto W = ref.lock();
++            return W && W->m_title == tex->m_content;
++        });
++    });
+ }
+ 
+ CTitleTex* CHyprGroupBarDecoration::textureFromTitle(const std::string& title) {

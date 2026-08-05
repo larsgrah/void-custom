@@ -4554,7 +4554,7 @@ libhyprgraphics.so.4 hyprgraphics-0.5.1_1
 liblua5.5.so.5.5 lua55-5.5.0_1
 libsdbus-c++.so.2 sdbus-cpp-2.1.0_1
 libhyprwire.so.3 hyprwire-0.3.1_1
-libhyprutils.so.12 hyprutils-0.13.1_1
-libaquamarine.so.11 aquamarine-0.12.1_1
+libhyprutils.so.13 hyprutils-0.14.0_1
+libaquamarine.so.13 aquamarine-0.14.0_1
 libglslang.so.16 glslang-16.3.0_1
 libglslang-default-resource-limits.so.16 glslang-16.3.0_1
