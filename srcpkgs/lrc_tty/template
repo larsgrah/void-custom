@@ -1,5 +1,5 @@
 pkgname=lrc_tty
-version=0.6
+version=0.7
 revision=1
 hostmakedepends="pkg-config dbus-devel"
 depends="dbus-libs"
@@ -9,11 +9,13 @@ maintainer="larsgrah <void@lars.earth>"
 license="GPL-3.0-only"
 homepage="https://github.com/larsgrah/lrc_tty"
 
-zig_ver=0.15.1
+zig_ver=0.16.0
 _arch="${XBPS_TARGET_MACHINE%%-*}"; : "${_arch:=$(uname -m)}"
 case "$_arch" in
-  x86_64)  zig_url="https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz" ;;
-  aarch64) zig_url="https://ziglang.org/download/${zig_ver}/zig-aarch64-linux-${zig_ver}.tar.xz" ;;
+  x86_64)  zig_url="https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz"
+           zig_sum="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" ;;
+  aarch64) zig_url="https://ziglang.org/download/${zig_ver}/zig-aarch64-linux-${zig_ver}.tar.xz"
+           zig_sum="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17" ;;
   *) echo "unsupported arch: $_arch"; return 1 ;;
 esac
 
@@ -23,8 +25,8 @@ distfiles="
  ${zig_url}
 "
 
-checksum="6cf5d568f72c5c2db996197d8bc39aef839beb75462b1feef369b14d777bfece
- c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
+checksum="7a095bf006d8c30260588c9c8ce8d64addabb1069d53756a6802fa9a7c5c2452
+ ${zig_sum}"
 
 do_build() {
     if [ "${XBPS_TARGET_LIBC:-glibc}" = "musl" ]; then echo "upstream Zig binary needs glibc"; return 1; fi
