@@ -1,6 +1,6 @@
 # Template file for 'lrc_tty'
 pkgname=lrc_tty
-version=0.7
+version=0.8
 revision=1
 hostmakedepends="pkg-config zig-bin"
 makedepends="dbus-devel"
@@ -11,7 +11,7 @@ maintainer="larsgrah <void@lars.earth>"
 license="GPL-3.0-only"
 homepage="https://github.com/larsgrah/lrc_tty"
 distfiles="https://github.com/larsgrah/lrc_tty/archive/refs/tags/v${version}.tar.gz"
-checksum="7a095bf006d8c30260588c9c8ce8d64addabb1069d53756a6802fa9a7c5c2452"
+checksum="ebd414777074b24a7bcabe57c7c1e3c3a726cef05fafe0484ce0977e2ef052c4"
 
 do_build() {
     export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
