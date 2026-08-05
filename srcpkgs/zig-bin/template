@@ -1,0 +1,35 @@
+# Template file for 'zig-bin'
+pkgname=zig-bin
+version=0.16.0
+revision=1
+archs="x86_64 aarch64"
+short_desc="Zig compiler toolchain (upstream binary build)"
+maintainer="larsgrah <void@lars.earth>"
+license="MIT"
+homepage="https://ziglang.org"
+nostrip=yes
+
+# void only ships zig 0.13.0, so pull the upstream binary instead
+_arch="${XBPS_TARGET_MACHINE%%-*}"; : "${_arch:=$(uname -m)}"
+case "$_arch" in
+  x86_64)
+    distfiles="https://ziglang.org/download/${version}/zig-x86_64-linux-${version}.tar.xz"
+    checksum="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+    ;;
+  aarch64)
+    distfiles="https://ziglang.org/download/${version}/zig-aarch64-linux-${version}.tar.xz"
+    checksum="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+    ;;
+esac
+wrksrc="zig-${_arch}-linux-${version}"
+
+if [ "${XBPS_TARGET_LIBC}" = "musl" ]; then
+    broken="upstream Zig binary needs glibc"
+fi
+
+do_install() {
+    vbin zig
+    vmkdir usr/lib/zig
+    vcopy "lib/*" usr/lib/zig
+    vlicense LICENSE
+}
