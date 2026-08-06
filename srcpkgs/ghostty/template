@@ -1,0 +1,71 @@
+# Template file for 'ghostty'
+pkgname=ghostty
+version=1.3.1
+revision=1
+# gettext is for msgfmt. 1.3 ships translations and 1.1.3 did not, so the
+# old void template got away without it
+hostmakedepends="pkg-config glib-devel pandoc gettext zig0.15-bin"
+# oniguruma and gtk4-layer-shell are new in 1.3. --system links deps
+# dynamically, and zig resolves these through pkg-config, so it is the .pc
+# files in the -devel packages that matter. without them zig falls back to
+# guessing filenames and looks for liboniguruma.so, which nothing ships
+makedepends="fontconfig-devel freetype-devel harfbuzz-devel gtk4-devel
+ libadwaita-devel oniguruma-devel gtk4-layer-shell-devel"
+depends="ghostty-terminfo-${version}_${revision}"
+short_desc="Fast and feature-rich terminal emulator that uses GPU acceleration"
+maintainer="larsgrah <void@lars.earth>"
+license="MIT"
+homepage="https://ghostty.org/"
+# the release tarball, not the github archive. upstream PACKAGING.md is
+# explicit that the two are not the same: this one ships preprocessed files
+# so the build needs fewer dependencies
+distfiles="https://release.files.ghostty.org/${version}/ghostty-${version}.tar.gz"
+checksum=3349d25600ffbda281197a18314f7d18791969cffe9474f0ff16a45a9ebfccdb
+
+# void's ghostty is 1.1.3, which segfaults in gtk_widget_unparent on every
+# exit. apprt.gtk.Window.deinit() unparents a context menu that was never
+# shown, so it is already disposed with ref_count 0. upstream fixed it in
+# the context menu rework in PR #5781, after 1.1.3. see
+# shell-and-terminal.md in the madrid repo for the measurements.
+#
+# not build_style=zig-build: that calls plain "zig", which is 0.13 here.
+
+do_build() {
+    # both the fetch script and the build call "zig" unqualified, so put
+    # 0.15 in front on PATH rather than patching them
+    mkdir -p "${wrksrc}/.zigbin"
+    ln -sf /usr/lib/zig0.15/zig "${wrksrc}/.zigbin/zig"
+    export PATH="${wrksrc}/.zigbin:${PATH}"
+
+    # step 1 of PACKAGING.md, the only part that wants the network. zig
+    # build --fetch still misses transitive deps, which is why upstream
+    # ships this script
+    export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-offline-cache"
+    ./nix/build-support/fetch-zig-cache.sh
+
+    # step 2, offline. --system points at the fetched cache and also makes
+    # the deps link dynamically
+    # without version-string the tarball build has no git metadata to read
+    # and reports itself as 1.3.1-dev+0000000 on channel tip
+    DESTDIR="${wrksrc}/zig-out" zig build \
+        -j"${XBPS_MAKEJOBS}" \
+        --prefix /usr \
+        --system "${ZIG_GLOBAL_CACHE_DIR}/p" \
+        -Doptimize=ReleaseFast \
+        -Dcpu=baseline \
+        -Dversion-string="${version}"
+}
+
+do_install() {
+    # zig has a single install step and already staged a full tree
+    vcopy "zig-out/usr" .
+    vlicense LICENSE
+    rm -f "${DESTDIR}/usr/share/man/.placeholder"
+}
+
+ghostty-terminfo_package() {
+	short_desc+=" - terminfo data"
+	pkg_install() {
+		vmove usr/share/terminfo
+	}
+}
