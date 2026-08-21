@@ -1,0 +1,25 @@
+# Template file for 'onnxruntime-bin'
+pkgname=onnxruntime-bin
+version=1.27.1
+revision=1
+archs="x86_64"
+short_desc="Cross-platform inference accelerator for ONNX models (upstream binary build)"
+maintainer="Lars Grahmann <void@lars.earth>"
+license="MIT"
+homepage="https://onnxruntime.ai"
+# upstream's own linux-x64 build. from source this is a multi-hour cmake with
+# a vendored protobuf and its own toolchain expectations, and the only thing
+# here that wants it is sherpa-onnx, on the plain cpu provider
+distfiles="https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-linux-x64-${version}.tgz"
+checksum=25b1ef1fea1acd210d63f8f24dc870ad6e077795ce1f54876252c6d3803c15af
+wrksrc="onnxruntime-linux-x64-${version}"
+nostrip=yes
+
+do_install() {
+	vmkdir usr/lib
+	vcopy "lib/libonnxruntime.so*" usr/lib
+	vcopy "lib/libonnxruntime_providers_shared.so" usr/lib
+	vmkdir usr/include/onnxruntime
+	vcopy "include/*" usr/include/onnxruntime
+	vlicense LICENSE
+}

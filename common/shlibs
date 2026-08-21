@@ -4558,3 +4558,5 @@ libhyprutils.so.13 hyprutils-0.14.0_1
 libaquamarine.so.13 aquamarine-0.14.0_1
 libglslang.so.16 glslang-16.3.0_1
 libglslang-default-resource-limits.so.16 glslang-16.3.0_1
+libonnxruntime.so.1 onnxruntime-bin-1.27.1_1
+libonnxruntime_providers_shared.so onnxruntime-bin-1.27.1_1
