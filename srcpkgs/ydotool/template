@@ -1,0 +1,19 @@
+# Template file for 'ydotool'
+pkgname=ydotool
+version=1.0.4
+revision=1
+build_style=cmake
+hostmakedepends="pkg-config scdoc"
+short_desc="Generic command-line automation tool for Wayland"
+maintainer="Lars Grahmann <void@lars.earth>"
+license="AGPL-3.0-or-later"
+homepage="https://github.com/ReimuNotMoe/ydotool"
+distfiles="https://github.com/ReimuNotMoe/ydotool/archive/refs/tags/v${version}.tar.gz"
+checksum=ba075a43aa6ead51940e892ecffa4d0b8b40c241e4e2bc4bd9bd26b61fde23bd
+
+post_install() {
+	# no systemd here, ydotoold gets started from the session instead
+	rm -rf ${DESTDIR}/usr/lib/systemd
+	vinstall ${FILESDIR}/99-uinput.rules 644 usr/lib/udev/rules.d
+	vlicense LICENSE
+}

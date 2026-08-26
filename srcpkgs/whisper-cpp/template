@@ -1,0 +1,26 @@
+# Template file for 'whisper-cpp'
+pkgname=whisper-cpp
+version=1.9.3
+revision=1
+build_style=cmake
+hostmakedepends="shaderc pkg-config"
+makedepends="vulkan-loader-devel Vulkan-Headers SPIRV-Headers"
+# ggml's -march=native gets overridden by our CFLAGS, so pick the ISA by hand.
+# avx2/fma/f16c/bmi2 is the zen3 baseline, no avx512 on a 5950X
+configure_args="-DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF
+ -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=ON -DWHISPER_SDL2=OFF
+ -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+ -DGGML_BMI2=ON -DGGML_VULKAN=ON"
+short_desc="Port of OpenAI's Whisper speech recognition model in C/C++"
+maintainer="Lars Grahmann <void@lars.earth>"
+license="MIT"
+homepage="https://github.com/ggml-org/whisper.cpp"
+distfiles="https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${version}.tar.gz"
+checksum=1650f884effba487025143bd8facd2f9fb40a83b3737a732803c67a8d659d9c0
+archs="x86_64"
+
+post_install() {
+	# static build, so the headers and cmake glue would point at nothing
+	rm -rf ${DESTDIR}/usr/include ${DESTDIR}/usr/lib
+	vlicense LICENSE
+}

@@ -1,0 +1,21 @@
+--- a/src/voxd/models.py
++++ b/src/voxd/models.py
+@@ -151,10 +151,14 @@
+         raise RuntimeError("Checksum mismatch – download corrupted, retried later.")
+ 
+     # keep a symlink inside whisper.cpp/models for people who call the CLI manually
+-    REPO_MODELS.mkdir(parents=True, exist_ok=True)
+-    link = REPO_MODELS / dest.name
+-    if not link.exists():
+-        link.symlink_to(dest)
++    # a system install lands under /usr, so just skip it when that is not writable
++    try:
++        REPO_MODELS.mkdir(parents=True, exist_ok=True)
++        link = REPO_MODELS / dest.name
++        if not link.exists():
++            link.symlink_to(dest)
++    except OSError:
++        pass
+     return dest
+ 
+ 

@@ -1,0 +1,80 @@
+--- a/src/voxd/core/typer.py
++++ b/src/voxd/core/typer.py
+@@ -91,11 +91,16 @@
+ 
+         # Try to find the best tool regardless of backend detection issues
+         if self.backend == "wayland":
+-            path = _which("ydotool")
+-            if path:
+-                self.tool = path
+-                return True
+-            print("[typer] ⚠️ ydotool not found in PATH or common dirs for Wayland.")
++            # wtype first. it uploads its own keymap over the virtual keyboard
++            # protocol, so it types the right characters on a non-us layout.
++            # ydotool goes through uinput and assumes the compositor is on us,
++            # which swaps y/z and mangles symbols on a german layout
++            for name in ("wtype", "ydotool"):
++                path = _which(name)
++                if path:
++                    self.tool = path
++                    return True
++            print("[typer] ⚠️ neither wtype nor ydotool found in PATH or common dirs for Wayland.")
+         elif self.backend == "x11":
+             path = _which("xdotool")
+             if path:
+@@ -107,14 +112,14 @@
+         
+         # Fallback: if backend detection failed or tool not found, try both tools
+         # Priority: ydotool first (more modern), then xdotool
+-        for tool_name in ["ydotool", "xdotool"]:
++        for tool_name in ["wtype", "ydotool", "xdotool"]:
+             path = _which(tool_name)
+             if path:
+                 self.tool = path
+                 print(f"[typer] Found {tool_name} at {path}, using as fallback.")
+                 return True
+         
+-        print("[typer] ⚠️ No typing tools found (tried ydotool and xdotool). Typing disabled.")
++        print("[typer] ⚠️ No typing tools found (tried wtype, ydotool and xdotool). Typing disabled.")
+         return False
+ 
+     def _check_ydotool_daemon(self):
+@@ -279,7 +284,9 @@
+ 
+         verbo(f"[typer] Typing transcript using {self.tool}...")
+         tool_name = os.path.basename(self.tool) if self.tool else ""
+-        if tool_name == "ydotool" and self.tool:
++        if tool_name == "wtype" and self.tool:
++            self._run_tool([self.tool, "-d", self.delay_str, "--", t])
++        elif tool_name == "ydotool" and self.tool:
+             self._run_tool([self.tool, "type", "-d", self.delay_str, t])
+         elif tool_name == "xdotool" and self.tool:
+             self._run_tool([self.tool, "type", "--delay", self.delay_str, t])
+@@ -321,7 +328,15 @@
+         try:
+             tool_name = os.path.basename(self.tool) if self.tool else ""
+             
+-            if "xdotool" in tool_name:
++            if "wtype" in tool_name:
++                if use_ctrl_v:
++                    keys = ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
++                else:
++                    keys = ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
++                subprocess.run([self.tool] + keys,
++                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++                               timeout=5)
++            elif "xdotool" in tool_name:
+                 subprocess.run(
+                     ["xdotool", "key", "--clearmodifiers", paste_keys],
+                     stdout=subprocess.DEVNULL,
+@@ -375,7 +390,9 @@
+ 
+         verbo(f"[typer] Typing transcript character-by-character using {self.tool}...")
+         tool_name = os.path.basename(self.tool) if self.tool else ""
+-        if tool_name == "ydotool" and self.tool:
++        if tool_name == "wtype" and self.tool:
++            self._run_tool([self.tool, "-d", "10", "--", t])  # Use 10ms delay for fallback
++        elif tool_name == "ydotool" and self.tool:
+             self._run_tool([self.tool, "type", "-d", "10", t])  # Use 10ms delay for fallback
+         elif tool_name == "xdotool" and self.tool:
+             self._run_tool([self.tool, "type", "--delay", "10", t])  # Use 10ms delay for fallback

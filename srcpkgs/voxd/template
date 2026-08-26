@@ -1,0 +1,25 @@
+# Template file for 'voxd'
+pkgname=voxd
+version=1.7.0
+revision=3
+build_style=python3-pep517
+hostmakedepends="hatchling python3-build python3-installer python3-wheel"
+depends="whisper-cpp wtype ydotool wl-clipboard python3-sounddevice python3-numpy
+ python3-requests python3-yaml python3-psutil python3-pyperclip python3-tqdm
+ python3-platformdirs python3-pyqt6 python3-pyqt6-gui python3-pyqt6-widgets
+ python3-pyqt6-svg python3-pyqtgraph python3-tkinter"
+short_desc="Speech-to-text voice typing for Linux"
+maintainer="Lars Grahmann <void@lars.earth>"
+license="MIT"
+homepage="https://github.com/jakovius/voxd"
+distfiles="https://github.com/jakovius/voxd/archive/refs/tags/v${version}.tar.gz"
+checksum=a3a9c253f64bcf91794b217b32d96c0909d29f2830a0d53ddb0731ef7c21ecba
+
+post_patch() {
+	# upstream ships a placeholder version that pep440 rejects
+	vsed -i pyproject.toml -e "s/^version = .*/version = \"${version}\"/"
+}
+
+post_install() {
+	vlicense LICENSE
+}
