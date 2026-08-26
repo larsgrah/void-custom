@@ -1,7 +1,7 @@
 # Template file for 'ghostty'
 pkgname=ghostty
 version=1.3.1
-revision=1
+revision=2
 # gettext is for msgfmt. 1.3 ships translations and 1.1.3 did not, so the
 # old void template got away without it
 hostmakedepends="pkg-config glib-devel pandoc gettext zig0.15-bin"
@@ -27,6 +27,13 @@ checksum=3349d25600ffbda281197a18314f7d18791969cffe9474f0ff16a45a9ebfccdb
 # shown, so it is already disposed with ref_count 0. upstream fixed it in
 # the context menu rework in PR #5781, after 1.1.3. see
 # shell-and-terminal.md in the madrid repo for the measurements.
+#
+# patches/fractional-wheel-ticks.patch: Surface.zig rounded every non
+# precision wheel delta up to a whole tick, which is right on macos and wrong
+# everywhere else. a high resolution wheel reports 1/120ths of a detent and
+# gdk passes the fraction through, so the clamp made scroll speed depend on
+# how many events arrived rather than how far the wheel turned. see the
+# autoscroll section of the madrid repo.
 #
 # not build_style=zig-build: that calls plain "zig", which is 0.13 here.
 

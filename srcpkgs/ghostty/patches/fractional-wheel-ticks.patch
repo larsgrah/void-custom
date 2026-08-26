@@ -1,0 +1,28 @@
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -3407,10 +3407,21 @@
+             // magnitude of 0.1 which would normally require a few clicks
+             // before we register an actual scroll event (depending on cell
+             // height and the mouse_scroll_multiplier setting).
+-            const yoff_max: f64 = if (yoff > 0)
+-                @max(yoff, 1)
+-            else
+-                @min(yoff, -1);
++            //
++            // Only macos does that. On other platforms a fractional tick is a
++            // real fraction: a high resolution wheel reports REL_WHEEL_HI_RES
++            // in 1/120ths of a detent, and libinput and GDK pass that through
++            // as a fractional delta. Rounding it up to a whole tick throws the
++            // resolution away and makes the speed depend on how many events
++            // arrive rather than on how far the wheel actually turned, so a
++            // free spinning wheel or an injected scroll stream runs away.
++            //
++            // pending_scroll_y below already accumulates sub-cell amounts, so
++            // leaving the fraction alone is all that is needed for it to add
++            // up correctly.
++            const yoff_max: f64 = if (comptime builtin.os.tag == .macos) macos: {
++                break :macos if (yoff > 0) @max(yoff, 1) else @min(yoff, -1);
++            } else yoff;
+ 
+             break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
+         };
