@@ -1,0 +1,3 @@
+#!/bin/sh
+# force libsecret backend, chromium doesn't recognize sway and falls back to plaintext
+exec /usr/lib/claude-desktop/claude-desktop --password-store=gnome-libsecret "$@"

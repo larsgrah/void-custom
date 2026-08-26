@@ -1,0 +1,26 @@
+# Template file for 'claude-desktop'
+pkgname=claude-desktop
+version=1.37937.1
+revision=1
+archs="x86_64"
+create_wrksrc=yes
+depends="gtk+3 libnotify nss xdg-utils at-spi2-core libdrm libgbm libxcb
+ libsecret libXtst libuuid alsa-lib xdg-desktop-portal"
+short_desc="Desktop application for Claude.ai"
+maintainer="lars <lars.grahmann@googlemail.com>"
+license="custom:Proprietary"
+homepage="https://claude.ai"
+distfiles="https://downloads.claude.ai/claude-desktop/apt/stable/pool/main/c/claude-desktop/claude-desktop_${version}_amd64.deb"
+checksum=66bbc61dd0464b550c4d63812520119e8344b462541de44797352b8918842f4f
+repository=nonfree
+restricted=yes
+nostrip=yes
+
+do_install() {
+	vcopy usr /
+	# suid sandbox, same as the deb postinst
+	chmod 4755 ${DESTDIR}/usr/lib/claude-desktop/chrome-sandbox
+	# replace symlink with wrapper that forces the libsecret backend
+	rm ${DESTDIR}/usr/bin/claude-desktop
+	vbin ${FILESDIR}/claude-desktop
+}
