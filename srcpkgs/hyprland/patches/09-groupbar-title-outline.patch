@@ -1,0 +1,134 @@
+--- a/src/config/values/ConfigValues.cpp
++++ b/src/config/values/ConfigValues.cpp
+@@ -459,6 +459,8 @@ std::vector<SP<IValue>> Values::getConfigValues() {
+         MS<Color>("group:groupbar:text_color_inactive", "color for inactive windows' titles in the groupbar", -1),
+         MS<Color>("group:groupbar:text_color_locked_active", "color for the active window's title in a locked group", -1),
+         MS<Color>("group:groupbar:text_color_locked_inactive", "color for inactive windows' titles in locked groups", -1),
++        MS<Int>("group:groupbar:text_outline", "width in px of an outline drawn around groupbar titles, 0 disables it", 0, {.min = 0, .max = 8}),
++        MS<Color>("group:groupbar:text_outline_color", "color of the outline drawn around groupbar titles", 0xff000000),
+         MS<Gradient>("group:groupbar:col.active", "active group border color", 0x66ffff00),
+         MS<Gradient>("group:groupbar:col.inactive", "inactive (out of focus) group border color", 0x66777700),
+         MS<Gradient>("group:groupbar:col.locked_active", "active locked group border color", 0x66ff5500),
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -1547,7 +1547,8 @@ void IHyprRenderer::initAssets() {
+     m_screencopyDeniedTexture = renderText("Permission denied to share screen", Colors::WHITE, 20);
+ }
+ 
+-SP<ITexture> IHyprRenderer::renderText(const std::string& text, CHyprColor col, int pt, bool italic, const std::string& fontFamily, int maxWidth, int weight) {
++SP<ITexture> IHyprRenderer::renderText(const std::string& text, CHyprColor col, int pt, bool italic, const std::string& fontFamily, int maxWidth, int weight, int outline,
++                                       CHyprColor outlineCol) {
+     static auto           FONT = CConfigValue<std::string>("misc:font_family");
+ 
+     const auto            FONTFAMILY = fontFamily.empty() ? *FONT : fontFamily;
+@@ -1574,14 +1575,27 @@ SP<ITexture> IHyprRenderer::renderText(const std::string& text, CHyprColor col,
+ 
+     PangoRectangle rectInk = {}, rectLog = {};
+     pango_layout_get_pixel_extents(layoutText, &rectInk, &rectLog);
+-    int  textW = std::max(rectLog.width, rectInk.x + rectInk.width);
+-    int  textH = std::max(rectLog.height, rectInk.y + rectInk.height);
++    // the halo grows outward from the glyphs, so it needs room on every side
++    int  textW = std::max(rectLog.width, rectInk.x + rectInk.width) + (2 * outline);
++    int  textH = std::max(rectLog.height, rectInk.y + rectInk.height) + (2 * outline);
+ 
+     auto CAIROSURFACE = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, textW, textH);
+     auto CAIRO        = cairo_create(CAIROSURFACE);
+ 
++    cairo_move_to(CAIRO, outline, outline);
++
++    if (outline > 0) {
++        // stroke the glyph outlines at twice the width first, half of it ends
++        // up under the fill, so the letterform is not thinned
++        pango_cairo_layout_path(CAIRO, layoutText);
++        cairo_set_source_rgba(CAIRO, outlineCol.r, outlineCol.g, outlineCol.b, outlineCol.a);
++        cairo_set_line_width(CAIRO, 2 * outline);
++        cairo_set_line_join(CAIRO, CAIRO_LINE_JOIN_ROUND);
++        cairo_stroke(CAIRO);
++        cairo_move_to(CAIRO, outline, outline);
++    }
++
+     cairo_set_source_rgba(CAIRO, COLOR.r, COLOR.g, COLOR.b, COLOR.a);
+-    cairo_move_to(CAIRO, 0, 0);
+     pango_cairo_show_layout(CAIRO, layoutText);
+ 
+     pango_font_description_free(pangoFD);
+--- a/src/render/Renderer.hpp
++++ b/src/render/Renderer.hpp
+@@ -175,7 +175,7 @@ namespace Render {
+         virtual SP<ITexture>         createTexture(std::span<const float> lut3D, size_t N)                                                                                     = 0;
+         virtual SP<ITexture>         createTexture(const SP<Aquamarine::IBuffer> buffer, bool keepDataCopy = false);
+         virtual SP<ITexture>         renderText(const std::string& text, CHyprColor col, int pt, bool italic = false, const std::string& fontFamily = "", int maxWidth = 0,
+-                                                int weight = 400);
++                                                int weight = 400, int outline = 0, CHyprColor outlineCol = CHyprColor{0.F, 0.F, 0.F, 1.F});
+         virtual SP<ITexture>         renderText(Hyprgraphics::CTextResource::STextResourceData&& data);
+         SP<ITexture>                 loadAsset(const std::string& filename);
+         virtual bool                 shouldUseNewBlurOptimizations(PHLLS pLayer, PHLWINDOW pWindow);
+--- a/src/render/decorations/CHyprGroupBarDecoration.cpp
++++ b/src/render/decorations/CHyprGroupBarDecoration.cpp
+@@ -131,6 +131,8 @@ void CHyprGroupBarDecoration::draw(PHLMONITOR pMonitor, float const& a) {
+     static auto PKEEPUPPERGAP              = CConfigValue<Config::INTEGER>("group:groupbar:keep_upper_gap");
+     static auto PTEXTOFFSET                = CConfigValue<Config::INTEGER>("group:groupbar:text_offset");
+     static auto PTEXTPADDING               = CConfigValue<Config::INTEGER>("group:groupbar:text_padding");
++    static auto PTEXTOUTLINE               = CConfigValue<Config::INTEGER>("group:groupbar:text_outline");
++    static auto PTEXTOUTLINECOLOR          = CConfigValue<Config::INTEGER>("group:groupbar:text_outline_color");
+     static auto PBLUR                      = CConfigValue<Config::INTEGER>("group:groupbar:blur");
+     auto* const GROUPCOLACTIVE             = sc<Config::CGradientValueData*>((PGROUPCOLACTIVE.ptr()));
+     auto* const GROUPCOLINACTIVE           = sc<Config::CGradientValueData*>((PGROUPCOLINACTIVE.ptr()));
+@@ -271,9 +273,11 @@ void CHyprGroupBarDecoration::draw(PHLMONITOR pMonitor, float const& a) {
+         // re-renders every label through pango again. with a group on
+         // screen that is most of hyprland's idle cpu. keep them and drop
+         // only the ones that left the group, so the cache stays bounded
+-        if (m_lastTexScale != pMonitor->m_scale || m_lastTexBarWidth != m_barWidth) {
+-            m_lastTexScale    = pMonitor->m_scale;
+-            m_lastTexBarWidth = m_barWidth;
++        if (m_lastTexScale != pMonitor->m_scale || m_lastTexBarWidth != m_barWidth || m_lastTexOutline != *PTEXTOUTLINE || m_lastTexOutlineColor != *PTEXTOUTLINECOLOR) {
++            m_lastTexScale        = pMonitor->m_scale;
++            m_lastTexBarWidth     = m_barWidth;
++            m_lastTexOutline      = *PTEXTOUTLINE;
++            m_lastTexOutlineColor = *PTEXTOUTLINECOLOR;
+             invalidateTextures();
+         } else
+             pruneUnusedTextures();
+@@ -310,6 +314,8 @@ CTitleTex::CTitleTex(PHLWINDOW pWindow, const Vector2D& bufferSize, const float
+     static auto      PTEXTCOLORINACTIVE       = CConfigValue<Config::INTEGER>("group:groupbar:text_color_inactive");
+     static auto      PTEXTCOLORLOCKEDACTIVE   = CConfigValue<Config::INTEGER>("group:groupbar:text_color_locked_active");
+     static auto      PTEXTCOLORLOCKEDINACTIVE = CConfigValue<Config::INTEGER>("group:groupbar:text_color_locked_inactive");
++    static auto      PTEXTOUTLINE             = CConfigValue<Config::INTEGER>("group:groupbar:text_outline");
++    static auto      PTEXTOUTLINECOLOR        = CConfigValue<Config::INTEGER>("group:groupbar:text_outline_color");
+ 
+     static auto      PTITLEFONTWEIGHTACTIVE   = CConfigValue<Config::IComplexConfigValue>("group:groupbar:font_weight_active");
+     static auto      PTITLEFONTWEIGHTINACTIVE = CConfigValue<Config::IComplexConfigValue>("group:groupbar:font_weight_inactive");
+@@ -322,9 +328,13 @@ CTitleTex::CTitleTex(PHLWINDOW pWindow, const Vector2D& bufferSize, const float
+     const CHyprColor COLORLOCKEDACTIVE   = *PTEXTCOLORLOCKEDACTIVE == -1 ? COLORACTIVE : CHyprColor(*PTEXTCOLORLOCKEDACTIVE);
+     const CHyprColor COLORLOCKEDINACTIVE = *PTEXTCOLORLOCKEDINACTIVE == -1 ? COLORINACTIVE : CHyprColor(*PTEXTCOLORLOCKEDINACTIVE);
+ 
++    const CHyprColor COLOROUTLINE = CHyprColor(*PTEXTOUTLINECOLOR);
++    const int        OUTLINE      = *PTEXTOUTLINE * monitorScale;
++
+     const auto       FONTFAMILY = *PTITLEFONTFAMILY != STRVAL_EMPTY ? *PTITLEFONTFAMILY : *FALLBACKFONT;
+ 
+-#define RENDER_TEXT(color, weight) g_pHyprRenderer->renderText(pWindow->m_title, (color), *PTITLEFONTSIZE* monitorScale, false, FONTFAMILY, bufferSize.x - 2, (weight));
++#define RENDER_TEXT(color, weight)                                                                                                                                                 \
++    g_pHyprRenderer->renderText(pWindow->m_title, (color), *PTITLEFONTSIZE* monitorScale, false, FONTFAMILY, bufferSize.x - 2, (weight), OUTLINE, COLOROUTLINE);
+     m_texActive         = RENDER_TEXT(COLORACTIVE, FONTWEIGHTACTIVE->m_value);
+     m_texInactive       = RENDER_TEXT(COLORINACTIVE, FONTWEIGHTINACTIVE->m_value);
+     m_texLockedActive   = RENDER_TEXT(COLORLOCKEDACTIVE, FONTWEIGHTACTIVE->m_value);
+--- a/src/render/decorations/CHyprGroupBarDecoration.hpp
++++ b/src/render/decorations/CHyprGroupBarDecoration.hpp
+@@ -62,10 +62,12 @@ class CHyprGroupBarDecoration : public IHyprWindowDecoration {
+ 
+     // the title textures are rendered with pango and are the single most
+     // expensive thing the group bar does, so they are kept between frames.
+-    // they are keyed on the title alone, so a change in scale or bar width
+-    // has to drop them wholesale
+-    float                     m_lastTexScale    = 0.0F;
+-    float                     m_lastTexBarWidth = 0.0F;
++    // they are keyed on the title alone, so a change in scale, bar width or
++    // outline has to drop them wholesale
++    float                     m_lastTexScale        = 0.0F;
++    float                     m_lastTexBarWidth     = 0.0F;
++    int64_t                   m_lastTexOutline      = 0;
++    int64_t                   m_lastTexOutlineColor = 0;
+ 
+     CTitleTex*                textureFromTitle(const std::string&);
+     void                      invalidateTextures();
