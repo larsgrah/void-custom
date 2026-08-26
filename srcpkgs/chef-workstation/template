@@ -1,6 +1,6 @@
 # Template file for 'chef-workstation'
 pkgname=chef-workstation
-version=25.5.1084
+version=25.14.2
 revision=1
 archs="x86_64"
 wrksrc="${pkgname}-${version}"
@@ -9,7 +9,7 @@ maintainer="Lars <void@lars.earth>"
 license="Apache-2.0"
 homepage="https://docs.chef.io/workstation/"
 distfiles="https://packages.chef.io/files/stable/${pkgname}/${version}/el/8/${pkgname}-${version}-1.el8.x86_64.rpm"
-checksum=b05a8326fccae06778e330e000466a2517e5ec946a5acde28d63c4707d4930df
+checksum=fcbd6ec6dbcbfe2e5b6030493dd861574fd8424b0d300212e435b4a1a52a51dd
 
 nocross=yes
 nopie=yes
