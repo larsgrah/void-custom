@@ -1,15 +1,24 @@
 --- a/src/render/decorations/CHyprGroupBarDecoration.hpp
 +++ b/src/render/decorations/CHyprGroupBarDecoration.hpp
-@@ -60,8 +60,16 @@
+@@ -6,6 +6,7 @@
+ #include "../Texture.hpp"
+ #include <string>
+ #include "../../helpers/memory/Memory.hpp"
++#include "../../helpers/signal/Signal.hpp"
+ 
+ class CTitleTex {
+   public:
+@@ -60,8 +61,17 @@
  
      std::optional<bool>       m_bLastVisibilityStatus;
  
-+    // the title textures are rendered with pango and are the single most
-+    // expensive thing the group bar does, so they are kept between frames.
-+    // they are keyed on the title alone, so a change in scale or bar width
-+    // has to drop them wholesale
++    // the title textures go through pango and are the most expensive thing the
++    // group bar does, so they are kept between frames. they are keyed on the
++    // title alone, so anything else that changes what they look like has to
++    // drop them wholesale
 +    float                     m_lastTexScale    = 0.0F;
 +    float                     m_lastTexBarWidth = 0.0F;
++    CHyprSignalListener       m_configReloadedListener;
 +
      CTitleTex*                textureFromTitle(const std::string&);
      void                      invalidateTextures();
@@ -19,17 +28,36 @@
      bool                      visible();
 --- a/src/render/decorations/CHyprGroupBarDecoration.cpp
 +++ b/src/render/decorations/CHyprGroupBarDecoration.cpp
-@@ -266,8 +266,27 @@
+@@ -13,6 +13,7 @@
+ #include "../../managers/fullscreen/FullscreenController.hpp"
+ #include "../../layout/LayoutManager.hpp"
+ #include "../../layout/supplementary/DragController.hpp"
++#include "../../event/EventBus.hpp"
+ 
+ using namespace Render;
+ 
+@@ -30,6 +31,10 @@
+ 
+     if (*PENABLED && *PGRADIENTS)
+         refreshGroupBarGradients();
++
++    // the cached title textures bake in the font and colours, so a reload has
++    // to drop them
++    m_configReloadedListener = Event::bus()->m_events.config.reloaded.listen([this] { invalidateTextures(); });
+ }
+ 
+ SDecorationPositioningInfo CHyprGroupBarDecoration::getPositioningInfo() {
+@@ -266,8 +271,27 @@
              xoff += *PINNERGAP + m_barWidth;
      }
  
 -    if (*PRENDERTITLES)
 -        invalidateTextures();
 +    if (*PRENDERTITLES) {
-+        // upstream clears every title texture here, so the next frame
-+        // re-renders every label through pango again. with a group on
-+        // screen that is most of hyprland's idle cpu. keep them and drop
-+        // only the ones that left the group, so the cache stays bounded
++        // upstream clears every title texture here, so the next frame renders
++        // every label through pango again. with a group on screen that is most
++        // of hyprland's idle cpu. keep them instead and drop only the ones that
++        // left the group, so the cache stays bounded
 +        if (m_lastTexScale != pMonitor->m_scale || m_lastTexBarWidth != m_barWidth) {
 +            m_lastTexScale    = pMonitor->m_scale;
 +            m_lastTexBarWidth = m_barWidth;
