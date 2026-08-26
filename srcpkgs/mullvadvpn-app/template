@@ -1,0 +1,24 @@
+# Template file for 'mullvadvpn-app'
+pkgname=mullvadvpn-app
+version=2026.4
+revision=1
+archs="x86_64"
+create_wrksrc=yes
+hostmakedepends="rpmextract"
+short_desc="Mullvad VPN client app"
+maintainer="lars <lars.grahmann@googlemail.com>"
+license="GPL-3.0"
+homepage="https://mullvad.net/en"
+changelog="https://github.com/mullvad/mullvadvpn-app/releases"
+distfiles="https://github.com/mullvad/mullvadvpn-app/releases/download/${version}/MullvadVPN-${version}_x86_64.rpm"
+checksum=6999ba206e34d230fc48d3d41a5da7c99376b38bfe6d8f18b795faa6b875ba4e
+conf_files="/etc/sv/mullvad/conf"
+
+do_install() {
+	# Copy files
+	vcopy "opt" /
+	# Omit usr/lib/systemd
+	vcopy "usr/bin" /usr/
+	vcopy "usr/share" /usr/
+	vsv mullvad
+}

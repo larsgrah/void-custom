@@ -1,0 +1,2 @@
+# Configuration for the mullvad runit service.
+# Variables set here are sourced by the run script.
