@@ -2149,7 +2149,7 @@ libqtermwidget6.so.2 qtermwidget-qt6-2.0.0_1
 libmd4c.so.0 libmd4c-0.4.8_1
 libmd4c-html.so.0 libmd4c-html-0.4.8_1
 libQt6Core.so.6 qt6-core-6.10.0_1
-libQt_6_PRIVATE_API.6.10.0 qt6-core-6.10.0_1
+libQt_6_PRIVATE_API.6.11.1 qt6-core-6.11.1_1
 libQt6OpenGL.so.6 qt6-gui-6.10.0_1
 libQt6DBus.so.6 qt6-dbus-6.10.0_1
 libQt6PrintSupport.so.6 qt6-printsupport-6.10.0_1
@@ -4560,3 +4560,4 @@ libglslang.so.16 glslang-16.3.0_1
 libglslang-default-resource-limits.so.16 glslang-16.3.0_1
 libonnxruntime.so.1 onnxruntime-bin-1.27.1_1
 libonnxruntime_providers_shared.so onnxruntime-bin-1.27.1_1
+libcpptrace.so.1 cpptrace-1.0.4_1

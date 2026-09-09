@@ -1,0 +1,60 @@
+--- a/src/wayland/hyprland/ipc/connection.hpp
++++ b/src/wayland/hyprland/ipc/connection.hpp
+@@ -147,6 +147,9 @@
+ 	QString mRequestSocketPath;
+ 	QString mEventSocketPath;
+ 	bool valid = false;
++	// the event socket went away after it had connected, so events are being
++	// missed until it is back
++	bool reconnecting = false;
+ 	bool requestingMonitors = false;
+ 	bool requestingWorkspaces = false;
+ 	bool requestingToplevels = false;
+--- a/src/wayland/hyprland/ipc/connection.cpp
++++ b/src/wayland/hyprland/ipc/connection.cpp
+@@ -17,6 +17,7 @@
+ #include <qproperty.h>
+ #include <qqml.h>
+ #include <qtenvironmentvariables.h>
++#include <qtimer.h>
+ #include <qtmetamacros.h>
+ #include <qtypes.h>
+ #include <qvariant.h>
+@@ -109,11 +110,35 @@
+ 		this->eventReader.setDevice(&this->eventSocket);
+ 		qCInfo(logHyprlandIpc) << "Hyprland event socket connected.";
+ 		emit this->connected();
+-	} else if (state == QLocalSocket::UnconnectedState && this->valid) {
+-		qCWarning(logHyprlandIpc) << "Hyprland event socket disconnected.";
++
++		// everything hyprland sent while the socket was down is gone, so pull
++		// the state back in rather than waiting for the next event to fix it
++		if (this->reconnecting) {
++			this->reconnecting = false;
++			this->refreshMonitors(true);
++			this->refreshWorkspaces(true);
++			this->refreshToplevels();
++		}
++	} else if (this->valid) {
++		// hyprland drops a client whose event queue backs up, which a stalled
++		// main thread does in a few seconds on a busy desktop. without this
++		// the shell would silently stop seeing workspace and focus changes for
++		// the rest of its life. a peer close passes through ClosingState first,
++		// so this is "was connected, now anything else" rather than a check
++		// against UnconnectedState, which would already see valid == false
++		qCWarning(logHyprlandIpc) << "Hyprland event socket disconnected, reconnecting.";
++		this->reconnecting = true;
+ 	}
+ 
+ 	this->valid = state == QLocalSocket::ConnectedState;
++
++	if (state == QLocalSocket::UnconnectedState && this->reconnecting) {
++		QTimer::singleShot(1000, this, [this]() {
++			if (this->eventSocket.state() == QLocalSocket::UnconnectedState) {
++				this->eventSocket.connectToServer(this->mEventSocketPath, QLocalSocket::ReadOnly);
++			}
++		});
++	}
+ }
+ 
+ void HyprlandIpc::eventSocketReady() {
