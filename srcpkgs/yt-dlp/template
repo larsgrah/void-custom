@@ -1,0 +1,53 @@
+# Template file for 'yt-dlp'
+pkgname=yt-dlp
+version=2026.08.30
+revision=1
+# tracks master rather than the tagged release. youtube breaks something
+# about monthly and the fix sits on master for weeks before a tag, so this
+# builds the commit the nightly of the same date was cut from. bump _commit
+# and version together, the nightly tag names both
+_commit=bbc809a1161d3bfca51fa36f59dda35556ee85a0
+_nightly=2026.08.30.232658
+# XXX: keep python3-yt-dlp-ejs in sync with pyproject.toml
+_ejs_ver=0.8.0
+build_style=python3-pep517
+# pandoc is for the man page and README.txt, which the release tarball
+# ships prebuilt and the git archive does not
+hostmakedepends="hatchling pandoc"
+depends="python3-Brotli python3-certifi python3-mutagen python3-pycryptodomex
+ python3-urllib3 python3-requests python3-websockets
+ python3-yt-dlp-ejs>=${_ejs_ver}_1<=${_ejs_ver}_9999"
+short_desc="CLI program to download videos from YouTube and other sites"
+maintainer="larsgrah <void@lars.earth>"
+license="Unlicense"
+homepage="https://github.com/yt-dlp/yt-dlp"
+changelog="https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/Changelog.md"
+distfiles="https://github.com/yt-dlp/yt-dlp/archive/${_commit}.tar.gz>yt-dlp-${version}.tar.gz"
+checksum=7ce24ecd30a8a22505638f2766385faa1f5b926f5b50243a94b943ed3f27ed13
+replaces="python3-youtube-dl>=0"
+
+post_extract() {
+	_req_ejs="$(grep -o '"yt-dlp-ejs==.*"' "$wrksrc/pyproject.toml" | sed -e 's/^.*==\(.*\)"$/\1/' | head -1)"
+	if [ "$_ejs_ver" != "$_req_ejs" ]; then
+		msg_error "python3-yt-dlp-ejs version mismatch ($_ejs_ver != $_req_ejs): update python3-yt-dlp-ejs and \$_ejs_ver to match yt-dlp's pyproject.toml\n"
+	fi
+}
+
+pre_build() {
+	# version.py in git still says the last tag. stamp the nightly version
+	# and channel on it, that is what --version and -U report
+	python3 devscripts/update-version.py -c nightly -r yt-dlp/yt-dlp-nightly-builds "${_nightly}"
+	# update-version.py reads the head from git and there is no git here,
+	# so put the commit back by hand. yt-dlp -v prints it
+	vsed -i yt_dlp/version.py -e "s/^RELEASE_GIT_HEAD = None$/RELEASE_GIT_HEAD = '${_commit}'/"
+	# the generated bits the release tarball carries and the git archive
+	# does not: lazy extractors are what keeps startup under 100ms
+	python3 devscripts/make_lazy_extractors.py
+	mkdir -p completions/bash completions/zsh completions/fish
+	python3 devscripts/bash-completion.py
+	python3 devscripts/zsh-completion.py
+	python3 devscripts/fish-completion.py
+	python3 devscripts/prepare_manpage.py yt-dlp.1.temp.md
+	pandoc -s -f markdown-smart -t man yt-dlp.1.temp.md -o yt-dlp.1
+	pandoc -f markdown-smart -t plain README.md -o README.txt
+}
