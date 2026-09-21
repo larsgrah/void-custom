@@ -1,0 +1,4 @@
+#!/bin/sh
+# force libsecret backend, chromium doesn't recognize hyprland and falls back to plaintext
+# and force wayland, the app lands on xwayland otherwise
+exec /usr/lib/chatgpt/ChatGPT --password-store=gnome-libsecret --ozone-platform=wayland "$@"

@@ -1,0 +1,30 @@
+# Template file for 'chatgpt'
+pkgname=chatgpt
+version=26.915.31945
+revision=1
+archs="x86_64"
+create_wrksrc=yes
+depends="gtk+3 libnotify nss xdg-utils at-spi2-core libdrm libgbm libxcb
+ libsecret libXtst alsa-lib tpm2-tss libusb xz git xdg-desktop-portal"
+short_desc="ChatGPT desktop app with Codex, by OpenAI"
+maintainer="lars <lars.grahmann@googlemail.com>"
+license="custom:Proprietary"
+homepage="https://developers.openai.com/codex/app"
+distfiles="https://persistent.oaistatic.com/codex-app-prod/linux/deb/pool/main/c/chatgpt/chatgpt_${version}_amd64.deb"
+checksum=d27a9c02919cfe484dcc5f34584b9ea9fd0d7a65c69dcc872b5bdcfa0efb5983
+repository=nonfree
+restricted=yes
+nostrip=yes
+# qt shims are optional
+skiprdeps="/usr/lib/chatgpt/libqt5_shim.so /usr/lib/chatgpt/libqt6_shim.so"
+
+do_install() {
+	vcopy usr /
+	rm -r ${DESTDIR}/usr/share/lintian
+	# musl/android prebuilds never load here
+	find ${DESTDIR}/usr/lib/chatgpt/resources/app.asar.unpacked -path '*/prebuilds/*' \
+		\( -name '*musl*' -o -name 'android-*' \) -prune -exec rm -r {} +
+	# replace symlink with wrapper that forces libsecret and wayland
+	rm ${DESTDIR}/usr/bin/chatgpt
+	vbin ${FILESDIR}/chatgpt
+}
