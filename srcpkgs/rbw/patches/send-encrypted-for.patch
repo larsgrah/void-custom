@@ -1,0 +1,65 @@
+diff --git a/src/api.rs b/src/api.rs
+index b892da0..7c2f4a4 100644
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -751,6 +751,8 @@ struct SyncResPasswordHistory {
+ 
+ #[derive(serde::Serialize, Debug)]
+ struct CiphersPostReq {
++    #[serde(rename = "encryptedFor", skip_serializing_if = "Option::is_none")]
++    encrypted_for: Option<String>,
+     #[serde(rename = "type")]
+     ty: u32, // XXX what are the valid types?
+     #[serde(rename = "folderId")]
+@@ -766,6 +768,8 @@ struct CiphersPostReq {
+ 
+ #[derive(serde::Serialize, Debug)]
+ struct CiphersPutReq {
++    #[serde(rename = "encryptedFor", skip_serializing_if = "Option::is_none")]
++    encrypted_for: Option<String>,
+     #[serde(rename = "type")]
+     ty: u32, // XXX what are the valid types?
+     #[serde(rename = "folderId")]
+@@ -1205,6 +1209,7 @@ impl Client {
+         folder_id: Option<&str>,
+     ) -> Result<()> {
+         let mut req = CiphersPostReq {
++            encrypted_for: user_id_from_access_token(access_token),
+             ty: 1,
+             folder_id: folder_id.map(std::string::ToString::to_string),
+             name: name.to_string(),
+@@ -1332,6 +1337,7 @@ impl Client {
+         history: &[crate::db::HistoryEntry],
+     ) -> Result<()> {
+         let mut req = CiphersPutReq {
++            encrypted_for: user_id_from_access_token(access_token),
+             ty: match data {
+                 crate::db::EntryData::Login { .. } => 1,
+                 crate::db::EntryData::SecureNote => 2,
+@@ -1768,3 +1774,12 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
+     log::warn!("unexpected error received during login: {error_res:?}");
+     Error::RequestFailed { status: code }
+ }
++
++// vaultwarden 1.37+ wants the user id on cipher create/update, it's the
++// access token's sub claim
++fn user_id_from_access_token(access_token: &str) -> Option<String> {
++    let payload = access_token.split('.').nth(1)?;
++    let bytes = crate::base64::decode_url_safe_no_pad(payload).ok()?;
++    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
++    claims.get("sub")?.as_str().map(std::string::ToString::to_string)
++}
+diff --git a/src/base64.rs b/src/base64.rs
+index 86971bc..82b32e5 100644
+--- a/src/base64.rs
++++ b/src/base64.rs
+@@ -13,3 +13,9 @@ pub fn decode<T: AsRef<[u8]>>(
+ ) -> Result<Vec<u8>, base64::DecodeError> {
+     base64::engine::general_purpose::STANDARD.decode(input)
+ }
++
++pub fn decode_url_safe_no_pad<T: AsRef<[u8]>>(
++    input: T,
++) -> Result<Vec<u8>, base64::DecodeError> {
++    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input)
++}
