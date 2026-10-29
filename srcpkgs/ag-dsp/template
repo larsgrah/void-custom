@@ -1,8 +1,8 @@
 # Template file for 'ag-dsp'
 pkgname=ag-dsp
 version=0.1.0
-revision=2
-_commit=ddb8e804dc4412e4d7286027506d8cad3566c135
+revision=3
+_commit=82249e7173eedac331ac5a8a6710c7cc3bb0dc73
 build_wrksrc=ag-dsp
 build_style=cargo
 hostmakedepends="cargo rust pkg-config"
@@ -15,6 +15,6 @@ homepage="https://git.grahmann.family/lars/ag-dsp"
 #   git -C ~/code/private/ag-dsp archive --format=tar.gz --prefix=ag-dsp/ \
 #     -o hostdir/sources/ag-dsp-${version}/ag-dsp-${_commit}.tar.gz ${_commit}
 distfiles="https://git.grahmann.family/lars/ag-dsp/archive/${_commit}.tar.gz>ag-dsp-${_commit}.tar.gz"
-checksum=2bbba71f72ecdd8ae3628053fe180a4e29ffddb021b4c2e0658a4942c49eb841
+checksum=f8c9112041d9446ee2ac13b81a2b88ce5e2f51a14153d14a86c844f71cd4c7b7
 archs="x86_64"
 create_wrksrc=yes
