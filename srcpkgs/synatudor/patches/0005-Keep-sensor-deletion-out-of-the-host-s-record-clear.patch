@@ -1,0 +1,145 @@
+From 3f51934cc08cedd77e4525b19b80ddf8ee7c4255 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars@grahmann.family>
+Date: Thu, 29 Oct 2026 14:46:53 +0100
+Subject: [PATCH 5/5] Keep sensor deletion out of the host's record clear
+
+With the driver's own storage, wiping the record list also deleted the
+templates on the sensor. The plugin clears the host's list every time it
+hands the host back on close, so each release erased every enrolled
+finger. Deleting on the sensor is its own call now, made for a deleted
+print, the CLI wipe and a new CLEAR_STORAGE message for clear_storage.
+---
+ cli/src/cli.c                          |  1 +
+ libfprint-tod/src/data.c               |  2 +-
+ libtudor/inc/tudor/tudor.h             |  2 ++
+ libtudor/src/tudor/storage.c           | 25 ++++++++++++++++---------
+ tudor-host/inc/tudor/libfprint-proto.h |  5 ++++-
+ tudor-host/src/handler.c               | 16 +++++++++++++++-
+ 6 files changed, 39 insertions(+), 12 deletions(-)
+
+diff --git a/cli/src/cli.c b/cli/src/cli.c
+index 0edc8ef..bf4f280 100644
+--- a/cli/src/cli.c
++++ b/cli/src/cli.c
+@@ -211,6 +211,7 @@ void cli_main_loop(struct tudor_device *device) {
+ 
+                 //Wipe records
+                 int num_wiped = tudor_wipe_records(device, all_guids ? NULL: &guid, finger);
++                tudor_delete_sensor_records(device, all_guids ? NULL : &guid, finger);
+                 printf("Succesfully wiped %d enrolled finger(s)\n", num_wiped);
+             } goto cmdend;
+             case 's': abort_cmd_loop = true; goto cmdend;
+diff --git a/libfprint-tod/src/data.c b/libfprint-tod/src/data.c
+index 7eb97f5..2095272 100644
+--- a/libfprint-tod/src/data.c
++++ b/libfprint-tod/src/data.c
+@@ -327,6 +327,6 @@ void fpi_device_clear_storage(FpDevice *dev) {
+ 
+     //Tell the driver host
+     tdev->send_msg->size = sizeof(enum ipc_msg_type);
+-    tdev->send_msg->type = IPC_MSG_CLEAR_RECORDS;
++    tdev->send_msg->type = IPC_MSG_CLEAR_STORAGE;
+     send_acked_ipc_msg(tdev, tdev->send_msg, clear_storage_acked_cb, NULL);
+ }
+\ No newline at end of file
+diff --git a/libtudor/inc/tudor/tudor.h b/libtudor/inc/tudor/tudor.h
+index 7349b00..e9d7ec6 100644
+--- a/libtudor/inc/tudor/tudor.h
++++ b/libtudor/inc/tudor/tudor.h
+@@ -97,6 +97,8 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
+ bool tudor_close(struct tudor_device *device);
+ 
+ int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
++//Deletes enrolled templates on the sensor itself, the record list is untouched
++bool tudor_delete_sensor_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
+ bool tudor_add_record(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, const void *data, size_t data_size);
+ 
+ bool tudor_enroll_start(struct tudor_device *device, RECGUID guid, enum tudor_finger finger);
+diff --git a/libtudor/src/tudor/storage.c b/libtudor/src/tudor/storage.c
+index 75cf3c9..bab3a7a 100644
+--- a/libtudor/src/tudor/storage.c
++++ b/libtudor/src/tudor/storage.c
+@@ -1,16 +1,23 @@
+ #include "internal.h"
+ 
+-int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
+-    //With the driver's own storage the templates live on the sensor, delete them there too
+-    if(tudor_vendor_storage) {
+-        winmodule_set_cur(&tudor_adapter_dll->module);
+-        WINBIO_IDENTITY ident = { .Type = guid ? WINBIO_ID_TYPE_GUID : WINBIO_ID_TYPE_WILDCARD };
+-        if(guid) ident.TemplateGuid = *(GUID*) guid;
+-        else ident.Null = WINBIO_IDENTITY_WILDCARD;
+-        HRESULT hres = tudor_storage_adapter->DeleteRecord(device->pipeline, &ident, (UCHAR) finger);
+-        log_info("Deleted sensor records: 0x%x", hres);
++bool tudor_delete_sensor_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
++    //Only the driver's own storage keeps templates on the sensor, ours are
++    //all in the record list
++    if(!tudor_vendor_storage) return true;
++
++    winmodule_set_cur(&tudor_adapter_dll->module);
++    WINBIO_IDENTITY ident = { .Type = guid ? WINBIO_ID_TYPE_GUID : WINBIO_ID_TYPE_WILDCARD };
++    if(guid) ident.TemplateGuid = *(GUID*) guid;
++    else ident.Null = WINBIO_IDENTITY_WILDCARD;
++    HRESULT hres = tudor_storage_adapter->DeleteRecord(device->pipeline, &ident, (UCHAR) finger);
++    if(hres != ERROR_SUCCESS && hres != WINBIO_E_DATABASE_NO_RESULTS) {
++        log_error("Error deleting sensor records: 0x%x!", hres);
++        return false;
+     }
++    return true;
++}
+ 
++int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
+     cant_fail_ret(pthread_mutex_lock(&device->records_lock));
+ 
+     //Find the record
+diff --git a/tudor-host/inc/tudor/libfprint-proto.h b/tudor-host/inc/tudor/libfprint-proto.h
+index 2de02d3..8886ac0 100644
+--- a/tudor-host/inc/tudor/libfprint-proto.h
++++ b/tudor-host/inc/tudor/libfprint-proto.h
+@@ -30,7 +30,10 @@ enum ipc_msg_type {
+     IPC_MSG_VERIFY,
+     IPC_MSG_RESP_VERIFY,
+     IPC_MSG_IDENTIFY,
+-    IPC_MSG_RESP_IDENTIFY
++    IPC_MSG_RESP_IDENTIFY,
++
++    //Deletes everything on the sensor, CLEAR_RECORDS only empties the host's list
++    IPC_MSG_CLEAR_STORAGE
+ };
+ 
+ #define IPC_SENSOR_NAME_SIZE 128
+diff --git a/tudor-host/src/handler.c b/tudor-host/src/handler.c
+index 0ae1d9a..0e85be7 100644
+--- a/tudor-host/src/handler.c
++++ b/tudor-host/src/handler.c
+@@ -319,8 +319,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+             struct ipc_msg_del_record msg;
+             ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL);
+ 
+-            //Delete the record
++            //Delete the record, on the sensor too when it keeps them
+             int num_recs = tudor_wipe_records(state->dev, &msg.guid, msg.finger);
++            tudor_delete_sensor_records(state->dev, &msg.guid, msg.finger);
+             log_info("Deleted %d records with GUID %08x... finger %d", num_recs, msg.guid.PartA, msg.finger);
+ 
+             //Send ACK
+@@ -339,6 +340,19 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
+             send_ack(state->ipc_sock);
+         } break;
+ 
++        case IPC_MSG_CLEAR_STORAGE: {
++            check_in_action(state, type);
++            consume_simple_msg(state->ipc_sock, type);
++
++            //Wipe records and everything enrolled on the sensor
++            int num_recs = tudor_wipe_records(state->dev, NULL, TUDOR_FINGER_ANY);
++            tudor_delete_sensor_records(state->dev, NULL, TUDOR_FINGER_ANY);
++            log_info("Cleared storage, %d records", num_recs);
++
++            //Send ACK
++            send_ack(state->ipc_sock);
++        } break;
++
+         case IPC_MSG_ENROLL: {
+             check_in_action(state, type);
+             

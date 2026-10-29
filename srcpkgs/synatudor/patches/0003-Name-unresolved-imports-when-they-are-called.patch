@@ -1,0 +1,57 @@
+From 1415ae591f29e42f5f2e9cdab8ecb7cab838a0d6 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars@grahmann.family>
+Date: Thu, 29 Oct 2026 13:47:05 +0100
+Subject: [PATCH 3/5] Name unresolved imports when they are called
+
+The plain stub can't be a named one in the sandboxed host, which gets no
+executable memory, so the loader records which IAT slots it filled with
+the stub and the stub decodes its return address back to the slot.
+---
+ libtudor/src/loader.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/libtudor/src/loader.c b/libtudor/src/loader.c
+index ac3983c..a9a4c38 100644
+--- a/libtudor/src/loader.c
++++ b/libtudor/src/loader.c
+@@ -17,8 +17,25 @@ static void ord_stub() {
+ }
+ 
+ #ifndef DBGIMPORT
++//Which IAT slots got the stub, so a call can say what it was for. Named
++//stubs need executable memory, which the sandboxed host doesn't get
++static struct { void *slot; const char *lib, *name; } *unresolved;
++static int num_unresolved;
++
+ static void unresolved_stub() {
+-    log_error("Unresolved import called!");
++    //The DLLs call imports as call [rip+disp32], with an optional REX.W in
++    //front, so the return address leads back to the slot
++    uint8_t *ret = __builtin_return_address(0);
++    void *slot = NULL;
++    if(ret[-6] == 0xff && ret[-5] == 0x15) slot = ret + *(int32_t*) (ret - 4);
++
++    for(int i = 0; slot && i < num_unresolved; i++) {
++        if(unresolved[i].slot == slot) {
++            log_error("Unresolved import %s@%s called!", unresolved[i].name, unresolved[i].lib);
++            abort();
++        }
++    }
++    log_error("Unresolved import called! [return address %p]", ret);
+     abort();
+ }
+ #endif
+@@ -81,6 +98,13 @@ bool load_dll(struct dll_image *dll, const char *name, uint8_t *data, uint32_t s
+                 resolv_addr = &ord_stub;
+             } else {
+                 resolv_addr = resolve_import(lib->name, imp->name);
++#ifndef DBGIMPORT
++                if(resolv_addr == &unresolved_stub) {
++                    unresolved = realloc(unresolved, (num_unresolved + 1) * sizeof(*unresolved));
++                    if(!unresolved) { perror("Couldn't allocate unresolved import list"); abort(); }
++                    unresolved[num_unresolved++] = (typeof(*unresolved)) { image_mem + imp->addr_off, strdup(lib->name), strdup(imp->name) };
++                }
++#endif
+             }
+ 
+             //Write the address into the image

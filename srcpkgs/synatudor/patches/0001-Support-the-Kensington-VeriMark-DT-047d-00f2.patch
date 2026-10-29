@@ -1,7 +1,7 @@
 From fa33bd19014f69149c5f7bf719f3a967ada7787d Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars@grahmann.family>
 Date: Thu, 29 Oct 2026 13:29:20 +0100
-Subject: [PATCH 1/2] Support the Kensington VeriMark DT (047d:00f2)
+Subject: [PATCH 1/5] Support the Kensington VeriMark DT (047d:00f2)
 
 Runs Synaptics' 6.0.11.1132 driver for the VeriMark DT from the Microsoft
 Update Catalog instead of Lenovo's 104 build. The DLLs go in

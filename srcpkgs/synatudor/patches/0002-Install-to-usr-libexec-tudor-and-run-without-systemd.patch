@@ -1,7 +1,7 @@
 From d78cb9e5d11f38bb0375607a18d64ad0ffa4f18f Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars@grahmann.family>
 Date: Thu, 29 Oct 2026 13:32:43 +0100
-Subject: [PATCH 2/2] Install to /usr/libexec/tudor and run without systemd
+Subject: [PATCH 2/5] Install to /usr/libexec/tudor and run without systemd
 
 /sbin is a symlink on Void, so the install dir moves to /usr/libexec/tudor
 and the host's sandbox bind-mounts it from a meson define. The launcher

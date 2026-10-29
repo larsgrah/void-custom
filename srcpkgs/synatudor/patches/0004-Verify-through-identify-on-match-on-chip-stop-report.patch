@@ -1,0 +1,89 @@
+From c48513342ce5ee6702cf073d5fc033adf767dc4e Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars@grahmann.family>
+Date: Thu, 29 Oct 2026 14:43:21 +0100
+Subject: [PATCH 4/5] Verify through identify on match-on-chip, stop reporting
+ retries
+
+The driver's own engine rejects nearly every sample as a bad capture in
+VerifyFeatureSet while IdentifyFeatureSet matches, so with the vendor
+storage verify identifies and checks the result is the requested print.
+
+The plugin reported each capture retry to libfprint, which takes one
+report per action. Everything after the first was dropped with a
+critical and the action never completed, so pam_fprintd timed out. The
+host retries the capture itself, the plugin now only logs it.
+---
+ libfprint-tod/src/identify.c |  2 +-
+ libfprint-tod/src/verify.c   |  3 ++-
+ libtudor/src/tudor/device.c  | 27 ++++++++++++++++++++++++++-
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/libfprint-tod/src/identify.c b/libfprint-tod/src/identify.c
+index fd2cb8e..b89bc87 100644
+--- a/libfprint-tod/src/identify.c
++++ b/libfprint-tod/src/identify.c
+@@ -55,8 +55,8 @@ static void identify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_
+ 
+             //Check if we should retry
+             if(msg->resp_identify.retry) {
++                //The host captures again by itself, see verify.c
+                 g_info("Tudor host requested identify capture retry");
+-                fpi_device_identify_report(FP_DEVICE(tdev), NULL, NULL, fpi_device_retry_new(FP_DEVICE_RETRY_GENERAL));
+                 recv_ipc_msg_no_timeout(tdev, identify_recv_cb, user_data);
+                 break;
+             }
+diff --git a/libfprint-tod/src/verify.c b/libfprint-tod/src/verify.c
+index 5480b43..70ce7a6 100644
+--- a/libfprint-tod/src/verify.c
++++ b/libfprint-tod/src/verify.c
+@@ -44,8 +44,9 @@ static void verify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_da
+ 
+             //Check if we should retry
+             if(msg->resp_verify.retry) {
++                //The host captures again by itself. libfprint takes one report per
++                //action, a retry reported here would swallow the real result
+                 g_info("Tudor host requested verify capture retry for GUID %08x... finger %d", params->guid.PartA, params->finger);
+-                fpi_device_verify_report(FP_DEVICE(tdev), FPI_MATCH_ERROR, NULL, fpi_device_retry_new(FP_DEVICE_RETRY_GENERAL));
+                 recv_ipc_msg_no_timeout(tdev, verify_recv_cb, user_data);
+                 break;
+             }
+diff --git a/libtudor/src/tudor/device.c b/libtudor/src/tudor/device.c
+index 07bb288..b331b04 100644
+--- a/libtudor/src/tudor/device.c
++++ b/libtudor/src/tudor/device.c
+@@ -373,9 +373,34 @@ static void verify_cb(OVERLAPPED *ovlp, NTSTATUS status, tudor_async_res_t res)
+     };
+ 
+     log_debug("Verifying sample...");
+-    BOOLEAN is_match;
+     UCHAR *payload_ptr, *hash_ptr;
+     SIZE_T payload_size, hash_size;
++    if(tudor_vendor_storage) {
++        //The match-on-chip engine calls nearly every sample a bad capture in
++        //VerifyFeatureSet, while identify matches fine. Identify, then check
++        //it found the one we were asked about
++        WINBIO_IDENTITY identity;
++        UCHAR subfactor;
++        hres = tudor_engine_adapter->IdentifyFeatureSet(res->dev->pipeline, &identity, &subfactor, &payload_ptr, &payload_size, &hash_ptr, &hash_size, &reject_detail);
++        if(hres == WINBIO_E_UNKNOWN_ID) {
++            success = true;
++            matches = false;
++            goto exit;
++        }
++        if(hres != ERROR_SUCCESS) {
++            if(hres == WINBIO_E_BAD_CAPTURE) retry = true;
++            log_error("Error identifying sample for verify: 0x%x! [reject detail 0x%x]", hres, reject_detail);
++            goto exit;
++        }
++
++        success = true;
++        matches = identity.Type == WINBIO_ID_TYPE_GUID
++            && memcmp(&identity.TemplateGuid, &res->args.verify.guid, sizeof(GUID)) == 0
++            && (res->args.verify.finger == TUDOR_FINGER_ANY || subfactor == (UCHAR) res->args.verify.finger);
++        goto exit;
++    }
++
++    BOOLEAN is_match;
+     if((hres = tudor_engine_adapter->VerifyFeatureSet(res->dev->pipeline, &(WINBIO_IDENTITY) {
+         .Type = WINBIO_ID_TYPE_GUID,
+         .TemplateGuid = *(GUID*) &res->args.verify.guid

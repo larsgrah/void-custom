@@ -1,7 +1,7 @@
 # Template file for 'synatudor'
 pkgname=synatudor
 version=0.0.20250617
-revision=1
+revision=4
 _commit=31dfdb06107fd1c35c9f9ceae72617e98eccc43a
 _driver=6.0.11.1132
 build_style=meson
