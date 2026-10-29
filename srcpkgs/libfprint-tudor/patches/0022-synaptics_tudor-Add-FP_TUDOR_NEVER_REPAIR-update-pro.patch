@@ -1,7 +1,7 @@
 From 7cf8ae633d7a451f231dbb604744503e06113bf0 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:25:07 +0100
-Subject: [PATCH 22/30] synaptics_tudor: Add FP_TUDOR_NEVER_REPAIR, update
+Subject: [PATCH 22/33] synaptics_tudor: Add FP_TUDOR_NEVER_REPAIR, update
  protocol notes (not for upstream)
 
 ---

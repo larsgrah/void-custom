@@ -1,7 +1,7 @@
 From fe1c46eb7d9e2890482b4b1aeb0e841c392197db Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:42:55 +0100
-Subject: [PATCH 25/30] tests: Rework the synaptics_tudor custom test for the
+Subject: [PATCH 25/33] tests: Rework the synaptics_tudor custom test for the
  recording
 
 ---

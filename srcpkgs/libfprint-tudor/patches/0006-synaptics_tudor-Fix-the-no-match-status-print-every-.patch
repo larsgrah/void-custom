@@ -1,7 +1,7 @@
 From 04a44f3538423016ec5202e378e8d63268bcf65c Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 16:39:45 +0100
-Subject: [PATCH 06/30] synaptics_tudor: Fix the no match status, print every
+Subject: [PATCH 06/33] synaptics_tudor: Fix the no match status, print every
  outcome in tudor-test
 
 ---

@@ -1,7 +1,7 @@
 From 95b799826498bad87a4556f312e738c74cb67655 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:25:07 +0100
-Subject: [PATCH 21/30] synaptics_tudor: Send the plain DER signature in
+Subject: [PATCH 21/33] synaptics_tudor: Send the plain DER signature in
  CertificateVerify
 
 The sensor does not need the fixed 70 byte form. The vendor driver sent

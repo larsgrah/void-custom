@@ -1,7 +1,7 @@
 From 2a26d1bf02394fa4896a92db57187317ed2406e4 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:54:55 +0100
-Subject: [PATCH 29/30] tests: Add the synaptics_tudor umockdev recording
+Subject: [PATCH 29/33] tests: Add the synaptics_tudor umockdev recording
 
 Recorded on a Kensington VeriMark DT with FP_DEVICE_EMULATION set, so the
 handshake uses the fixed test keys and replays byte for byte. The key's

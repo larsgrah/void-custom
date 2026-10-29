@@ -1,7 +1,7 @@
 From c01e294c6d0b861173a8e870c39c637645d6619b Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:56:30 +0100
-Subject: [PATCH 30/30] synaptics_tudor: Identify with a gallery without our
+Subject: [PATCH 30/33] synaptics_tudor: Identify with a gallery without our
  prints ends in no match
 
 fprintd identifies against every stored print before an enroll to catch

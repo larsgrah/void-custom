@@ -1,7 +1,7 @@
 From 4e86069928edb4650398c29eeef64dee1db9aa26 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:42:55 +0100
-Subject: [PATCH 27/30] examples: Add the umockdev recording wrapper (not for
+Subject: [PATCH 27/33] examples: Add the umockdev recording wrapper (not for
  upstream)
 
 ---

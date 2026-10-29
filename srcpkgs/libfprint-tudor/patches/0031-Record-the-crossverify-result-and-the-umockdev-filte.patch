@@ -1,0 +1,32 @@
+From a3569b93749fa2af8be8c3f6928932e6fbaed9ef Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 23:01:26 +0100
+Subject: [PATCH 31/33] Record the crossverify result and the umockdev filter
+ in the notes (not for upstream)
+
+---
+ PROTOCOL.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index fb3feebd..fa3141c6 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -463,6 +463,17 @@ Other findings from the traces and logs:
+ - Open sequence: version, pairing and TLS only, see above.
+ - The a1 object data read works, so list returns real prints.
+ 
++Crossverify after the umockdev recording (umockdev/20261029-*-crossverify.log):
++a temporary right middle print, verified 8 times with the left index, all no
++match, and 2 times with the right middle, both match. With the 5 identifies of
++the crossmatch run that is 13 wrong-finger attempts without a false accept, so
++the one verify match in session 1 is put down to the wrong finger with data
++behind it now.
++
++The umockdev recording replays offline. The FIDO interface of the key had to
++be filtered out of the capture (endpoints 0x01 and 0x81), the kernel's usbhid
++polls it and replay waits on those urbs otherwise.
++
+ ## Debug environment
+ 
+ `FP_TUDOR_PAIRING_DIR` moves the pairing directory. On this branch it is

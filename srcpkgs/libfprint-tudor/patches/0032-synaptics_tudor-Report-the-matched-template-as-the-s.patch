@@ -1,0 +1,43 @@
+From 70836d93bbb31063037908269db6c8c5df568763 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 23:24:50 +0100
+Subject: [PATCH 32/33] synaptics_tudor: Report the matched template as the
+ scanned print
+
+The sensor names the template it matched even when it isn't in the
+gallery. fprintd deletes such a print and carries on when it gets it
+back, which is the only way a template it lost track of (lost state, a
+test run) ever goes away. Passing NULL locked that finger out for good,
+the duplicate check then refused every enroll of it.
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index e6b83004..75357f88 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -2420,6 +2420,7 @@ identify_finish (FpiDeviceSynapticsTudor *self,
+   FpDevice *device = FP_DEVICE (self);
+   GPtrArray *gallery = NULL;
+   FpPrint *match = NULL;
++  FpPrint *scanned = NULL;
+ 
+   if (error && error->domain == FP_DEVICE_RETRY)
+     {
+@@ -2447,7 +2448,14 @@ identify_finish (FpiDeviceSynapticsTudor *self,
+         }
+     }
+ 
+-  fpi_device_identify_report (device, match, NULL, NULL);
++  /* The sensor names the template it matched even when it is not in the
++   * gallery. Handing it back as the scanned print lets fprintd find a
++   * template it has no record of and delete it, otherwise that finger can
++   * never be enrolled again */
++  if (self->matched)
++    scanned = tudor_print_new (fp_print_new (device), self->template_id);
++
++  fpi_device_identify_report (device, match, scanned, NULL);
+   fpi_device_identify_complete (device, NULL);
+ }
+ 

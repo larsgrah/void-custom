@@ -1,7 +1,7 @@
 From 9db6fe12a28ab6644544c9c3f9c303cb135025b5 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 18:19:13 +0100
-Subject: [PATCH 09/30] synaptics_tudor: Fix pairing loss, session handling and
+Subject: [PATCH 09/33] synaptics_tudor: Fix pairing loss, session handling and
  slot exhaustion
 
 The pairing is only replaced when the sensor answers the handshake with a

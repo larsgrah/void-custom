@@ -1,0 +1,209 @@
+From 61f662998a25eca01c61124f049a2c6d884182ce Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 23:27:04 +0100
+Subject: [PATCH 33/33] synaptics_tudor: Drop the in-driver duplicate check
+
+fprintd identifies before every enroll itself, so the extra identify only
+cost a touch, and it refused enrolls fprintd could have cleaned up now
+that identify reports the matched template. The umockdev test checks that
+case instead: identify with an empty gallery gives no match and hands the
+stored print back as the scanned one. The recording has to be redone.
+---
+ PROTOCOL.md                               |  6 ++-
+ examples/tudor-owner-session2.sh          |  2 +
+ examples/tudor-record-umockdev.sh         | 10 ++---
+ libfprint/drivers/synaptics_tudor/tudor.c | 53 +----------------------
+ tests/synaptics_tudor/custom.py           | 20 ++++-----
+ 5 files changed, 20 insertions(+), 71 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index fa3141c6..bed4ae3b 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -452,6 +452,10 @@ Other findings from the traces and logs:
+   0x99 between the last 0x96 02 and the commit. The only host side
+   duplicate check seen (identity already in the record store,
+   WINBIO_E_DUPLICATE_ENROLLMENT) is keyed by identity, not by finger.
++  The driver had its own duplicate identify before each enroll for a while.
++  It went again: fprintd identifies before every enroll anyway, and with the
++  matched template reported as the scanned print fprintd can clean up
++  templates it lost track of, which the in-driver refusal used to block.
+ - Rejects: the frame event only has bit 31 of the flags, nothing else was
+   ever set. The vendor "reject detail 0x7" is WinBio POOR_QUALITY, a
+   constant for a flagged frame, so too short / off centre cannot be told
+@@ -486,8 +490,6 @@ run can never orphan the enrolled templates.
+ 
+ ## Still open
+ 
+-- Whether identify works inside an open enroll session, it would save the
+-  extra touch of the duplicate check.
+ - What a rejected capture does in the middle of an enroll (no touch was
+   rejected so far, only the vendor trace has a flagged frame, in a verify).
+ - Whether cleanup changes anything but the counters (slots were freed).
+diff --git a/examples/tudor-owner-session2.sh b/examples/tudor-owner-session2.sh
+index 8369e918..d5684bee 100755
+--- a/examples/tudor-owner-session2.sh
++++ b/examples/tudor-owner-session2.sh
+@@ -1,4 +1,6 @@
+ #!/bin/bash
++# Historical: part A tests the in-driver duplicate check, which was removed
++# again afterwards (fprintd identifies before every enroll itself).
+ # Second owner session (not for upstream). Run it from the libfprint-tudor
+ # checkout after ninja -C build. It answers three open questions:
+ #   A  does enrolling an enrolled finger fail with a duplicate error (F1)
+diff --git a/examples/tudor-record-umockdev.sh b/examples/tudor-record-umockdev.sh
+index 0329815d..bed450cf 100755
+--- a/examples/tudor-record-umockdev.sh
++++ b/examples/tudor-record-umockdev.sh
+@@ -8,7 +8,7 @@
+ #   1. fprintd is stopped (dev mode), usbmon is loaded
+ #   2. tests/create-driver-test.py runs tests/synaptics_tudor/custom.py as
+ #      root, you follow the prompts: your RIGHT MIDDLE finger, 7 enroll
+-#      touches, 1 duplicate check, 1 verify, 1 identify (10 touches)
++#      touches, 1 identify without a gallery, 1 verify, 1 identify (10 touches)
+ #   3. the system pairing and the dev copies are deleted. The recording pairs
+ #      the sensor with the public test key, that pairing must never be used
+ #      for real. fprintd pairs fresh with a random key on its next open.
+@@ -115,8 +115,8 @@ if [ "$mode" = crossverify ]; then
+     sed 's/^/  /' "$base" | tee -a "$log"
+ 
+     say
+-    say ">>> ENROLL a temporary print with your RIGHT MIDDLE finger: one touch for"
+-    say "    the duplicate check, then seven touches, lift between all of them."
++    say ">>> ENROLL a temporary print with your RIGHT MIDDLE finger: seven"
++    say "    touches, lift between all of them."
+     ask "Press Enter to start."
+     "$ex/tudor-test" --keep --enroll-only 2>&1 | grep -vE 'DEBUG|^\(process' | tee -a "$log"
+     temp=$(created | head -n1)
+@@ -205,8 +205,8 @@ cat <<EOF | tee -a "$log"
+ - the sensor is paired with the PUBLIC TEST KEY, your left index template
+   stops matching (it is deleted by the test). Afterwards the pairing files are
+   deleted and fprintd pairs fresh. Enroll the left index again in Settings.
+-- you need: your RIGHT MIDDLE finger, 10 touches (7 enroll, 1 duplicate
+-  check, 1 verify, 1 identify), the script says when to touch
++- you need: your RIGHT MIDDLE finger, 10 touches (7 enroll, 1 identify
++  without a gallery, 1 verify, 1 identify), the script says when to touch
+ EOF
+ if [ -e "$testdir/custom.pcapng" ]; then
+     echo "NOTE: $testdir/custom.pcapng exists and is replaced (a copy goes to $logdir)"
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 75357f88..5e696f97 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1978,8 +1978,6 @@ enum {
+   EN_SLOTS,
+   EN_RECLAIM,
+   EN_SLOTS_AGAIN,
+-  EN_DUP_CAPTURE,
+-  EN_DUP_PROCESS,
+   EN_BEGIN,
+   EN_CAPTURE,
+   EN_PROCESS,
+@@ -2065,7 +2063,7 @@ en_slots_done (FpiDeviceSynapticsTudor *self,
+     }
+ 
+   if (!tudor_db_full (&self->db_info))
+-    fpi_ssm_jump_to_state (ssm, EN_DUP_CAPTURE);
++    fpi_ssm_jump_to_state (ssm, EN_BEGIN);
+   else if (self->db_info.users_deleted + self->db_info.templates_deleted +
+            self->db_info.payloads_deleted > 0)
+     fpi_ssm_next_state (ssm);
+@@ -2144,29 +2142,6 @@ en_add_done (FpiDeviceSynapticsTudor *self,
+   fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
+ }
+ 
+-/* The sensor has no duplicate check of its own that we know of, the vendor
+- * trace sends nothing for it. So the finger is identified once before the
+- * enroll starts. */
+-static void
+-en_dup_done (FpiDeviceSynapticsTudor *self,
+-             FpiSsm                  *ssm)
+-{
+-  if (self->status == TUDOR_STATUS_OK && self->reply->len >= TUDOR_DB2_ID_SIZE)
+-    {
+-      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_DUPLICATE,
+-                                                          "This finger is already enrolled"));
+-      return;
+-    }
+-  if (self->status != TUDOR_STATUS_NO_MATCH)
+-    {
+-      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+-                                                          "Duplicate check failed with status 0x%04x",
+-                                                          self->status));
+-      return;
+-    }
+-  fpi_ssm_next_state (ssm);
+-}
+-
+ static void
+ en_run_state (FpiSsm   *ssm,
+               FpDevice *device)
+@@ -2189,31 +2164,6 @@ en_run_state (FpiSsm   *ssm,
+       tudor_send_db_info (self, ssm, en_slots_again_done);
+       break;
+ 
+-    case EN_DUP_CAPTURE:
+-      /* Nothing to be a duplicate of on an empty sensor */
+-      if (self->db_info.templates_current == 0)
+-        {
+-          fpi_ssm_jump_to_state (ssm, EN_BEGIN);
+-          return;
+-        }
+-      tudor_start_capture (self, ssm, 0x14);
+-      break;
+-
+-    case EN_DUP_PROCESS:
+-      {
+-        static const guint8 cmd[13] = { TUDOR_CMD_IDENTIFY, 0x01 };
+-
+-        if (self->cap_rejected)
+-          {
+-            fpi_device_enroll_progress (device, 0, NULL, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+-            fpi_ssm_jump_to_state (ssm, EN_DUP_CAPTURE);
+-            return;
+-          }
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD_ANY_STATUS,
+-                        en_dup_done);
+-      }
+-      break;
+-
+     case EN_BEGIN:
+       {
+         static const guint8 cmd[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_BEGIN };
+@@ -2793,5 +2743,4 @@ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+   dev_class->clear_storage = tudor_clear_storage;
+ 
+   fpi_device_class_auto_initialize_features (dev_class);
+-  dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
+ }
+diff --git a/tests/synaptics_tudor/custom.py b/tests/synaptics_tudor/custom.py
+index c9c3cd1e..27f9b2d0 100644
+--- a/tests/synaptics_tudor/custom.py
++++ b/tests/synaptics_tudor/custom.py
+@@ -71,18 +71,14 @@ assert stored[0].get_description() == DESCRIPTION
+ assert stored[0].get_username() == 'tudor-test'
+ assert stored[0].get_finger() == FINGER
+ 
+-# The same finger again is a duplicate and stops after the first touch
+-say('DUPLICATE CHECK: touch the sensor once more')
+-dup = FPrint.Print.new(d)
+-dup.set_finger(FINGER)
+-dup.set_username('tudor-test')
+-try:
+-    d.enroll_sync(dup, None, None, None)
+-    assert False, 'duplicate enroll was not refused'
+-except GLib.Error as error:
+-    assert error.matches(FPrint.DeviceError.quark(),
+-                         FPrint.DeviceError.DATA_DUPLICATE)
+-assert len(d.list_prints_sync()) == 1
++# A template the caller has no record of, like fprintd after it lost its
++# state: no match, but the sensor's template comes back as the scanned print
++# so the caller can delete it
++say('IDENTIFY WITHOUT A GALLERY: touch the sensor once')
++match, scanned = d.identify_sync([])
++assert match is None
++assert scanned is not None
++assert scanned.equal(p)
+ 
+ say('VERIFY: touch the sensor once')
+ verify_res, verify_print = d.verify_sync(p)

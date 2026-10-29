@@ -1,7 +1,7 @@
 From ebfa00be4e86c44acb7e6146a863d04db86e9ff5 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:42:55 +0100
-Subject: [PATCH 26/30] Update protocol notes for emulation and the pairing dir
+Subject: [PATCH 26/33] Update protocol notes for emulation and the pairing dir
  (not for upstream)
 
 ---

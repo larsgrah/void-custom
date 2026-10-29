@@ -1,7 +1,7 @@
 From 2a31f36fa880c65e717f77a83cd715023eb7f53b Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 22:16:29 +0100
-Subject: [PATCH 20/30] synaptics_tudor: Open with version, pairing and TLS
+Subject: [PATCH 20/33] synaptics_tudor: Open with version, pairing and TLS
  only
 
 Owner session 2 showed enroll, verify and identify work without the

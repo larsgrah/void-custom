@@ -1,7 +1,7 @@
 From 04db9422078e2d948a2c034ee266b8d4c18d178b Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 19:39:33 +0100
-Subject: [PATCH 17/30] synaptics_tudor: Add FP_TUDOR_OPEN_TRIM for the open
+Subject: [PATCH 17/33] synaptics_tudor: Add FP_TUDOR_OPEN_TRIM for the open
  sequence A/B test (not for upstream)
 
 ---
