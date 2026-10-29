@@ -1,0 +1,33 @@
+# Template file for 'libfprint-tod'
+pkgname=libfprint-tod
+version=1.94.9
+revision=1
+_todver=tod1
+build_style=meson
+build_helper="gir qemu"
+configure_args="-Dudev_rules=disabled -Dgtk-examples=false -Ddoc=false -Dtod=true"
+hostmakedepends="pkg-config glib-devel"
+makedepends="libusb-devel nss-devel glib-devel gdk-pixbuf-devel pixman-devel
+ libgusb-devel libglib-devel openssl-devel"
+depends="libfprint-udev-rules>=${version}_1"
+short_desc="Fingerprint reader library with Touch OEM Drivers support"
+maintainer="Lars Grahmann <lars@grahmann.family>"
+license="LGPL-2.1-or-later"
+homepage="https://gitlab.freedesktop.org/3v1n0/libfprint/-/tree/tod"
+distfiles="https://gitlab.freedesktop.org/3v1n0/libfprint/-/archive/v${version}+${_todver}/libfprint-v${version}+${_todver}.tar.bz2"
+checksum=cbc78637bfb748d09c16b094d95a7c7173f31f7a5bd86e5e3d81beaba8dc37e9
+wrksrc="libfprint-v${version}+${_todver}"
+provides="libfprint-${version}_${revision}"
+replaces="libfprint>=0"
+
+libfprint-tod-devel_package() {
+	depends="${makedepends} ${sourcepkg}>=${version}_${revision}"
+	short_desc+=" - development files"
+	provides="libfprint-devel-${version}_${revision}"
+	replaces="libfprint-devel>=0"
+	pkg_install() {
+		vmove usr/include
+		vmove usr/lib/pkgconfig
+		vmove "usr/lib/*.so"
+	}
+}
