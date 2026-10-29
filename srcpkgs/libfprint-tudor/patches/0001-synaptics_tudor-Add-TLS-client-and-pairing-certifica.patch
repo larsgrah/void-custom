@@ -1,0 +1,1242 @@
+From 8832cf2d2368dc666a82b3d15fb3efc6123da744 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 15:25:45 +0100
+Subject: [PATCH 1/8] synaptics_tudor: Add TLS client and pairing certificates
+
+The Tudor sensors speak a bent TLS 1.2 (ECDH-ECDSA with AES-256-GCM,
+no extensions length, no compression methods, fixed size signatures)
+and want a host certificate signed by a fixed key at pairing time.
+Everything is built on OpenSSL EVP and has no USB in it.
+---
+ libfprint/drivers/synaptics_tudor/tudor.h     |   89 ++
+ libfprint/drivers/synaptics_tudor/tudor_tls.c | 1040 +++++++++++++++++
+ libfprint/drivers/synaptics_tudor/tudor_tls.h |   77 ++
+ 3 files changed, 1206 insertions(+)
+ create mode 100644 libfprint/drivers/synaptics_tudor/tudor.h
+ create mode 100644 libfprint/drivers/synaptics_tudor/tudor_tls.c
+ create mode 100644 libfprint/drivers/synaptics_tudor/tudor_tls.h
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.h b/libfprint/drivers/synaptics_tudor/tudor.h
+new file mode 100644
+index 00000000..aad48159
+--- /dev/null
++++ b/libfprint/drivers/synaptics_tudor/tudor.h
+@@ -0,0 +1,89 @@
++/*
++ * Synaptics Tudor match-on-chip driver for libfprint
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib.h>
++
++/* Vendor control requests (bmRequestType 0x40 out, 0xc0 in, wIndex 0) */
++#define TUDOR_REQ_PROBE       0x19  /* out, wValue 1 */
++#define TUDOR_REQ_PROBE_READ  0x1a  /* in, one byte */
++#define TUDOR_REQ_CMD         0x16  /* out, command bytes */
++#define TUDOR_REQ_RESP        0x17  /* in, response bytes */
++#define TUDOR_REQ_TLS_STATE   0x14  /* in, two bytes, first one is 1 in a session */
++#define TUDOR_REQ_SESSION_END 0x1b  /* out, no data, sent before the closing alert */
++
++/* Commands the driver is allowed to send, see tudor_cmd_allowed() */
++#define TUDOR_CMD_GET_VERSION     0x01
++#define TUDOR_CMD_TLS_DATA        0x44
++#define TUDOR_CMD_PAIR            0x93
++#define TUDOR_CMD_DB2_GET_DB_INFO 0x9e
++#define TUDOR_CMD_DB2_OBJ_LIST    0x9f
++
++/* Version reply with the status bytes */
++#define TUDOR_VERSION_REPLY_SIZE  38
++
++/* Object types for TUDOR_CMD_DB2_OBJ_LIST, only what was seen on the wire */
++#define TUDOR_DB2_TYPE_TEMPLATE   0x02
++#define TUDOR_DB2_TYPE_PAYLOAD    0x03
++
++#define TUDOR_DB2_ID_SIZE         16
++
++/* Status words (first two bytes of every response) that mean success */
++#define TUDOR_STATUS_OK           0x0000
++#define TUDOR_STATUS_OK_412       0x0412
++#define TUDOR_STATUS_OK_5CC       0x05cc
++
++/* Certificate in the Synaptics format, 400 bytes */
++#define TUDOR_CERT_SIZE           400
++
++typedef struct
++{
++  guint32 build;
++  guint8  fw_major;
++  guint8  fw_minor;
++  guint8  product_id;
++  guint8  flags1;
++  guint8  flags2;
++  guint8  provision_state;
++  guint8  id[6];
++} TudorVersion;
++
++/* Reply of TUDOR_CMD_DB2_GET_DB_INFO, field names from the vendor driver's log */
++typedef struct
++{
++  guint16 version_major;
++  guint16 version_minor;
++  guint32 pversion;
++  guint16 uop_len;
++  guint16 top_len;
++  guint16 pop_len;
++  guint16 template_slot_size;
++  guint16 payload_slot_size;
++  guint16 users_current;
++  guint16 users_deleted;
++  guint16 users_available;
++  guint16 templates_current;
++  guint16 templates_deleted;
++  guint16 templates_available;
++  guint16 payloads_current;
++  guint16 payloads_deleted;
++  guint16 payloads_available;
++} TudorDbInfo;
++
++gboolean tudor_cmd_allowed (guint8 opcode);
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.c b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+new file mode 100644
+index 00000000..70e08ea1
+--- /dev/null
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+@@ -0,0 +1,1040 @@
++/*
++ * Synaptics Tudor match-on-chip driver for libfprint
++ * TLS 1.2 client as spoken by the sensor (not standard compliant)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "synaptics_tudor"
++
++#include <string.h>
++#include <openssl/core_names.h>
++#include <openssl/crypto.h>
++#include <openssl/bn.h>
++#include <openssl/ecdsa.h>
++#include <openssl/err.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/param_build.h>
++#include <openssl/rand.h>
++#include <openssl/x509.h>
++
++#include "drivers_api.h"
++
++#include "tudor_tls.h"
++
++#define TLS_VERSION_HI 0x03
++#define TLS_VERSION_LO 0x03
++
++#define TLS_CCS        20
++#define TLS_ALERT      21
++#define TLS_HANDSHAKE  22
++#define TLS_APPDATA    23
++
++#define HS_CLIENT_HELLO  1
++#define HS_SERVER_HELLO  2
++#define HS_CERTIFICATE   11
++#define HS_CERT_REQUEST  13
++#define HS_SERVER_DONE   14
++#define HS_CERT_VERIFY   15
++#define HS_CLIENT_KEX    16
++#define HS_FINISHED      20
++
++#define SUITE_ECDH_ECDSA_AES256_GCM_SHA384 0xc02e
++
++#define GCM_NONCE_SIZE 8
++#define GCM_SALT_SIZE  4
++#define GCM_TAG_SIZE   16
++#define RANDOM_SIZE    32
++#define VERIFY_SIZE    12
++
++/* The cert layout, all integers little endian, coordinates are padded to 68 bytes */
++#define CERT_MAGIC       0x5f3f
++#define CERT_CURVE_P256  23
++#define CERT_COORD_SIZE  68
++#define CERT_OFF_X       4
++#define CERT_OFF_Y       (CERT_OFF_X + CERT_COORD_SIZE)
++#define CERT_OFF_TYPE    (CERT_OFF_Y + CERT_COORD_SIZE + 1)
++#define CERT_OFF_SIGLEN  (CERT_OFF_TYPE + 1)
++#define CERT_OFF_SIG     (CERT_OFF_SIGLEN + 2)
++#define CERT_SIGNED_SIZE (CERT_OFF_TYPE + 1)
++#define CERT_SIG_MAX     (TUDOR_CERT_SIZE - CERT_OFF_SIG)
++
++/* Keys of the sensors, public part only. x and y are little endian */
++typedef struct
++{
++  guint8   fw_major;
++  guint8   fw_minor;
++  gboolean key_flag;
++  guint8   x[32];
++  guint8   y[32];
++} SensorKey;
++
++static const SensorKey sensor_keys[] = {
++  {
++    10, 1, FALSE,
++    { 0x5d, 0xfe, 0x8b, 0xc0, 0x6c, 0x0d, 0x12, 0x44, 0xd8, 0xd9, 0x37, 0xe9, 0x4c, 0x0c, 0xfc, 0x7e,
++      0x32, 0x67, 0x5e, 0xa2, 0x1c, 0xea, 0x46, 0x4b, 0x82, 0xda, 0xf5, 0xa5, 0x8c, 0x20, 0xd6, 0x33 },
++    { 0xfd, 0xa0, 0x34, 0x7c, 0x77, 0xf0, 0xc1, 0x57, 0x1f, 0xc4, 0x42, 0x47, 0x08, 0xe7, 0xdc, 0x18,
++      0xc7, 0x1e, 0xb6, 0xf3, 0xcd, 0xaf, 0x91, 0x2b, 0xc6, 0xf6, 0x4b, 0xfc, 0x81, 0xe1, 0x55, 0xb9 },
++  },
++  {
++    10, 1, TRUE,
++    { 0xdc, 0xdf, 0xdc, 0x11, 0x06, 0x65, 0x23, 0x9f, 0xe3, 0xb7, 0xd8, 0x5b, 0x19, 0xa5, 0xa6, 0x65,
++      0xf4, 0x69, 0xe4, 0x08, 0x52, 0x1a, 0x3b, 0xae, 0x06, 0x18, 0x70, 0xb9, 0x93, 0x62, 0x65, 0xcb },
++    { 0xdc, 0xbf, 0x44, 0x7e, 0x63, 0x19, 0x1f, 0x88, 0xb4, 0x06, 0xb1, 0x91, 0xca, 0x1e, 0x57, 0xba,
++      0x40, 0x2f, 0x50, 0x89, 0x10, 0x79, 0xbe, 0x59, 0xc1, 0xb3, 0x97, 0xe0, 0x4e, 0x42, 0x00, 0xa7 },
++  },
++};
++
++/* The sensor only accepts host certs signed by this key, the vendor driver
++ * derives it with the TLS PRF from fixed inputs. */
++static const guint8 hs_key_secret[] = {
++  0x71, 0x7c, 0xd7, 0x2d, 0x09, 0x62, 0xbc, 0x4a, 0x28, 0x46, 0x13, 0x8d, 0xbb, 0x2c, 0x24, 0x19
++};
++static const guint8 hs_key_seed[] = {
++  0x25, 0x12, 0xa7, 0x64, 0x07, 0x06, 0x5f, 0x38, 0x38, 0x46, 0x13, 0x9d, 0x4b, 0xec, 0x20, 0x33,
++  0xaa, 0xaa
++};
++
++struct _TudorTls
++{
++  EVP_PKEY    *host_key;
++  guint8       host_cert[TUDOR_CERT_SIZE];
++  EVP_PKEY    *sensor_pubkey;
++
++  EVP_MD_CTX  *hs_hash;
++  guint8       client_random[RANDOM_SIZE];
++  guint8       server_random[RANDOM_SIZE];
++  guint8       expect_server_verify[VERIFY_SIZE];
++
++  guint8       c_key[32];
++  guint8       s_key[32];
++  guint8       c_salt[GCM_SALT_SIZE];
++  guint8       s_salt[GCM_SALT_SIZE];
++  guint64      c_seq;
++  guint64      s_seq;
++
++  gboolean     sent_hello;
++  gboolean     keys_ready;
++  gboolean     established;
++};
++
++static void
++set_ssl_error (GError **error, const char *what)
++{
++  gulong code = ERR_get_error ();
++  char buf[128] = "no details";
++
++  if (code)
++    ERR_error_string_n (code, buf, sizeof (buf));
++  ERR_clear_error ();
++  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "%s: %s", what, buf);
++}
++
++static void
++put_u16le (guint8 *p, guint16 v)
++{
++  p[0] = v & 0xff;
++  p[1] = v >> 8;
++}
++
++static guint16
++get_u16le (const guint8 *p)
++{
++  return p[0] | (p[1] << 8);
++}
++
++static void
++put_u24be (guint8 *p, gsize v)
++{
++  p[0] = (v >> 16) & 0xff;
++  p[1] = (v >> 8) & 0xff;
++  p[2] = v & 0xff;
++}
++
++static void
++put_u16be (guint8 *p, guint16 v)
++{
++  p[0] = v >> 8;
++  p[1] = v & 0xff;
++}
++
++static void
++put_u64be (guint8 *p, guint64 v)
++{
++  for (int i = 7; i >= 0; i--, v >>= 8)
++    p[i] = v & 0xff;
++}
++
++static void
++reverse_copy (guint8 *dst, const guint8 *src, gsize len)
++{
++  for (gsize i = 0; i < len; i++)
++    dst[i] = src[len - 1 - i];
++}
++
++/* Same PRF as TLS 1.2 uses */
++static gboolean
++tls_prf (const EVP_MD *md,
++         const guint8 *secret,
++         gsize         secret_len,
++         const char   *label,
++         const guint8 *seed,
++         gsize         seed_len,
++         guint8       *out,
++         gsize         out_len)
++{
++  g_autofree guint8 *inp = g_malloc (strlen (label) + seed_len);
++  gsize inp_len = strlen (label) + seed_len;
++  g_autofree guint8 *buf = g_malloc (EVP_MAX_MD_SIZE + inp_len);
++  guint8 a[EVP_MAX_MD_SIZE];
++  guint8 block[EVP_MAX_MD_SIZE];
++  unsigned int a_len, b_len;
++  gsize done = 0;
++
++  memcpy (inp, label, strlen (label));
++  memcpy (inp + strlen (label), seed, seed_len);
++
++  if (!HMAC (md, secret, secret_len, inp, inp_len, a, &a_len))
++    return FALSE;
++
++  while (done < out_len)
++    {
++      memcpy (buf, a, a_len);
++      memcpy (buf + a_len, inp, inp_len);
++      if (!HMAC (md, secret, secret_len, buf, a_len + inp_len, block, &b_len))
++        return FALSE;
++      memcpy (out + done, block, MIN (b_len, out_len - done));
++      done += b_len;
++
++      if (done < out_len)
++        {
++          guint8 next[EVP_MAX_MD_SIZE];
++
++          if (!HMAC (md, secret, secret_len, a, a_len, next, &a_len))
++            return FALSE;
++          memcpy (a, next, a_len);
++        }
++    }
++  return TRUE;
++}
++
++/* Pairing certs */
++
++static EVP_PKEY *
++pubkey_from_point (const guint8 *point, GError **error)
++{
++  g_autoptr(EVP_PKEY_CTX) ctx = NULL;
++  EVP_PKEY *pkey = NULL;
++  OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new ();
++  OSSL_PARAM *params = NULL;
++
++  if (bld &&
++      OSSL_PARAM_BLD_push_utf8_string (bld, OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0) &&
++      OSSL_PARAM_BLD_push_octet_string (bld, OSSL_PKEY_PARAM_PUB_KEY, point, 65))
++    params = OSSL_PARAM_BLD_to_param (bld);
++  OSSL_PARAM_BLD_free (bld);
++
++  ctx = EVP_PKEY_CTX_new_from_name (NULL, "EC", NULL);
++  if (!params || !ctx || EVP_PKEY_fromdata_init (ctx) <= 0 ||
++      EVP_PKEY_fromdata (ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0)
++    {
++      set_ssl_error (error, "Could not load public key");
++      pkey = NULL;
++    }
++  OSSL_PARAM_free (params);
++  return pkey;
++}
++
++EVP_PKEY *
++tudor_cert_get_pubkey (const guint8 cert[TUDOR_CERT_SIZE], GError **error)
++{
++  guint8 point[65];
++
++  if (get_u16le (cert) != CERT_MAGIC || get_u16le (cert + 2) != CERT_CURVE_P256)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Unexpected certificate format");
++      return NULL;
++    }
++
++  point[0] = 0x04;
++  reverse_copy (point + 1, cert + CERT_OFF_X, 32);
++  reverse_copy (point + 33, cert + CERT_OFF_Y, 32);
++  return pubkey_from_point (point, error);
++}
++
++EVP_PKEY *
++tudor_cert_new_host_key (GError **error)
++{
++  EVP_PKEY *key = EVP_PKEY_Q_keygen (NULL, NULL, "EC", "P-256");
++
++  if (!key)
++    set_ssl_error (error, "Could not generate host key");
++  return key;
++}
++
++/* Key from the TLS PRF output, wrapped in a bare SEC1 structure so openssl
++ * works out the public point on its own */
++static EVP_PKEY *
++hs_key_new (GError **error)
++{
++  static const guint8 sec1_head[] = { 0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20 };
++  static const guint8 sec1_tail[] = {
++    0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07
++  };
++  guint8 prf[32];
++  guint8 der[sizeof (sec1_head) + 32 + sizeof (sec1_tail)];
++  const guint8 *p = der;
++  EVP_PKEY *key;
++
++  if (!tls_prf (EVP_sha256 (), hs_key_secret, sizeof (hs_key_secret),
++                "HS_KEY_PAIR_GEN", hs_key_seed, sizeof (hs_key_seed),
++                prf, sizeof (prf)))
++    {
++      set_ssl_error (error, "Could not derive pairing key");
++      return NULL;
++    }
++
++  memcpy (der, sec1_head, sizeof (sec1_head));
++  reverse_copy (der + sizeof (sec1_head), prf, 32);
++  memcpy (der + sizeof (sec1_head) + 32, sec1_tail, sizeof (sec1_tail));
++
++  key = d2i_PrivateKey (EVP_PKEY_EC, NULL, &p, sizeof (der));
++  if (!key)
++    set_ssl_error (error, "Could not load pairing key");
++  return key;
++}
++
++gboolean
++tudor_cert_make_host (EVP_PKEY *host_key, guint8 cert[TUDOR_CERT_SIZE], GError **error)
++{
++  g_autoptr(EVP_PKEY) hs_key = NULL;
++  g_autoptr(EVP_MD_CTX) md = NULL;
++  guint8 point[65];
++  gsize point_len = 0;
++  guint8 sig[CERT_SIG_MAX];
++  gsize sig_len = sizeof (sig);
++
++  if (!EVP_PKEY_get_octet_string_param (host_key, OSSL_PKEY_PARAM_PUB_KEY,
++                                        point, sizeof (point), &point_len) ||
++      point_len != sizeof (point))
++    {
++      set_ssl_error (error, "Could not export host key");
++      return FALSE;
++    }
++
++  memset (cert, 0, TUDOR_CERT_SIZE);
++  put_u16le (cert, CERT_MAGIC);
++  put_u16le (cert + 2, CERT_CURVE_P256);
++  reverse_copy (cert + CERT_OFF_X, point + 1, 32);
++  reverse_copy (cert + CERT_OFF_Y, point + 33, 32);
++
++  hs_key = hs_key_new (error);
++  if (!hs_key)
++    return FALSE;
++
++  md = EVP_MD_CTX_new ();
++  if (!md ||
++      EVP_DigestSignInit (md, NULL, EVP_sha256 (), NULL, hs_key) <= 0 ||
++      EVP_DigestSign (md, sig, &sig_len, cert, CERT_SIGNED_SIZE) <= 0)
++    {
++      set_ssl_error (error, "Could not sign host certificate");
++      return FALSE;
++    }
++
++  put_u16le (cert + CERT_OFF_SIGLEN, sig_len);
++  memcpy (cert + CERT_OFF_SIG, sig, sig_len);
++  return TRUE;
++}
++
++gboolean
++tudor_cert_verify_sensor (const guint8 cert[TUDOR_CERT_SIZE],
++                          guint8       fw_major,
++                          guint8       fw_minor,
++                          gboolean     key_flag,
++                          GError     **error)
++{
++  const SensorKey *sk = NULL;
++  g_autoptr(EVP_PKEY) key = NULL;
++  g_autoptr(EVP_MD_CTX) md = NULL;
++  guint8 point[65];
++  guint16 sig_len = get_u16le (cert + CERT_OFF_SIGLEN);
++
++  for (gsize i = 0; i < G_N_ELEMENTS (sensor_keys); i++)
++    {
++      if (sensor_keys[i].fw_major == fw_major &&
++          sensor_keys[i].fw_minor == fw_minor &&
++          sensor_keys[i].key_flag == key_flag)
++        sk = &sensor_keys[i];
++    }
++
++  if (!sk)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                   "No key known for sensor firmware %u.%u%s",
++                   fw_major, fw_minor, key_flag ? " (key flag)" : "");
++      return FALSE;
++    }
++
++  if (sig_len == 0 || sig_len > CERT_SIG_MAX)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Bad signature size in sensor certificate");
++      return FALSE;
++    }
++
++  point[0] = 0x04;
++  reverse_copy (point + 1, sk->x, 32);
++  reverse_copy (point + 33, sk->y, 32);
++  key = pubkey_from_point (point, error);
++  if (!key)
++    return FALSE;
++
++  md = EVP_MD_CTX_new ();
++  if (!md ||
++      EVP_DigestVerifyInit (md, NULL, EVP_sha256 (), NULL, key) <= 0 ||
++      EVP_DigestVerify (md, cert + CERT_OFF_SIG, sig_len, cert, CERT_SIGNED_SIZE) != 1)
++    {
++      ERR_clear_error ();
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Sensor certificate signature does not verify");
++      return FALSE;
++    }
++  return TRUE;
++}
++
++/* Session */
++
++TudorTls *
++tudor_tls_new (EVP_PKEY    *host_key,
++               const guint8 host_cert[TUDOR_CERT_SIZE],
++               EVP_PKEY    *sensor_pubkey)
++{
++  TudorTls *tls = g_new0 (TudorTls, 1);
++
++  EVP_PKEY_up_ref (host_key);
++  EVP_PKEY_up_ref (sensor_pubkey);
++  tls->host_key = host_key;
++  tls->sensor_pubkey = sensor_pubkey;
++  memcpy (tls->host_cert, host_cert, TUDOR_CERT_SIZE);
++  tls->hs_hash = EVP_MD_CTX_new ();
++  EVP_DigestInit_ex (tls->hs_hash, EVP_sha256 (), NULL);
++  return tls;
++}
++
++void
++tudor_tls_free (TudorTls *tls)
++{
++  if (!tls)
++    return;
++
++  EVP_PKEY_free (tls->host_key);
++  EVP_PKEY_free (tls->sensor_pubkey);
++  EVP_MD_CTX_free (tls->hs_hash);
++  OPENSSL_cleanse (tls, sizeof (*tls));
++  g_free (tls);
++}
++
++gboolean
++tudor_tls_is_established (TudorTls *tls)
++{
++  return tls->established;
++}
++
++static void
++add_record_header (GByteArray *out, guint8 type, gsize len)
++{
++  guint8 hdr[5] = { type, TLS_VERSION_HI, TLS_VERSION_LO, len >> 8, len & 0xff };
++
++  g_byte_array_append (out, hdr, sizeof (hdr));
++}
++
++static void
++add_handshake (GByteArray *out, guint8 type, const guint8 *body, gsize len)
++{
++  guint8 hdr[4] = { type };
++
++  put_u24be (hdr + 1, len);
++  g_byte_array_append (out, hdr, sizeof (hdr));
++  g_byte_array_append (out, body, len);
++}
++
++GByteArray *
++tudor_tls_client_hello (TudorTls *tls)
++{
++  /* No compression methods and no length on the extensions, the
++   * sensor wants it that way */
++  static const guint8 suites[] = {
++    0x00, 0x0c, 0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d, 0x00, 0x8d, 0x00, 0xa8, 0x00, 0xa9
++  };
++  static const guint8 exts[] = {
++    0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17,
++    0x00, 0x0b, 0x00, 0x02, 0x01, 0x00
++  };
++  g_autoptr(GByteArray) body = g_byte_array_new ();
++  GByteArray *out = g_byte_array_new ();
++  guint8 sess_id[8] = { 7 };
++  guint8 ver[2] = { TLS_VERSION_HI, TLS_VERSION_LO };
++  guint8 no_comp = 0;
++  GByteArray *hs = g_byte_array_new ();
++
++  RAND_bytes (tls->client_random, sizeof (tls->client_random));
++
++  g_byte_array_append (body, ver, sizeof (ver));
++  g_byte_array_append (body, tls->client_random, sizeof (tls->client_random));
++  g_byte_array_append (body, sess_id, sizeof (sess_id));
++  g_byte_array_append (body, suites, sizeof (suites));
++  g_byte_array_append (body, &no_comp, 1);
++  g_byte_array_append (body, exts, sizeof (exts));
++
++  add_handshake (hs, HS_CLIENT_HELLO, body->data, body->len);
++  EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len);
++
++  add_record_header (out, TLS_HANDSHAKE, hs->len);
++  g_byte_array_append (out, hs->data, hs->len);
++  g_byte_array_unref (hs);
++
++  tls->sent_hello = TRUE;
++  return out;
++}
++
++static gboolean
++gcm_seal (const guint8 *key,
++          const guint8 *salt,
++          guint64       seq,
++          guint8        type,
++          const guint8 *pt,
++          gsize         pt_len,
++          GByteArray   *out)
++{
++  g_autoptr(EVP_CIPHER_CTX) ctx = EVP_CIPHER_CTX_new ();
++  guint8 nonce[GCM_NONCE_SIZE];
++  guint8 iv[GCM_SALT_SIZE + GCM_NONCE_SIZE];
++  guint8 aad[13];
++  guint8 *ct;
++  int n, total;
++  gsize start;
++
++  if (!ctx || RAND_bytes (nonce, sizeof (nonce)) != 1)
++    return FALSE;
++
++  memcpy (iv, salt, GCM_SALT_SIZE);
++  memcpy (iv + GCM_SALT_SIZE, nonce, GCM_NONCE_SIZE);
++  put_u64be (aad, seq);
++  aad[8] = type;
++  aad[9] = TLS_VERSION_HI;
++  aad[10] = TLS_VERSION_LO;
++  put_u16be (aad + 11, pt_len);
++
++  start = out->len;
++  g_byte_array_append (out, nonce, sizeof (nonce));
++  g_byte_array_set_size (out, out->len + pt_len + GCM_TAG_SIZE);
++  ct = out->data + start + GCM_NONCE_SIZE;
++
++  if (EVP_EncryptInit_ex (ctx, EVP_aes_256_gcm (), NULL, key, iv) != 1 ||
++      EVP_EncryptUpdate (ctx, NULL, &n, aad, sizeof (aad)) != 1 ||
++      EVP_EncryptUpdate (ctx, ct, &n, pt, pt_len) != 1)
++    return FALSE;
++  total = n;
++  if (EVP_EncryptFinal_ex (ctx, ct + total, &n) != 1)
++    return FALSE;
++  total += n;
++  if (EVP_CIPHER_CTX_ctrl (ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_SIZE, ct + total) != 1)
++    return FALSE;
++  return TRUE;
++}
++
++static GByteArray *
++gcm_open (const guint8 *key,
++          const guint8 *salt,
++          guint64       seq,
++          guint8        type,
++          const guint8 *frag,
++          gsize         frag_len,
++          GError      **error)
++{
++  g_autoptr(EVP_CIPHER_CTX) ctx = EVP_CIPHER_CTX_new ();
++  guint8 iv[GCM_SALT_SIZE + GCM_NONCE_SIZE];
++  guint8 aad[13];
++  guint8 tag[GCM_TAG_SIZE];
++  GByteArray *pt;
++  gsize pt_len;
++  int n, total;
++
++  if (frag_len < GCM_NONCE_SIZE + GCM_TAG_SIZE)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "TLS record too short");
++      return NULL;
++    }
++
++  pt_len = frag_len - GCM_NONCE_SIZE - GCM_TAG_SIZE;
++  memcpy (iv, salt, GCM_SALT_SIZE);
++  memcpy (iv + GCM_SALT_SIZE, frag, GCM_NONCE_SIZE);
++  memcpy (tag, frag + frag_len - GCM_TAG_SIZE, GCM_TAG_SIZE);
++  put_u64be (aad, seq);
++  aad[8] = type;
++  aad[9] = TLS_VERSION_HI;
++  aad[10] = TLS_VERSION_LO;
++  put_u16be (aad + 11, pt_len);
++
++  pt = g_byte_array_sized_new (pt_len + 1);
++  g_byte_array_set_size (pt, pt_len);
++
++  if (!ctx ||
++      EVP_DecryptInit_ex (ctx, EVP_aes_256_gcm (), NULL, key, iv) != 1 ||
++      EVP_DecryptUpdate (ctx, NULL, &n, aad, sizeof (aad)) != 1 ||
++      EVP_DecryptUpdate (ctx, pt->data, &n, frag + GCM_NONCE_SIZE, pt_len) != 1)
++    goto fail;
++  total = n;
++  if (EVP_CIPHER_CTX_ctrl (ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_SIZE, tag) != 1 ||
++      EVP_DecryptFinal_ex (ctx, pt->data + total, &n) != 1)
++    goto fail;
++  return pt;
++
++fail:
++  ERR_clear_error ();
++  g_byte_array_unref (pt);
++  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                       "TLS record failed to decrypt");
++  return NULL;
++}
++
++/* Returns the payload of the record at the start of data and advances it */
++static gboolean
++take_record (const guint8 **data,
++             gsize         *len,
++             guint8        *type,
++             const guint8 **payload,
++             gsize         *payload_len,
++             GError       **error)
++{
++  gsize plen;
++
++  if (*len < 5 || (*data)[1] != TLS_VERSION_HI || (*data)[2] != TLS_VERSION_LO)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Malformed TLS record header");
++      return FALSE;
++    }
++
++  plen = ((*data)[3] << 8) | (*data)[4];
++  if (*len < 5 + plen)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Truncated TLS record");
++      return FALSE;
++    }
++
++  *type = (*data)[0];
++  *payload = *data + 5;
++  *payload_len = plen;
++  *data += 5 + plen;
++  *len -= 5 + plen;
++  return TRUE;
++}
++
++/* The sensor only takes signatures of exactly 70 bytes, a DER sequence of
++ * two 32 byte integers, with no extra zero byte when the top bit is set */
++static gboolean
++sig_to_fixed (const guint8 *der, gsize der_len, guint8 out[70])
++{
++  const guint8 *p = der;
++  ECDSA_SIG *sig = d2i_ECDSA_SIG (NULL, &p, der_len);
++  const BIGNUM *r, *s;
++  gboolean ok = FALSE;
++
++  if (!sig)
++    return FALSE;
++
++  ECDSA_SIG_get0 (sig, &r, &s);
++  out[0] = 0x30;
++  out[1] = 0x44;
++  out[2] = 0x02;
++  out[3] = 0x20;
++  out[36] = 0x02;
++  out[37] = 0x20;
++  ok = BN_bn2binpad (r, out + 4, 32) == 32 && BN_bn2binpad (s, out + 38, 32) == 32;
++  ECDSA_SIG_free (sig);
++  return ok;
++}
++
++GByteArray *
++tudor_tls_handle_server_hello (TudorTls     *tls,
++                               const guint8 *data,
++                               gsize         len,
++                               GError      **error)
++{
++  const guint8 *payload;
++  gsize payload_len;
++  guint8 type;
++  const guint8 *p;
++  gsize left;
++  gboolean got_hello = FALSE, got_req = FALSE, got_done = FALSE;
++  g_autoptr(EVP_PKEY) eph = NULL;
++  g_autoptr(EVP_PKEY_CTX) dctx = NULL;
++  g_autoptr(EVP_PKEY_CTX) sctx = NULL;
++  g_autoptr(GByteArray) flight = g_byte_array_new ();
++  g_autoptr(GByteArray) hs = g_byte_array_new ();
++  g_autoptr(GByteArray) cert_body = g_byte_array_new ();
++  g_autoptr(GByteArray) fin = g_byte_array_new ();
++  g_autoptr(EVP_MD_CTX) snap = EVP_MD_CTX_new ();
++  guint8 point[65];
++  gsize point_len = 0;
++  guint8 premaster[32];
++  gsize premaster_len = sizeof (premaster);
++  guint8 digest[32];
++  unsigned int dlen = 0;
++  guint8 sig[128];
++  gsize sig_len = sizeof (sig);
++  guint8 verify[VERIFY_SIZE];
++  guint8 seed[2 * RANDOM_SIZE];
++  guint8 master[48];
++  guint8 block[2 * 32 + 2 * GCM_SALT_SIZE];
++  GByteArray *result;
++
++  if (!tls->sent_hello)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                           "No hello sent");
++      return NULL;
++    }
++
++  if (len >= 1 && data[0] == TLS_ALERT)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Sensor sent a TLS alert instead of a hello");
++      return NULL;
++    }
++
++  p = data;
++  left = len;
++  if (!take_record (&p, &left, &type, &payload, &payload_len, error))
++    return NULL;
++  if (type != TLS_HANDSHAKE)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Expected a handshake record");
++      return NULL;
++    }
++
++  /* Whole record goes into the transcript as it came */
++  EVP_DigestUpdate (tls->hs_hash, payload, payload_len);
++
++  for (gsize off = 0; off < payload_len;)
++    {
++      guint8 mtype;
++      gsize mlen;
++      const guint8 *m;
++
++      if (payload_len - off < 4)
++        goto proto;
++      mtype = payload[off];
++      mlen = (payload[off + 1] << 16) | (payload[off + 2] << 8) | payload[off + 3];
++      m = payload + off + 4;
++      if (mlen > payload_len - off - 4)
++        goto proto;
++
++      switch (mtype)
++        {
++        case HS_SERVER_HELLO:
++          {
++            guint8 sid_len;
++            guint16 suite;
++
++            /* Version is not checked, the sensor says 0x0383 */
++            if (mlen < 2 + RANDOM_SIZE + 1)
++              goto proto;
++            memcpy (tls->server_random, m + 2, RANDOM_SIZE);
++            sid_len = m[2 + RANDOM_SIZE];
++            if (mlen < 2 + RANDOM_SIZE + 1 + sid_len + 3)
++              goto proto;
++            suite = (m[3 + RANDOM_SIZE + sid_len] << 8) | m[4 + RANDOM_SIZE + sid_len];
++            if (suite != SUITE_ECDH_ECDSA_AES256_GCM_SHA384)
++              {
++                g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                             "Sensor chose cipher suite 0x%04x", suite);
++                return NULL;
++              }
++            got_hello = TRUE;
++            break;
++          }
++
++        case HS_CERT_REQUEST:
++          /* One type count, then the types, then two junk bytes */
++          if (mlen < 2 || m[0] < 1 || mlen < 1u + m[0])
++            goto proto;
++          got_req = memchr (m + 1, 0x40, m[0]) != NULL;
++          break;
++
++        case HS_SERVER_DONE:
++          got_done = TRUE;
++          break;
++
++        default:
++          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                       "Unexpected handshake message %u", mtype);
++          return NULL;
++        }
++      off += 4 + mlen;
++    }
++
++  if (!got_hello || !got_req || !got_done)
++    goto proto;
++
++  /* Certificate. The sensor wants the length twice and two junk bytes */
++  g_byte_array_set_size (cert_body, 3 + 3 + 2);
++  put_u24be (cert_body->data, TUDOR_CERT_SIZE);
++  put_u24be (cert_body->data + 3, TUDOR_CERT_SIZE);
++  memset (cert_body->data + 6, 0, 2);
++  g_byte_array_append (cert_body, tls->host_cert, TUDOR_CERT_SIZE);
++  add_handshake (hs, HS_CERTIFICATE, cert_body->data, cert_body->len);
++
++  /* Client key exchange is just the ephemeral point */
++  eph = EVP_PKEY_Q_keygen (NULL, NULL, "EC", "P-256");
++  if (!eph ||
++      !EVP_PKEY_get_octet_string_param (eph, OSSL_PKEY_PARAM_PUB_KEY,
++                                        point, sizeof (point), &point_len) ||
++      point_len != sizeof (point))
++    {
++      set_ssl_error (error, "Could not generate ephemeral key");
++      return NULL;
++    }
++  add_handshake (hs, HS_CLIENT_KEX, point, sizeof (point));
++
++  /* Premaster is the plain x coordinate of the ECDH result */
++  dctx = EVP_PKEY_CTX_new (eph, NULL);
++  if (!dctx || EVP_PKEY_derive_init (dctx) <= 0 ||
++      EVP_PKEY_derive_set_peer (dctx, tls->sensor_pubkey) <= 0 ||
++      EVP_PKEY_derive (dctx, premaster, &premaster_len) <= 0)
++    {
++      set_ssl_error (error, "ECDH failed");
++      return NULL;
++    }
++
++  /* Certificate verify signs the digest so far as it is */
++  EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len);
++  EVP_MD_CTX_copy_ex (snap, tls->hs_hash);
++  EVP_DigestFinal_ex (snap, digest, &dlen);
++
++  sctx = EVP_PKEY_CTX_new (tls->host_key, NULL);
++  if (!sctx || EVP_PKEY_sign_init (sctx) <= 0 ||
++      EVP_PKEY_sign (sctx, sig, &sig_len, digest, dlen) <= 0)
++    {
++      set_ssl_error (error, "Could not sign handshake");
++      return NULL;
++    }
++  {
++    gsize before = hs->len;
++    guint8 fixed[70];
++
++    if (!sig_to_fixed (sig, sig_len, fixed))
++      {
++        set_ssl_error (error, "Could not encode signature");
++        return NULL;
++      }
++    add_handshake (hs, HS_CERT_VERIFY, fixed, sizeof (fixed));
++    EVP_DigestUpdate (tls->hs_hash, hs->data + before, hs->len - before);
++  }
++
++  add_record_header (flight, TLS_HANDSHAKE, hs->len);
++  g_byte_array_append (flight, hs->data, hs->len);
++
++  /* Key schedule, the transcript is final now */
++  memcpy (seed, tls->client_random, RANDOM_SIZE);
++  memcpy (seed + RANDOM_SIZE, tls->server_random, RANDOM_SIZE);
++  if (!tls_prf (EVP_sha384 (), premaster, premaster_len, "master secret",
++                seed, sizeof (seed), master, sizeof (master)) ||
++      !tls_prf (EVP_sha384 (), master, sizeof (master), "key expansion",
++                seed, sizeof (seed), block, sizeof (block)))
++    {
++      set_ssl_error (error, "Key derivation failed");
++      return NULL;
++    }
++  memcpy (tls->c_key, block, 32);
++  memcpy (tls->s_key, block + 32, 32);
++  memcpy (tls->c_salt, block + 64, GCM_SALT_SIZE);
++  memcpy (tls->s_salt, block + 64 + GCM_SALT_SIZE, GCM_SALT_SIZE);
++
++  EVP_MD_CTX_copy_ex (snap, tls->hs_hash);
++  EVP_DigestFinal_ex (snap, digest, &dlen);
++  if (!tls_prf (EVP_sha384 (), master, sizeof (master), "client finished",
++                digest, dlen, verify, VERIFY_SIZE) ||
++      !tls_prf (EVP_sha384 (), master, sizeof (master), "server finished",
++                digest, dlen, tls->expect_server_verify, VERIFY_SIZE))
++    {
++      set_ssl_error (error, "Finished derivation failed");
++      return NULL;
++    }
++
++  /* Change cipher spec, then the encrypted finished */
++  {
++    guint8 ccs[6] = { TLS_CCS, TLS_VERSION_HI, TLS_VERSION_LO, 0, 1, 1 };
++
++    g_byte_array_append (flight, ccs, sizeof (ccs));
++  }
++  add_handshake (fin, HS_FINISHED, verify, VERIFY_SIZE);
++  result = g_byte_array_new ();
++  if (!gcm_seal (tls->c_key, tls->c_salt, tls->c_seq, TLS_HANDSHAKE,
++                 fin->data, fin->len, result))
++    {
++      g_byte_array_unref (result);
++      set_ssl_error (error, "Could not encrypt finished");
++      return NULL;
++    }
++  tls->c_seq++;
++  add_record_header (flight, TLS_HANDSHAKE, result->len);
++  g_byte_array_append (flight, result->data, result->len);
++  g_byte_array_unref (result);
++
++  tls->keys_ready = TRUE;
++  OPENSSL_cleanse (master, sizeof (master));
++  OPENSSL_cleanse (block, sizeof (block));
++  OPENSSL_cleanse (premaster, sizeof (premaster));
++  return g_steal_pointer (&flight);
++
++proto:
++  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                       "Malformed server hello flight");
++  return NULL;
++}
++
++gboolean
++tudor_tls_handle_server_finished (TudorTls     *tls,
++                                  const guint8 *data,
++                                  gsize         len,
++                                  GError      **error)
++{
++  const guint8 *payload;
++  gsize payload_len;
++  guint8 type;
++  g_autoptr(GByteArray) pt = NULL;
++
++  if (!tls->keys_ready)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                           "No keys yet");
++      return FALSE;
++    }
++
++  if (!take_record (&data, &len, &type, &payload, &payload_len, error))
++    return FALSE;
++  if (type != TLS_CCS || payload_len != 1 || payload[0] != 1)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Expected change cipher spec");
++      return FALSE;
++    }
++
++  if (!take_record (&data, &len, &type, &payload, &payload_len, error))
++    return FALSE;
++  if (type != TLS_HANDSHAKE)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Expected finished record");
++      return FALSE;
++    }
++
++  pt = gcm_open (tls->s_key, tls->s_salt, tls->s_seq, TLS_HANDSHAKE,
++                 payload, payload_len, error);
++  if (!pt)
++    return FALSE;
++  tls->s_seq++;
++
++  if (pt->len != 4 + VERIFY_SIZE || pt->data[0] != HS_FINISHED ||
++      CRYPTO_memcmp (pt->data + 4, tls->expect_server_verify, VERIFY_SIZE) != 0)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Sensor finished message does not verify");
++      return FALSE;
++    }
++
++  tls->established = TRUE;
++  return TRUE;
++}
++
++GByteArray *
++tudor_tls_wrap (TudorTls *tls, const guint8 *data, gsize len)
++{
++  g_autoptr(GByteArray) frag = g_byte_array_new ();
++  GByteArray *out;
++
++  g_return_val_if_fail (tls->established, NULL);
++
++  if (!gcm_seal (tls->c_key, tls->c_salt, tls->c_seq, TLS_APPDATA, data, len, frag))
++    return NULL;
++  tls->c_seq++;
++
++  out = g_byte_array_new ();
++  add_record_header (out, TLS_APPDATA, frag->len);
++  g_byte_array_append (out, frag->data, frag->len);
++  return out;
++}
++
++GByteArray *
++tudor_tls_unwrap (TudorTls *tls, const guint8 *data, gsize len, GError **error)
++{
++  const guint8 *payload;
++  gsize payload_len;
++  guint8 type;
++  GByteArray *pt;
++
++  g_return_val_if_fail (tls->established, NULL);
++
++  if (!take_record (&data, &len, &type, &payload, &payload_len, error))
++    return NULL;
++
++  if (type != TLS_APPDATA && type != TLS_ALERT)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Unexpected TLS record type %u", type);
++      return NULL;
++    }
++
++  pt = gcm_open (tls->s_key, tls->s_salt, tls->s_seq, type, payload, payload_len, error);
++  if (!pt)
++    return NULL;
++  tls->s_seq++;
++
++  if (type == TLS_ALERT)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Sensor sent TLS alert level %u description %u",
++                   pt->len > 0 ? pt->data[0] : 0, pt->len > 1 ? pt->data[1] : 0);
++      g_byte_array_unref (pt);
++      return NULL;
++    }
++  return pt;
++}
++
++GByteArray *
++tudor_tls_close_notify (TudorTls *tls)
++{
++  g_autoptr(GByteArray) frag = g_byte_array_new ();
++  static const guint8 alert[2] = { 1, 0 };
++  GByteArray *out;
++
++  if (!tls->established ||
++      !gcm_seal (tls->c_key, tls->c_salt, tls->c_seq, TLS_ALERT, alert, sizeof (alert), frag))
++    return NULL;
++  tls->c_seq++;
++
++  out = g_byte_array_new ();
++  add_record_header (out, TLS_ALERT, frag->len);
++  g_byte_array_append (out, frag->data, frag->len);
++  return out;
++}
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.h b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+new file mode 100644
+index 00000000..92905aa6
+--- /dev/null
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+@@ -0,0 +1,77 @@
++/*
++ * Synaptics Tudor match-on-chip driver for libfprint
++ * TLS 1.2 client as spoken by the sensor (not standard compliant)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib.h>
++#include <openssl/evp.h>
++
++#include "tudor.h"
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_PKEY, EVP_PKEY_free)
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_PKEY_CTX, EVP_PKEY_CTX_free)
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_MD_CTX, EVP_MD_CTX_free)
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_CIPHER_CTX, EVP_CIPHER_CTX_free)
++
++typedef struct _TudorTls TudorTls;
++
++#define TUDOR_TLS_RECORD_HANDSHAKE 22
++#define TUDOR_TLS_RECORD_ALERT     21
++#define TUDOR_TLS_RECORD_APPDATA   23
++
++/* Pairing certificates */
++EVP_PKEY *tudor_cert_new_host_key (GError **error);
++gboolean  tudor_cert_make_host (EVP_PKEY    *host_key,
++                                guint8       cert[TUDOR_CERT_SIZE],
++                                GError     **error);
++gboolean  tudor_cert_verify_sensor (const guint8 cert[TUDOR_CERT_SIZE],
++                                    guint8       fw_major,
++                                    guint8       fw_minor,
++                                    gboolean     key_flag,
++                                    GError     **error);
++EVP_PKEY *tudor_cert_get_pubkey (const guint8 cert[TUDOR_CERT_SIZE],
++                                 GError     **error);
++
++/* Session */
++TudorTls *tudor_tls_new (EVP_PKEY    *host_key,
++                         const guint8 host_cert[TUDOR_CERT_SIZE],
++                         EVP_PKEY    *sensor_pubkey);
++void      tudor_tls_free (TudorTls *tls);
++
++GByteArray *tudor_tls_client_hello (TudorTls *tls);
++GByteArray *tudor_tls_handle_server_hello (TudorTls     *tls,
++                                           const guint8 *data,
++                                           gsize         len,
++                                           GError      **error);
++gboolean    tudor_tls_handle_server_finished (TudorTls     *tls,
++                                              const guint8 *data,
++                                              gsize         len,
++                                              GError      **error);
++gboolean    tudor_tls_is_established (TudorTls *tls);
++
++GByteArray *tudor_tls_wrap (TudorTls     *tls,
++                            const guint8 *data,
++                            gsize         len);
++GByteArray *tudor_tls_unwrap (TudorTls     *tls,
++                              const guint8 *data,
++                              gsize         len,
++                              GError      **error);
++GByteArray *tudor_tls_close_notify (TudorTls *tls);
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (TudorTls, tudor_tls_free)

@@ -1,0 +1,349 @@
+From 3dcf24e4149e9ff972ceb7a0c7d604b4a64ced77 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 17:22:07 +0100
+Subject: [PATCH 8/8] synaptics_tudor: Keep the pairing between opens
+
+The sensor ties templates to the host key it was paired with, so pairing
+on every open lost them. The key and both certificates are stored per
+sensor, a rejected stored pairing is replaced by a fresh one.
+---
+ PROTOCOL.md                                   |  30 +++-
+ libfprint/drivers/synaptics_tudor/tudor.c     | 139 +++++++++++++++++-
+ libfprint/drivers/synaptics_tudor/tudor_tls.c |  50 +++++--
+ libfprint/drivers/synaptics_tudor/tudor_tls.h |   5 +
+ 4 files changed, 205 insertions(+), 19 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 373ea2db..19de4413 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -125,12 +125,30 @@ Type 1 was never seen on the wire and is not sent.
+ ## Pairing
+ 
+ PAIR sends a host certificate and the sensor answers with the host
+-certificate countersigned and its own certificate. The Windows driver does
+-this on every open with a new key pair, the traces of two runs show two
+-different host keys, and the saved Windows store only holds the latest
+-one. Nothing is reused. The driver does the same: a fresh P-256 key
+-per open, no persistent data. (libfprint has no per-device persistent data
+-API anyway, only prints stored by the caller.) 25 opens in a row worked.
++certificate countersigned and its own certificate. **The sensor ties its
++templates to this pairing**, templates enrolled under one host key do not
++match under another. An earlier version of these notes said the Windows
++driver pairs on every open, that was an artefact of the emulation. With
++the pairing kept, the Windows driver sends no PAIR at all: two probe
++passes (version, iota 9, iota 1a, af, startinfo), the TLS state read and
++the handshake with the stored host key and certificate, then frame state,
++db info twice and the object lists (cross-identify.trace).
++
++The driver keeps host key (32 bytes), countersigned host cert and sensor
++cert per sensor in `$FP_TUDOR_PAIRING_DIR` or
++`/var/lib/fprint/synaptics_tudor/<sensor id>.pairing` (file 0600,
++directory 0700), see tudor_pairing_load/save/forget in tudor.c. If the
++handshake with the stored pairing fails the file is dropped and the
++sensor is paired again (all the old templates are lost then).
++
++Upstream question: libfprint has no per-device persistent data API, so
++this is a private file next to fprintd's. A proper API would be better.
++
++Seen in the reused-pairing trace and not used yet: after the template list
++the Windows driver lists the payloads of a template (`9f 03 ..`), asks
++object info (`a0 03 <payload id>`) and reads the data (`a1 03 <payload
++id>`, reply starts with the same type/length/data list as the commit).
++That is the missing read command, it would give list real prints.
+ 
+ ### Certificate format (400 bytes)
+ 
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index ed08bbe1..47c21630 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -19,6 +19,7 @@
+ #define FP_COMPONENT "synaptics_tudor"
+ 
+ #include <string.h>
++#include <glib/gstdio.h>
+ 
+ #include "drivers_api.h"
+ 
+@@ -75,6 +76,7 @@ struct _FpiDeviceSynapticsTudor
+   guint         version_tries;
+   guint         probe_idx;
+   guint         probe_pass;
++  gboolean      pairing_from_file;
+ 
+   /* List */
+   TudorDbInfo   db_info;
+@@ -469,6 +471,98 @@ tudor_control (FpiSsm *ssm, gboolean in, guint8 request, guint16 value, gsize le
+                            tudor_ctrl_done, NULL);
+ }
+ 
++/* Pairing storage. The sensor ties its templates to the host key it was
++ * paired with, so the pairing has to survive between opens. This is the
++ * only place that knows where it lives. */
++
++#define TUDOR_PAIRING_DIR     "/var/lib/fprint/synaptics_tudor"
++#define TUDOR_PAIRING_MAGIC   "TUDORPAIR1"
++#define TUDOR_PAIRING_SIZE    (sizeof (TUDOR_PAIRING_MAGIC) - 1 + 32 + 2 * TUDOR_CERT_SIZE)
++
++static gchar *
++tudor_pairing_path (FpiDeviceSynapticsTudor *self)
++{
++  const gchar *dir = g_getenv ("FP_TUDOR_PAIRING_DIR");
++  g_autofree gchar *name = NULL;
++  g_autoptr(GString) id = g_string_new (NULL);
++
++  for (guint i = 0; i < sizeof (self->version.id); i++)
++    g_string_append_printf (id, "%02x", self->version.id[i]);
++  name = g_strdup_printf ("%s.pairing", id->str);
++  return g_build_filename (dir && *dir ? dir : TUDOR_PAIRING_DIR, name, NULL);
++}
++
++static gboolean
++tudor_pairing_load (FpiDeviceSynapticsTudor *self)
++{
++  g_autofree gchar *path = tudor_pairing_path (self);
++  g_autofree gchar *data = NULL;
++  g_autoptr(GError) error = NULL;
++  gsize len = 0, magic = sizeof (TUDOR_PAIRING_MAGIC) - 1;
++  EVP_PKEY *key;
++
++  if (!g_file_get_contents (path, &data, &len, &error))
++    {
++      fp_dbg ("no stored pairing: %s", error->message);
++      return FALSE;
++    }
++  if (len != TUDOR_PAIRING_SIZE || memcmp (data, TUDOR_PAIRING_MAGIC, magic) != 0)
++    {
++      fp_warn ("ignoring malformed pairing file %s", path);
++      return FALSE;
++    }
++
++  key = tudor_key_import ((const guint8 *) data + magic, &error);
++  if (!key)
++    {
++      fp_warn ("ignoring unusable pairing: %s", error->message);
++      return FALSE;
++    }
++  g_clear_pointer (&self->host_key, EVP_PKEY_free);
++  self->host_key = key;
++  memcpy (self->host_cert, data + magic + 32, TUDOR_CERT_SIZE);
++  memcpy (self->dev_cert, data + magic + 32 + TUDOR_CERT_SIZE, TUDOR_CERT_SIZE);
++  return TRUE;
++}
++
++static void
++tudor_pairing_save (FpiDeviceSynapticsTudor *self)
++{
++  g_autofree gchar *path = tudor_pairing_path (self);
++  g_autofree gchar *dir = g_path_get_dirname (path);
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GByteArray) data = g_byte_array_new ();
++  guint8 secret[32];
++
++  if (!tudor_key_export (self->host_key, secret, &error))
++    {
++      fp_warn ("could not store pairing: %s", error->message);
++      return;
++    }
++  g_byte_array_append (data, (const guint8 *) TUDOR_PAIRING_MAGIC, sizeof (TUDOR_PAIRING_MAGIC) - 1);
++  g_byte_array_append (data, secret, sizeof (secret));
++  g_byte_array_append (data, self->host_cert, TUDOR_CERT_SIZE);
++  g_byte_array_append (data, self->dev_cert, TUDOR_CERT_SIZE);
++  OPENSSL_cleanse (secret, sizeof (secret));
++
++  if (g_mkdir_with_parents (dir, 0700) != 0 ||
++      !g_file_set_contents_full (path, (const gchar *) data->data, data->len,
++                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
++    {
++      fp_warn ("could not store pairing in %s: %s", dir, error ? error->message : "mkdir failed");
++      return;
++    }
++  fp_dbg ("stored pairing in %s", path);
++}
++
++static void
++tudor_pairing_forget (FpiDeviceSynapticsTudor *self)
++{
++  g_autofree gchar *path = tudor_pairing_path (self);
++
++  g_unlink (path);
++}
++
+ /* Open */
+ 
+ enum {
+@@ -605,6 +699,29 @@ open_pair_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+   fpi_ssm_jump_to_state (ssm, OPEN_PASS);
+ }
+ 
++/* With a stored pairing the sensor is not paired again, the session is
++ * set up with the old keys */
++static void
++open_use_pairing (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  g_autoptr(EVP_PKEY) sensor_key = NULL;
++
++  self->pairing_from_file = FALSE;
++  if (tudor_pairing_load (self) &&
++      tudor_cert_verify_sensor (self->dev_cert, self->version.fw_major, self->version.fw_minor,
++                                (self->version.flags2 & 0x20) != 0, NULL) &&
++      (sensor_key = tudor_cert_get_pubkey (self->dev_cert, NULL)))
++    {
++      g_clear_pointer (&self->tls, tudor_tls_free);
++      self->tls = tudor_tls_new (self->host_key, self->host_cert, sensor_key);
++      self->pairing_from_file = TRUE;
++      fp_dbg ("using stored pairing");
++      fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
++      return;
++    }
++  fpi_ssm_jump_to_state (ssm, OPEN_PAIR);
++}
++
+ static void
+ open_hello_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ {
+@@ -629,6 +746,18 @@ open_flight_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+   if (!tudor_tls_handle_server_finished (self->tls, self->reply->data,
+                                          self->reply->len, &error))
+     {
++      /* The sensor does not know the stored pairing any more, pair again */
++      if (self->pairing_from_file)
++        {
++          fp_dbg ("stored pairing rejected: %s", error->message);
++          g_clear_error (&error);
++          tudor_pairing_forget (self);
++          self->pairing_from_file = FALSE;
++          g_clear_pointer (&self->tls, tudor_tls_free);
++          self->version_tries = 0;
++          fpi_ssm_jump_to_state (ssm, OPEN_PAIR);
++          return;
++        }
+       fpi_ssm_mark_failed (ssm, error);
+       return;
+     }
+@@ -658,8 +787,10 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+           /* Twice before pairing and once after */
+           if (self->probe_pass++ == 0)
+             fpi_ssm_jump_to_state (ssm, OPEN_PASS);
++          else if (self->probe_pass == 2)
++            open_use_pairing (self, ssm);
+           else
+-            fpi_ssm_jump_to_state (ssm, self->probe_pass == 2 ? OPEN_PAIR : OPEN_TLS_STATE);
++            fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
+         }
+       else
+         {
+@@ -729,6 +860,11 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+                                                                 "Sensor does not report a session"));
+             return;
+           }
++        if (!self->pairing_from_file)
++          {
++            tudor_pairing_save (self);
++            self->pairing_from_file = TRUE;
++          }
+         tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
+       }
+       break;
+@@ -785,6 +921,7 @@ tudor_open (FpDevice *device)
+   self->version_tries = 0;
+   self->probe_idx = 0;
+   self->probe_pass = 0;
++  self->pairing_from_file = FALSE;
+ 
+   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device),
+                                      TUDOR_INTERFACE, 0, &error))
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.c b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+index 70e08ea1..6e5b27e3 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor_tls.c
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+@@ -287,20 +287,50 @@ tudor_cert_new_host_key (GError **error)
+   return key;
+ }
+ 
+-/* Key from the TLS PRF output, wrapped in a bare SEC1 structure so openssl
+- * works out the public point on its own */
+-static EVP_PKEY *
+-hs_key_new (GError **error)
++/* Private key from its 32 byte big endian number, wrapped in a bare SEC1
++ * structure so openssl works out the public point on its own */
++EVP_PKEY *
++tudor_key_import (const guint8 secret[32], GError **error)
+ {
+   static const guint8 sec1_head[] = { 0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20 };
+   static const guint8 sec1_tail[] = {
+     0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07
+   };
+-  guint8 prf[32];
+   guint8 der[sizeof (sec1_head) + 32 + sizeof (sec1_tail)];
+   const guint8 *p = der;
+   EVP_PKEY *key;
+ 
++  memcpy (der, sec1_head, sizeof (sec1_head));
++  memcpy (der + sizeof (sec1_head), secret, 32);
++  memcpy (der + sizeof (sec1_head) + 32, sec1_tail, sizeof (sec1_tail));
++
++  key = d2i_PrivateKey (EVP_PKEY_EC, NULL, &p, sizeof (der));
++  OPENSSL_cleanse (der, sizeof (der));
++  if (!key)
++    set_ssl_error (error, "Could not load private key");
++  return key;
++}
++
++gboolean
++tudor_key_export (EVP_PKEY *key, guint8 secret[32], GError **error)
++{
++  BIGNUM *d = NULL;
++  gboolean ok = EVP_PKEY_get_bn_param (key, OSSL_PKEY_PARAM_PRIV_KEY, &d) &&
++                BN_bn2binpad (d, secret, 32) == 32;
++
++  BN_clear_free (d);
++  if (!ok)
++    set_ssl_error (error, "Could not export private key");
++  return ok;
++}
++
++static EVP_PKEY *
++hs_key_new (GError **error)
++{
++  guint8 prf[32];
++  guint8 secret[32];
++  EVP_PKEY *key;
++
+   if (!tls_prf (EVP_sha256 (), hs_key_secret, sizeof (hs_key_secret),
+                 "HS_KEY_PAIR_GEN", hs_key_seed, sizeof (hs_key_seed),
+                 prf, sizeof (prf)))
+@@ -309,13 +339,9 @@ hs_key_new (GError **error)
+       return NULL;
+     }
+ 
+-  memcpy (der, sec1_head, sizeof (sec1_head));
+-  reverse_copy (der + sizeof (sec1_head), prf, 32);
+-  memcpy (der + sizeof (sec1_head) + 32, sec1_tail, sizeof (sec1_tail));
+-
+-  key = d2i_PrivateKey (EVP_PKEY_EC, NULL, &p, sizeof (der));
+-  if (!key)
+-    set_ssl_error (error, "Could not load pairing key");
++  reverse_copy (secret, prf, 32);
++  key = tudor_key_import (secret, error);
++  OPENSSL_cleanse (secret, sizeof (secret));
+   return key;
+ }
+ 
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.h b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+index 92905aa6..50b671e3 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor_tls.h
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+@@ -37,6 +37,11 @@ typedef struct _TudorTls TudorTls;
+ 
+ /* Pairing certificates */
+ EVP_PKEY *tudor_cert_new_host_key (GError **error);
++EVP_PKEY *tudor_key_import (const guint8 secret[32],
++                           GError     **error);
++gboolean  tudor_key_export (EVP_PKEY *key,
++                           guint8    secret[32],
++                           GError  **error);
+ gboolean  tudor_cert_make_host (EVP_PKEY    *host_key,
+                                 guint8       cert[TUDOR_CERT_SIZE],
+                                 GError     **error);

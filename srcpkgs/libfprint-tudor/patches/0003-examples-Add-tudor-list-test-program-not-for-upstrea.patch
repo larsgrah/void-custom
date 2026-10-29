@@ -1,0 +1,113 @@
+From 7e8d2f92b8397dd589613d6641472afa1eafbdb0 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 15:25:45 +0100
+Subject: [PATCH 3/8] examples: Add tudor-list test program (not for upstream)
+
+---
+ examples/meson.build  | 10 ++++++
+ examples/tudor-list.c | 75 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+)
+ create mode 100644 examples/tudor-list.c
+
+diff --git a/examples/meson.build b/examples/meson.build
+index 250c055b..af80f808 100644
+--- a/examples/meson.build
++++ b/examples/meson.build
+@@ -18,6 +18,16 @@ foreach example: examples
+     )
+ endforeach
+ 
++if 'synaptics_tudor' in drivers
++    executable('tudor-list',
++        'tudor-list.c',
++        dependencies: [
++            libfprint_dep,
++            glib_dep,
++        ],
++    )
++endif
++
+ executable('cpp-test',
+     'cpp-test.cpp',
+     dependencies: libfprint_dep,
+diff --git a/examples/tudor-list.c b/examples/tudor-list.c
+new file mode 100644
+index 00000000..ef277a96
+--- /dev/null
++++ b/examples/tudor-list.c
+@@ -0,0 +1,75 @@
++/*
++ * Test program for the synaptics_tudor driver: opens the sensor, which
++ * pairs and sets up the TLS session, lists what is stored on it and closes
++ * again. Run it with G_MESSAGES_DEBUG=all to see the traffic.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdio.h>
++#include <libfprint/fprint.h>
++
++int
++main (void)
++{
++  g_autoptr(FpContext) ctx = fp_context_new ();
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GPtrArray) prints = NULL;
++  FpDevice *dev = NULL;
++  GPtrArray *devices = fp_context_get_devices (ctx);
++
++  for (guint i = 0; devices && i < devices->len; i++)
++    {
++      FpDevice *d = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (fp_device_get_driver (d), "synaptics_tudor") == 0)
++        dev = d;
++    }
++
++  if (!dev)
++    {
++      g_printerr ("No synaptics_tudor device found\n");
++      return 1;
++    }
++
++  g_print ("Device: %s\n", fp_device_get_name (dev));
++  if (!fp_device_open_sync (dev, NULL, &error))
++    {
++      g_printerr ("Open failed: %s\n", error->message);
++      return 1;
++    }
++  g_print ("Opened, TLS session is up\n");
++
++  prints = fp_device_list_prints_sync (dev, NULL, &error);
++  if (!prints)
++    {
++      g_printerr ("Listing failed: %s\n", error->message);
++      g_clear_error (&error);
++    }
++  else
++    {
++      g_print ("%u objects on the sensor\n", prints->len);
++      for (guint i = 0; i < prints->len; i++)
++        g_print ("  %s\n", fp_print_get_description (g_ptr_array_index (prints, i)));
++    }
++
++  if (!fp_device_close_sync (dev, NULL, &error))
++    {
++      g_printerr ("Close failed: %s\n", error->message);
++      return 1;
++    }
++  g_print ("Closed\n");
++  return prints ? 0 : 1;
++}

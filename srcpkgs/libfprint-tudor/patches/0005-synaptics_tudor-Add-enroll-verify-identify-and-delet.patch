@@ -1,0 +1,1700 @@
+From b419730d992779726d2c4f4d775f50f88a8f1475 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 16:34:27 +0100
+Subject: [PATCH 5/8] synaptics_tudor: Add enroll, verify, identify and delete
+
+Done from a trace of the vendor driver with a finger on the sensor.
+Captures go through the event endpoint, enroll takes the sensor's own
+number of captures and commits the template with a user id string as
+payload. Verify and identify compare the template id the sensor reports
+with the one stored in the print. Delete removes the user of a template
+after checking it has no other template.
+---
+ PROTOCOL.md                                   |  138 ++-
+ examples/meson.build                          |   16 +-
+ examples/tudor-test.c                         |  169 +++
+ libfprint/drivers/synaptics_tudor/tudor.c     | 1013 ++++++++++++++++-
+ libfprint/drivers/synaptics_tudor/tudor.h     |   22 +-
+ libfprint/drivers/synaptics_tudor/tudor_led.h |   82 ++
+ 6 files changed, 1378 insertions(+), 62 deletions(-)
+ create mode 100644 examples/tudor-test.c
+ create mode 100644 libfprint/drivers/synaptics_tudor/tudor_led.h
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index d38c0a37..1164652a 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -217,23 +217,128 @@ All the deviations from the standard:
+   warning alert (`01 00`) as a command with wValue 7, the sensor answers
+   with its own close_notify.
+ 
++## Events, captures, enroll, match, delete
++
++All from the finger-on-sensor trace of the Windows driver, implemented in
++the driver but not yet run against a finger (see the test notes at the end).
++
++### Events
++
++The interrupt endpoint 0x83 sends 7 byte notices (byte 6 is a running
++number, nothing else is needed). What happened is read with EVENT_READ.
++
++- `86 <mask u32> 0*12 <mask u32> 0*12 <flag u32>` EVENT_CONFIG, 37 bytes.
++  The mask is repeated at offset 1 and 17. Used: 0x06 (finger down and up),
++  0x04 (finger up), 0x01000000 (frame acquired, event 24) and mask 0 with
++  flag 4 to turn everything off. The reply is 64 bytes, the last u16 (offset
++  62 of the payload) is the number of the next event.
++- `87 <seq u16> 20 00 01 00 00 00` EVENT_READ. Payload: u32 count, then
++  12 byte events: u16 type, u16 number, u32 timestamp, u32 flags. Types:
++  1 finger down, 2 finger up, 24 frame acquired. Flags bit 31 on a frame
++  event means the capture was rejected (the Windows log says "reject
++  detail 0x7"). Seq is the number from the last EVENT_CONFIG reply for the
++  finger events and 0 for the frame event.
++- `39 ... ` LED_EX2, always 125 bytes, four fixed patterns (waiting for a
++  finger, off, success, failure), see tudor_led.h.
++- `80 <arg> 00 00 00 01 00 00 00 01 00 00 08 01 01 01 00` FRAME_ACQ, arg
++  0x0c for enroll and 0x14 for verify and identify, meaning unknown. `81`
++  FRAME_FINISH. Both reply with the status only.
++
++### One capture
++
++1. EVENT_CONFIG 0x06, wait for the notice (the sensor has an old event
++   pending whenever the last finger is still down or was just lifted, if
++   none comes the finger is up), EVENT_READ. If a finger down came without
++   a finger up: EVENT_CONFIG 0x04, wait, EVENT_READ until the finger up.
++   An EVENT_CONFIG off after every read.
++2. LED waiting, EVENT_CONFIG 0x01000000, FRAME_ACQ. The sensor takes the
++   image when a finger lands. Wait for the notice, EVENT_READ seq 0 for the
++   type 24 event.
++3. LED off, EVENT_CONFIG off, FRAME_FINISH.
++
++A rejected capture (flag) skips the processing step and starts over at 1.
++
++### Enroll (opcode 0x96)
++
++| command | meaning |
++|---|---|
++| `96 01` + 11 zeros | begin |
++| `96 02 00 00 00` | process the capture just taken |
++| `96 03 ...` | commit |
++| `96 04 00 00 00` | end |
++
++Reply of `96 02` (payload): template id (16, all zero until done), u32 60,
++u16 mask of captures taken (0x01, 0x03, 0x07 ... 0x7f), u16 percent
++(14 28 42 57 71 85 100), then counters and a quality of about 0x60. 7
++captures in the trace, and the id turns up in the reply of the 7th. After
++that: LED success, commit, end. The Windows driver also asks DB info
++between commit and end, not needed.
++
++Commit: `96 03`, 7 zero bytes, u32 length, then a list of type (u16),
++length (u32), data:
++
++| type | data |
++|---|---|
++| 0 | template id (16) |
++| 1 | identity: u32 2 (guid), 16 byte guid, zeros up to 76 bytes |
++| 2 | 1 byte finger, Windows numbering (1-5 right thumb..little, 6-10 left) |
++| 3 | payload, 17 bytes in Windows: the guid and the finger |
++
++The driver makes a new random guid per print so each print is a user of
++its own, and puts the libfprint user id string in the payload (cut at 64
++bytes, whether the sensor takes other sizes than 17 is untested).
++
++DB info after an enroll: users, templates and payloads all go up by one.
++
++### Identify (opcode 0x99)
++
++`99 01` + 11 zeros after a capture, the same for verify (the sensor has no
++verify). Status 0: match, payload is the template id (16) then fixed
++fields and, from offset 0x40 of the payload, the same type/length/data
++list as the commit (identity and payload of the match). Status 0x0905: no
++match, nothing else in the reply. LED success or failure after it.
++
++### Object info and delete
++
++- `a0 02 00 00 00 <template id>` object info of a template. Payload
++  offset 18 has the id of the user it belongs to (16 bytes), the bytes
++  before it are ff.
++- `a3 01 00 00 00 <user id>` deletes the user and everything below it.
++  Reply payload u16 3: the user, its template and its payload. DB info
++  afterwards: users, templates and payloads -1 each (counted as deleted).
++- The driver only deletes after `9f 02 00 00 00 <user id>` (templates of
++  that user, parent filter, not seen in the trace) returns exactly that
++  one template.
++
++### Storage and the print mapping
++
++The sensor only gives the payload back inside an identify reply, so the
++template to print mapping (username, finger) cannot be listed without a
++finger. Nothing in the trace reads an object's data (0xa1 in proto.txt).
++The driver treats the template id as the print: prints carry the id as
++data, verify and identify compare the id the sensor reports to the one in
++the print, list gives one print per template without username or finger.
++
+ ## Safety
+ 
+-tudor_cmd_allowed() lets through only GET_VERSION, PAIR, TLS_DATA and the
+-two DB reads. The driver never sends bootloader patch, peek/poke,
+-provision, ownership commands, storage writes, DB writes, request 0x15, or
+-anything else not seen in the traces.
++tudor_cmd_allowed() lets through only commands seen in the traces: the
++ones for open and listing above, LED, events, frame acquire and finish,
++enroll 0x96 01..04, identify, object info on templates and the delete of a
++user. The driver never sends bootloader patch, peek/poke, provision,
++ownership commands, storage writes or formats, request 0x15, or anything
++else not seen in the traces.
+ 
+ ## Unknowns
+ 
+ - Meaning of request 0x19/0x1a (a probe the Windows driver always does),
+   0x1b (session end).
+ - Opcode 0xaf (`af 01 00 00 00`, 10 byte reply, after the status `0de2a15901ffffff`).
+-- What the 2 templates and 4 payloads are in terms of fingers and users,
+-  how a user object maps to a template, and what is in the 16 byte ids.
+-  The 3 user objects are not listed by anything seen so far.
+-- Payload object contents and the reply of OBJ_LIST for a template that
+-  has payloads (only empty ones seen).
++- How to read a payload object (data command not in any trace) and which
++  object the payload hangs below (listing it below the templates gave
++  nothing for the owner's templates).
++- The ff bytes in the object info reply and the fields after the user id.
++- Meaning of the FRAME_ACQ argument, of the 0x3c in the enroll reply and of
++  the other fields in the identify reply.
+ - Status values other than 0.
+ - The 32 byte signature scheme of the countersigned host cert, and whether
+   the sensor checks anything in the junk bytes of the Certificate message.
+@@ -241,12 +346,11 @@ anything else not seen in the traces.
+ - Event endpoint 0x83 format (bytes 5 and 6 in the prototype notes are
+   frame index and event sequence).
+ 
+-## What is needed for enroll, verify, identify
++## Open points for the hardware test
+ 
+-Plaintext traces (same hook as for pair/reuse) with a finger on the
+-sensor of: one enroll (all stages, including EVENT_CONFIG / EVENT_READ,
+-LED_EX2, FRAME_ACQ/READ/FINISH, the DB2 object writes at the end and the
+-reply of the final DB info and object list), one verify and one
+-identify (IDENTIFY_WBF with its arguments and reply, and what happens on
+-no match), and one delete of a single print. The two throwaway
+-enrollments from capture-touch.sh would do.
++- Does the sensor take payloads other than 17 bytes.
++- Is the user id offset in the object info reply right (the driver
++  refuses to delete unless the parent filter query agrees).
++- What a rejected capture does in an enroll.
++- A trace of listing the data of an object would allow list to give real
++  prints.
+diff --git a/examples/meson.build b/examples/meson.build
+index af80f808..15989fb3 100644
+--- a/examples/meson.build
++++ b/examples/meson.build
+@@ -19,13 +19,15 @@ foreach example: examples
+ endforeach
+ 
+ if 'synaptics_tudor' in drivers
+-    executable('tudor-list',
+-        'tudor-list.c',
+-        dependencies: [
+-            libfprint_dep,
+-            glib_dep,
+-        ],
+-    )
++    foreach example : [ 'tudor-list', 'tudor-test' ]
++        executable(example,
++            example + '.c',
++            dependencies: [
++                libfprint_dep,
++                glib_dep,
++            ],
++        )
++    endforeach
+ endif
+ 
+ executable('cpp-test',
+diff --git a/examples/tudor-test.c b/examples/tudor-test.c
+new file mode 100644
+index 00000000..ad1d44f5
+--- /dev/null
++++ b/examples/tudor-test.c
+@@ -0,0 +1,169 @@
++/*
++ * Hardware test for the synaptics_tudor driver. Enrolls a print of its own,
++ * verifies and identifies it and deletes it again. Nothing else on the
++ * sensor is ever deleted, only the print made in this run. Needs a finger
++ * that is not enrolled on the sensor already.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdio.h>
++#include <libfprint/fprint.h>
++
++static void
++say (const char *what)
++{
++  g_print ("%s\n", what);
++  fflush (stdout);
++}
++
++static void
++enroll_progress (FpDevice *dev, gint done, FpPrint *print, gpointer data, GError *error)
++{
++  if (error)
++    g_print ("  retry: %s\n", error->message);
++  else
++    g_print ("  enroll stage %d done\n", done);
++  fflush (stdout);
++}
++
++static void
++match_cb (FpDevice *dev, FpPrint *match, FpPrint *print, gpointer data, GError *error)
++{
++  g_print ("  match callback: %s\n", error ? error->message : (match ? "match" : "no match"));
++  fflush (stdout);
++}
++
++static guint
++count_prints (FpDevice *dev)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GPtrArray) prints = fp_device_list_prints_sync (dev, NULL, &error);
++
++  if (!prints)
++    {
++      g_printerr ("  list failed: %s\n", error->message);
++      return G_MAXUINT;
++    }
++  g_print ("  %u prints on the sensor\n", prints->len);
++  for (guint i = 0; i < prints->len; i++)
++    g_print ("    %s\n", fp_print_get_description (g_ptr_array_index (prints, i)));
++  fflush (stdout);
++  return prints->len;
++}
++
++int
++main (void)
++{
++  g_autoptr(FpContext) ctx = fp_context_new ();
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpPrint) template = NULL;
++  g_autoptr(FpPrint) print = NULL;
++  g_autoptr(GPtrArray) gallery = g_ptr_array_new ();
++  FpDevice *dev = NULL;
++  GPtrArray *devices = fp_context_get_devices (ctx);
++  FpPrint *match = NULL;
++  gboolean ok = FALSE;
++  guint before, after;
++  gboolean matched = FALSE;
++
++  for (guint i = 0; devices && i < devices->len; i++)
++    {
++      FpDevice *d = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (fp_device_get_driver (d), "synaptics_tudor") == 0)
++        dev = d;
++    }
++  if (!dev)
++    {
++      g_printerr ("No synaptics_tudor device found\n");
++      return 1;
++    }
++
++  if (!fp_device_open_sync (dev, NULL, &error))
++    {
++      g_printerr ("Open failed: %s\n", error->message);
++      return 1;
++    }
++
++  say ("before:");
++  before = count_prints (dev);
++
++  say ("ENROLL: touch with the finger and lift it, repeat until it is done");
++  template = fp_print_new (dev);
++  fp_print_set_finger (template, FP_FINGER_RIGHT_THUMB);
++  fp_print_set_username (template, "tudor-test");
++  print = fp_device_enroll_sync (dev, g_object_ref (template), NULL, enroll_progress, NULL, &error);
++  if (!print)
++    {
++      g_printerr ("Enroll failed: %s\n", error->message);
++      goto out;
++    }
++  say ("enrolled");
++
++  say ("after enroll:");
++  after = count_prints (dev);
++  if (before != G_MAXUINT && after != before + 1)
++    g_printerr ("Expected one more print, not going on to delete\n");
++
++  for (int tries = 0; tries < 5 && !matched; tries++)
++    {
++      g_clear_error (&error);
++      say ("VERIFY: touch once");
++      if (fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
++        g_print ("  verify result: %s\n", matched ? "match" : "no match");
++      else if (!g_error_matches (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL) &&
++               error->domain != FP_DEVICE_RETRY)
++        break;
++    }
++
++  g_ptr_array_add (gallery, print);
++  for (int tries = 0; tries < 5; tries++)
++    {
++      g_clear_error (&error);
++      say ("IDENTIFY: touch once");
++      if (fp_device_identify_sync (dev, gallery, NULL, match_cb, NULL, &match, NULL, &error))
++        {
++          g_print ("  identify result: %s\n", match ? "found the print" : "no match");
++          break;
++        }
++      if (error->domain != FP_DEVICE_RETRY)
++        break;
++    }
++  g_clear_error (&error);
++
++  ok = TRUE;
++
++out:
++  if (print && after == before + 1)
++    {
++      say ("DELETE the print made in this run");
++      if (!fp_device_delete_print_sync (dev, print, NULL, &error))
++        {
++          g_printerr ("Delete failed: %s\n", error->message);
++          g_clear_error (&error);
++          ok = FALSE;
++        }
++      say ("after delete:");
++      count_prints (dev);
++    }
++
++  if (!fp_device_close_sync (dev, NULL, &error))
++    {
++      g_printerr ("Close failed: %s\n", error->message);
++      return 1;
++    }
++  return ok ? 0 : 1;
++}
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 80126d67..82779958 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -23,6 +23,7 @@
+ #include "drivers_api.h"
+ 
+ #include "tudor.h"
++#include "tudor_led.h"
+ #include "tudor_tls.h"
+ 
+ /* The sensor function is interface 1, interface 0 is the U2F hid device
+@@ -35,6 +36,29 @@
+ 
+ #define TUDOR_MAX_VERSION_TRIES 3
+ 
++#define TUDOR_EP_EVENT          (3 | FPI_USB_ENDPOINT_IN)
++#define TUDOR_EVENT_FINGER_DOWN 1
++#define TUDOR_EVENT_FINGER_UP   2
++#define TUDOR_EVENT_FRAME       24
++#define TUDOR_EVENT_REJECT      0x80000000
++#define TUDOR_EVENT_SIZE        12
++#define TUDOR_PIN_SHORT_MS      1000
++
++/* How many bytes of user id the payload object of a template takes. The
++ * vendor driver stores 17, a guid and the finger, what the limit is
++ * is not known. */
++#define TUDOR_PAYLOAD_MAX       64
++
++#define TUDOR_ENROLL_STAGES     7
++
++G_DECLARE_FINAL_TYPE (FpiDeviceSynapticsTudor, fpi_device_synaptics_tudor, FPI,
++                      DEVICE_SYNAPTICS_TUDOR, FpDevice)
++
++typedef void (*TudorDoneFunc) (FpiDeviceSynapticsTudor *self,
++                               FpiSsm                  *ssm);
++typedef void (*TudorFinishFunc) (FpiDeviceSynapticsTudor *self,
++                                 GError                  *error);
++
+ struct _FpiDeviceSynapticsTudor
+ {
+   FpDevice      parent;
+@@ -60,19 +84,36 @@ struct _FpiDeviceSynapticsTudor
+   GPtrArray    *template_ids;
+   guint         list_idx;
+   GPtrArray    *prints;
++
++  /* Events and captures */
++  guint16       event_seq;
++  guint32       event_seen;
++  gboolean      event_reject;
++  gboolean      pin_short;
++  gboolean      pin_timed_out;
++  gboolean      finger_is_down;
++  gboolean      cap_rejected;
++  guint8        acq_arg;
++  TudorDoneFunc after;
++
++  /* Operations */
++  gboolean      cleanup;
++  gboolean      enroll_begun;
++  guint8        template_id[TUDOR_DB2_ID_SIZE];
++  guint8        user_id[TUDOR_DB2_ID_SIZE];
++  gboolean      matched;
++  guint         enroll_stages;
++  GError       *op_error;
++  TudorFinishFunc finish;
+ };
+ 
+-G_DECLARE_FINAL_TYPE (FpiDeviceSynapticsTudor, fpi_device_synaptics_tudor, FPI,
+-                      DEVICE_SYNAPTICS_TUDOR, FpDevice)
+ G_DEFINE_TYPE (FpiDeviceSynapticsTudor, fpi_device_synaptics_tudor, FP_TYPE_DEVICE)
+ 
+-typedef void (*TudorDoneFunc) (FpiDeviceSynapticsTudor *self,
+-                               FpiSsm                  *ssm);
+-
+ typedef enum {
+   TUDOR_DECODE_RAW,
+   TUDOR_DECODE_CMD,
+   TUDOR_DECODE_CMD_ALLOW_ALERT,
++  TUDOR_DECODE_CMD_ANY_STATUS,
+ } TudorDecode;
+ 
+ typedef struct
+@@ -83,21 +124,37 @@ typedef struct
+   TudorDoneFunc done;
+ } TudorXfer;
+ 
+-/* Only commands that were seen in captures of the vendor driver and only
+- * read things. Everything else, writes in particular, is refused here no
+- * matter who asks. */
++/* Only commands that were seen in captures of the vendor driver. The
++ * delete is only ever sent with a user id that was looked up from a
++ * template first. Everything else, formats and firmware commands in
++ * particular, is refused here no matter who asks. */
+ gboolean
+-tudor_cmd_allowed (guint8 opcode)
++tudor_cmd_allowed (const guint8 *cmd, gsize len)
+ {
+-  switch (opcode)
++  switch (cmd[0])
+     {
+     case TUDOR_CMD_GET_VERSION:
++    case TUDOR_CMD_LED_EX2:
+     case TUDOR_CMD_TLS_DATA:
++    case TUDOR_CMD_FRAME_ACQ:
++    case TUDOR_CMD_FRAME_FINISH:
++    case TUDOR_CMD_EVENT_CONFIG:
++    case TUDOR_CMD_EVENT_READ:
+     case TUDOR_CMD_PAIR:
+     case TUDOR_CMD_DB2_GET_DB_INFO:
+     case TUDOR_CMD_DB2_OBJ_LIST:
++    case TUDOR_CMD_IDENTIFY:
+       return TRUE;
+ 
++    case TUDOR_CMD_ENROLL:
++      return len > 1 && cmd[1] >= TUDOR_ENROLL_BEGIN && cmd[1] <= TUDOR_ENROLL_END;
++
++    case TUDOR_CMD_DB2_OBJ_INFO:
++      return len > 1 && cmd[1] == TUDOR_DB2_TYPE_TEMPLATE;
++
++    case TUDOR_CMD_DB2_OBJ_DELETE:
++      return len == 5 + TUDOR_DB2_ID_SIZE && cmd[1] == TUDOR_DB2_TYPE_USER;
++
+     default:
+       return FALSE;
+     }
+@@ -134,6 +191,27 @@ get_u32le (const guint8 *p)
+ 
+ /* Transport */
+ 
++/* Cleanup runs after a cancel, so it must not use the cancelled cancellable,
++ * and it carries on when single steps fail */
++static GCancellable *
++tudor_cancellable (FpiDeviceSynapticsTudor *self)
++{
++  return self->cleanup ? NULL : fpi_device_get_cancellable (FP_DEVICE (self));
++}
++
++static void
++tudor_xfer_fail (FpiDeviceSynapticsTudor *self, FpiSsm *ssm, GError *error)
++{
++  if (self->cleanup)
++    {
++      fp_dbg ("ignoring error during cleanup: %s", error->message);
++      g_error_free (error);
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++  fpi_ssm_mark_failed (ssm, error);
++}
++
+ static void
+ tudor_xfer_free (TudorXfer *x)
+ {
+@@ -184,7 +262,8 @@ tudor_decode_reply (FpiDeviceSynapticsTudor *self, TudorXfer *x, GError **error)
+     }
+ 
+   self->status = get_u16le (data);
+-  if (self->status != TUDOR_STATUS_OK &&
++  if (x->decode != TUDOR_DECODE_CMD_ANY_STATUS &&
++      self->status != TUDOR_STATUS_OK &&
+       self->status != TUDOR_STATUS_OK_412 &&
+       self->status != TUDOR_STATUS_OK_5CC)
+     {
+@@ -210,7 +289,7 @@ tudor_read_done (FpiUsbTransfer *transfer,
+   if (error)
+     {
+       tudor_xfer_free (x);
+-      fpi_ssm_mark_failed (ssm, error);
++      tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+ 
+@@ -222,7 +301,7 @@ tudor_read_done (FpiUsbTransfer *transfer,
+   tudor_xfer_free (x);
+   if (decode_error)
+     {
+-      fpi_ssm_mark_failed (ssm, decode_error);
++      tudor_xfer_fail (self, ssm, decode_error);
+       return;
+     }
+ 
+@@ -238,6 +317,7 @@ tudor_write_done (FpiUsbTransfer *transfer,
+                   gpointer        user_data,
+                   GError         *error)
+ {
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+   TudorXfer *x = user_data;
+   FpiUsbTransfer *in;
+ 
+@@ -246,7 +326,7 @@ tudor_write_done (FpiUsbTransfer *transfer,
+       FpiSsm *ssm = x->ssm;
+ 
+       tudor_xfer_free (x);
+-      fpi_ssm_mark_failed (ssm, error);
++      tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+ 
+@@ -256,7 +336,7 @@ tudor_write_done (FpiUsbTransfer *transfer,
+                                  G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  TUDOR_REQ_RESP, 0, 0, x->read_cap);
+-  fpi_usb_transfer_submit (in, TUDOR_TIMEOUT_MS, fpi_device_get_cancellable (device),
++  fpi_usb_transfer_submit (in, TUDOR_TIMEOUT_MS, tudor_cancellable (self),
+                            tudor_read_done, x);
+ }
+ 
+@@ -287,7 +367,8 @@ tudor_exchange (FpiSsm       *ssm,
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  TUDOR_REQ_CMD, len % TUDOR_OUT_ALIGN, 0, padded);
+   memcpy (out->buffer, data, len);
+-  fpi_usb_transfer_submit (out, TUDOR_TIMEOUT_MS, fpi_device_get_cancellable (device),
++  fpi_usb_transfer_submit (out, TUDOR_TIMEOUT_MS,
++                           tudor_cancellable (FPI_DEVICE_SYNAPTICS_TUDOR (device)),
+                            tudor_write_done, x);
+ }
+ 
+@@ -303,7 +384,7 @@ tudor_send_cmd (FpiDeviceSynapticsTudor *self,
+ {
+   g_autoptr(GByteArray) wrapped = NULL;
+ 
+-  if (!tudor_cmd_allowed (cmd[0]))
++  if (!tudor_cmd_allowed (cmd, len))
+     {
+       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                           "Refusing to send command 0x%02x",
+@@ -354,7 +435,7 @@ tudor_ctrl_done (FpiUsbTransfer *transfer,
+ 
+   if (error)
+     {
+-      fpi_ssm_mark_failed (ssm, error);
++      tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+ 
+@@ -380,7 +461,8 @@ tudor_control (FpiSsm *ssm, gboolean in, guint8 request, guint16 value, gsize le
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  request, value, 0, length);
+   transfer->ssm = ssm;
+-  fpi_usb_transfer_submit (transfer, TUDOR_TIMEOUT_MS, fpi_device_get_cancellable (device),
++  fpi_usb_transfer_submit (transfer, TUDOR_TIMEOUT_MS,
++                           tudor_cancellable (FPI_DEVICE_SYNAPTICS_TUDOR (device)),
+                            tudor_ctrl_done, NULL);
+ }
+ 
+@@ -911,39 +993,898 @@ tudor_list (FpDevice *device)
+   fpi_ssm_start (fpi_ssm_new (device, list_run_state, LIST_NUM_STATES), list_done);
+ }
+ 
+-/* Stubs for what comes later. They need captures of the vendor driver
+- * with a finger on the sensor, see PROTOCOL.md. */
++/* Prints */
++
++static FpPrint *
++tudor_print_new (FpiDeviceSynapticsTudor *self, FpPrint *print, const guint8 *id)
++{
++  GVariant *data = g_variant_new ("(@ay)",
++                                  g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                             id, TUDOR_DB2_ID_SIZE, 1));
++
++  if (!print)
++    print = fp_print_new (FP_DEVICE (self));
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", data, NULL);
++  return print;
++}
++
++static gboolean
++tudor_print_get_id (FpPrint *print, guint8 id[TUDOR_DB2_ID_SIZE])
++{
++  g_autoptr(GVariant) data = NULL;
++  g_autoptr(GVariant) bytes = NULL;
++  gsize n = 0;
++  gconstpointer p;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(ay)")))
++    return FALSE;
++
++  bytes = g_variant_get_child_value (data, 0);
++  p = g_variant_get_fixed_array (bytes, &n, 1);
++  if (n != TUDOR_DB2_ID_SIZE)
++    return FALSE;
++  memcpy (id, p, n);
++  return TRUE;
++}
++
++/* Events */
++
++static void
++put_u32le (guint8 *p, guint32 v)
++{
++  p[0] = v & 0xff;
++  p[1] = (v >> 8) & 0xff;
++  p[2] = (v >> 16) & 0xff;
++  p[3] = v >> 24;
++}
++
++static void
++tudor_continue (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  TudorDoneFunc after = self->after;
++
++  self->after = NULL;
++  if (after)
++    after (self, ssm);
++  else
++    fpi_ssm_next_state (ssm);
++}
++
++static void
++event_config_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  /* The last word of the reply is the number of the next event */
++  if (self->reply->len >= 64)
++    self->event_seq = get_u16le (self->reply->data + 62);
++  tudor_continue (self, ssm);
++}
++
++/* One mask for the event types, flag 4 turns events off */
++static void
++tudor_event_config (FpiDeviceSynapticsTudor *self,
++                    FpiSsm                  *ssm,
++                    guint32                  mask,
++                    guint32                  flag,
++                    TudorDoneFunc            after)
++{
++  guint8 cmd[37] = { TUDOR_CMD_EVENT_CONFIG };
++
++  put_u32le (cmd + 1, mask);
++  put_u32le (cmd + 17, mask);
++  put_u32le (cmd + 33, flag);
++  self->after = after;
++  tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, event_config_done);
++}
++
++static void
++event_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  const guint8 *r = self->reply->data;
++  gsize len = self->reply->len;
++  guint count = len >= 4 ? get_u32le (r) : 0;
++
++  /* Each event is a type, a number, a timestamp and flags */
++  for (guint i = 0; i < count && 4 + (i + 1) * TUDOR_EVENT_SIZE <= len; i++)
++    {
++      const guint8 *ev = r + 4 + i * TUDOR_EVENT_SIZE;
++      guint type = get_u16le (ev);
++
++      fp_dbg ("event type %u number %u flags 0x%08x", type, get_u16le (ev + 2),
++              get_u32le (ev + 8));
++      if (type < 32)
++        self->event_seen |= 1u << type;
++      if (type == TUDOR_EVENT_FRAME && (get_u32le (ev + 8) & TUDOR_EVENT_REJECT))
++        self->event_reject = TRUE;
++    }
++  tudor_continue (self, ssm);
++}
++
++static void
++tudor_event_read (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm,
++                  guint16                  seq,
++                  TudorDoneFunc            after)
++{
++  guint8 cmd[9] = { TUDOR_CMD_EVENT_READ, seq & 0xff, seq >> 8, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00 };
++
++  self->event_seen = 0;
++  self->event_reject = FALSE;
++  self->after = after;
++  tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, event_read_done);
++}
++
++static void
++tudor_pin_cb (FpiUsbTransfer *transfer,
++              FpDevice       *device,
++              gpointer        user_data,
++              GError         *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  self->pin_timed_out = FALSE;
++  if (error)
++    {
++      if (self->pin_short &&
++          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          self->pin_timed_out = TRUE;
++          tudor_continue (self, transfer->ssm);
++          return;
++        }
++      tudor_xfer_fail (self, transfer->ssm, error);
++      return;
++    }
++
++  dbg_hex ("event notice", transfer->buffer, transfer->actual_length);
++  tudor_continue (self, transfer->ssm);
++}
++
++/* The sensor tells about events on the interrupt endpoint, with a short
++ * wait it gives up after a second */
++static void
++tudor_wait_event (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm,
++                  gboolean                 short_wait,
++                  TudorDoneFunc            after)
++{
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++
++  self->after = after;
++  self->pin_short = short_wait;
++  fpi_usb_transfer_fill_interrupt (transfer, TUDOR_EP_EVENT, 8);
++  transfer->ssm = ssm;
++  fpi_usb_transfer_submit (transfer, short_wait ? TUDOR_PIN_SHORT_MS : 0,
++                           tudor_cancellable (self), tudor_pin_cb, NULL);
++}
++
++static void
++tudor_led (FpiDeviceSynapticsTudor *self, FpiSsm *ssm, const guint8 *pattern)
++{
++  tudor_send_cmd (self, ssm, pattern, 125, 4096, TUDOR_DECODE_CMD, NULL);
++}
++
++/* Capture, shared by enroll, verify and identify */
++
++enum {
++  CAP_PRE_CONFIG,
++  CAP_PRE_WAIT,
++  CAP_PRE_READ,
++  CAP_PRE_OFF,
++  CAP_UP_CONFIG,
++  CAP_UP_WAIT,
++  CAP_UP_READ,
++  CAP_UP_OFF,
++  CAP_LED_WAIT,
++  CAP_ACQ_CONFIG,
++  CAP_ACQ,
++  CAP_ACQ_WAIT,
++  CAP_ACQ_READ,
++  CAP_LED_OFF,
++  CAP_OFF,
++  CAP_FINISH,
++  CAP_NUM_STATES,
++};
++
++static void
++cap_pre_wait_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  /* Nothing pending means the finger is not down */
++  if (self->pin_timed_out)
++    fpi_ssm_jump_to_state (ssm, CAP_PRE_OFF);
++  else
++    fpi_ssm_next_state (ssm);
++}
++
++static void
++cap_pre_off_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  gboolean down = self->event_seen & (1u << TUDOR_EVENT_FINGER_DOWN);
++  gboolean up = self->event_seen & (1u << TUDOR_EVENT_FINGER_UP);
++
++  /* A finger from before has to be lifted first */
++  if (down && !up)
++    fpi_ssm_next_state (ssm);
++  else
++    fpi_ssm_jump_to_state (ssm, CAP_LED_WAIT);
++}
++
++static void
++cap_up_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  if (self->event_seen & (1u << TUDOR_EVENT_FINGER_UP))
++    fpi_ssm_next_state (ssm);
++  else
++    fpi_ssm_jump_to_state (ssm, CAP_UP_WAIT);
++}
++
++static void
++cap_acq_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  if (!(self->event_seen & (1u << TUDOR_EVENT_FRAME)))
++    {
++      fpi_ssm_jump_to_state (ssm, CAP_ACQ_WAIT);
++      return;
++    }
++  self->cap_rejected = self->event_reject;
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++cap_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CAP_PRE_CONFIG:
++      self->event_seen = 0;
++      self->cap_rejected = FALSE;
++      tudor_event_config (self, ssm, (1u << TUDOR_EVENT_FINGER_DOWN) | (1u << TUDOR_EVENT_FINGER_UP),
++                          0, NULL);
++      break;
++
++    case CAP_PRE_WAIT:
++      tudor_wait_event (self, ssm, TRUE, cap_pre_wait_done);
++      break;
++
++    case CAP_PRE_READ:
++      tudor_event_read (self, ssm, self->event_seq, NULL);
++      break;
++
++    case CAP_PRE_OFF:
++      tudor_event_config (self, ssm, 0, 4, cap_pre_off_done);
++      break;
++
++    case CAP_UP_CONFIG:
++      tudor_event_config (self, ssm, 1u << TUDOR_EVENT_FINGER_UP, 0, NULL);
++      break;
++
++    case CAP_UP_WAIT:
++      tudor_wait_event (self, ssm, FALSE, NULL);
++      break;
++
++    case CAP_UP_READ:
++      tudor_event_read (self, ssm, self->event_seq, cap_up_read_done);
++      break;
++
++    case CAP_UP_OFF:
++      tudor_event_config (self, ssm, 0, 4, NULL);
++      break;
++
++    case CAP_LED_WAIT:
++      tudor_led (self, ssm, led_wait);
++      break;
++
++    case CAP_ACQ_CONFIG:
++      tudor_event_config (self, ssm, 1u << TUDOR_EVENT_FRAME, 0, NULL);
++      break;
++
++    case CAP_ACQ:
++      {
++        const guint8 cmd[17] = {
++          TUDOR_CMD_FRAME_ACQ, self->acq_arg, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 8, 1, 1, 1, 0
++        };
++
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    case CAP_ACQ_WAIT:
++      tudor_wait_event (self, ssm, FALSE, NULL);
++      break;
++
++    case CAP_ACQ_READ:
++      tudor_event_read (self, ssm, 0, cap_acq_read_done);
++      break;
++
++    case CAP_LED_OFF:
++      tudor_led (self, ssm, led_off);
++      break;
++
++    case CAP_OFF:
++      tudor_event_config (self, ssm, 0, 4, NULL);
++      break;
++
++    case CAP_FINISH:
++      {
++        static const guint8 cmd[] = { TUDOR_CMD_FRAME_FINISH };
++
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++tudor_start_capture (FpiDeviceSynapticsTudor *self, FpiSsm *parent, guint8 acq_arg)
++{
++  self->acq_arg = acq_arg;
++  fpi_ssm_start_subsm (parent, fpi_ssm_new (FP_DEVICE (self), cap_run_state, CAP_NUM_STATES));
++}
++
++/* Cleanup after a failed or cancelled operation, errors in here do not matter */
++
++enum {
++  CLEAN_OFF,
++  CLEAN_LED,
++  CLEAN_FINISH,
++  CLEAN_ENROLL_END,
++  CLEAN_NUM_STATES,
++};
++
++static void
++clean_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CLEAN_OFF:
++      tudor_event_config (self, ssm, 0, 4, NULL);
++      break;
++
++    case CLEAN_LED:
++      tudor_led (self, ssm, led_off);
++      break;
++
++    case CLEAN_FINISH:
++      {
++        static const guint8 cmd[] = { TUDOR_CMD_FRAME_FINISH };
++
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    case CLEAN_ENROLL_END:
++      {
++        static const guint8 cmd[] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_END, 0, 0, 0 };
++
++        if (!self->enroll_begun)
++          {
++            fpi_ssm_mark_completed (ssm);
++            return;
++          }
++        self->enroll_begun = FALSE;
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++clean_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  GError *op_error = g_steal_pointer (&self->op_error);
++  TudorFinishFunc finish = self->finish;
++
++  g_clear_error (&error);
++  self->cleanup = FALSE;
++  self->finish = NULL;
++  finish (self, op_error);
++}
++
++/* Passes the error on to finish once the sensor is back in a sane state */
++static void
++tudor_finish_op (FpiDeviceSynapticsTudor *self, GError *error, TudorFinishFunc finish)
++{
++  /* A retry is not an error, the capture has already put things away */
++  if ((!error && !self->enroll_begun) || (error && error->domain == FP_DEVICE_RETRY))
++    {
++      finish (self, error);
++      return;
++    }
++
++  self->op_error = error;
++  self->cleanup = TRUE;
++  self->finish = finish;
++  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (self), clean_run_state, CLEAN_NUM_STATES), clean_done);
++}
++
++/* Enroll */
++
++enum {
++  EN_BEGIN,
++  EN_CAPTURE,
++  EN_PROCESS,
++  EN_LED,
++  EN_COMMIT,
++  EN_END,
++  EN_NUM_STATES,
++};
++
++static guint8
++tudor_subfactor (FpFinger finger)
++{
++  /* Left hand 6 to 10 and right hand 1 to 5 in Windows, the other way here */
++  if (finger >= FP_FINGER_LEFT_THUMB && finger <= FP_FINGER_LEFT_LITTLE)
++    return finger + 5;
++  if (finger >= FP_FINGER_RIGHT_THUMB && finger <= FP_FINGER_RIGHT_LITTLE)
++    return finger - 5;
++  return 0;
++}
++
++static void
++put_tlv (GByteArray *out, guint16 type, const guint8 *data, guint32 len)
++{
++  guint8 head[6] = { type & 0xff, type >> 8 };
++
++  put_u32le (head + 2, len);
++  g_byte_array_append (out, head, sizeof (head));
++  g_byte_array_append (out, data, len);
++}
++
++/* The command that stores the enrollment: a list of type, length, data
++ * with the template id, an identity (type 2 is a guid, a new one for each
++ * print so every print is a user of its own), the finger and a payload
++ * that is the user id string. */
++static GByteArray *
++tudor_build_commit (FpiDeviceSynapticsTudor *self, FpPrint *print)
++{
++  g_autofree gchar *user_id = fpi_print_generate_user_id (print);
++  g_autoptr(GByteArray) blob = g_byte_array_new ();
++  GByteArray *cmd = g_byte_array_new ();
++  guint8 identity[76] = { 2 };
++  guint8 subfactor = tudor_subfactor (fp_print_get_finger (print));
++  guint8 head[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_COMMIT };
++
++  for (guint i = 0; i < 16; i++)
++    identity[4 + i] = g_random_int_range (0, 256);
++
++  put_tlv (blob, 0, self->template_id, TUDOR_DB2_ID_SIZE);
++  put_tlv (blob, 1, identity, sizeof (identity));
++  put_tlv (blob, 2, &subfactor, 1);
++  put_tlv (blob, 3, (const guint8 *) user_id, MIN (strlen (user_id), TUDOR_PAYLOAD_MAX));
++
++  /* Seven zero bytes, then the length of the list */
++  put_u32le (head + 9, blob->len);
++  g_byte_array_append (cmd, head, sizeof (head));
++  g_byte_array_append (cmd, blob->data, blob->len);
++  return cmd;
++}
++
++static void
++en_add_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  const guint8 *r = self->reply->data;
++  FpDevice *device = FP_DEVICE (self);
++  guint stages;
++  gboolean done = FALSE;
++
++  if (self->reply->len < 24)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Enroll reply too short"));
++      return;
++    }
++
++  /* Template id once done, then a mask of the captures taken and percent done */
++  for (guint i = 0; i < TUDOR_DB2_ID_SIZE; i++)
++    done |= r[i] != 0;
++  stages = __builtin_popcount (get_u16le (r + 20));
++  fp_dbg ("enroll %u captures, %u percent%s", stages, get_u16le (r + 22), done ? ", done" : "");
++
++  self->enroll_stages = stages;
++  fpi_device_enroll_progress (device, MIN (stages, TUDOR_ENROLL_STAGES), NULL, NULL);
++
++  if (done)
++    {
++      memcpy (self->template_id, r, TUDOR_DB2_ID_SIZE);
++      fpi_ssm_next_state (ssm);
++    }
++  else
++    {
++      fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
++    }
++}
++
++static void
++en_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case EN_BEGIN:
++      {
++        static const guint8 cmd[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_BEGIN };
++
++        self->enroll_begun = TRUE;
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    case EN_CAPTURE:
++      tudor_start_capture (self, ssm, 0x0c);
++      break;
++
++    case EN_PROCESS:
++      {
++        static const guint8 cmd[5] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_ADD };
++
++        if (self->cap_rejected)
++          {
++            fpi_device_enroll_progress (device, MIN (self->enroll_stages, TUDOR_ENROLL_STAGES), NULL,
++                                        fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++            fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
++            return;
++          }
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, en_add_done);
++      }
++      break;
++
++    case EN_LED:
++      tudor_led (self, ssm, led_ok);
++      break;
++
++    case EN_COMMIT:
++      {
++        FpPrint *print;
++        g_autoptr(GByteArray) cmd = NULL;
++
++        fpi_device_get_enroll_data (device, &print);
++        cmd = tudor_build_commit (self, print);
++        tudor_send_cmd (self, ssm, cmd->data, cmd->len, 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    case EN_END:
++      {
++        static const guint8 cmd[5] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_END };
++
++        self->enroll_begun = FALSE;
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++enroll_finish (FpiDeviceSynapticsTudor *self, GError *error)
++{
++  FpDevice *device = FP_DEVICE (self);
++  FpPrint *print = NULL;
++
++  if (error)
++    {
++      fpi_device_enroll_complete (device, NULL, error);
++      return;
++    }
++
++  fpi_device_get_enroll_data (device, &print);
++  fpi_device_enroll_complete (device, g_object_ref (tudor_print_new (self, print, self->template_id)),
++                              NULL);
++}
++
++static void
++en_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  tudor_finish_op (FPI_DEVICE_SYNAPTICS_TUDOR (device), error, enroll_finish);
++}
+ 
+ static void
+ tudor_enroll (FpDevice *device)
+ {
+-  /* FIXME: not implemented */
+-  fpi_device_enroll_complete (device, NULL,
+-                              fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  self->enroll_stages = 0;
++  self->enroll_begun = FALSE;
++  fpi_ssm_start (fpi_ssm_new (device, en_run_state, EN_NUM_STATES), en_done);
++}
++
++/* Verify and identify */
++
++enum {
++  ID_CAPTURE,
++  ID_PROCESS,
++  ID_LED,
++  ID_NUM_STATES,
++};
++
++static void
++id_done_cmd (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  if (self->status == TUDOR_STATUS_OK && self->reply->len >= TUDOR_DB2_ID_SIZE)
++    {
++      self->matched = TRUE;
++      memcpy (self->template_id, self->reply->data, TUDOR_DB2_ID_SIZE);
++    }
++  else if (self->status == TUDOR_STATUS_NO_MATCH)
++    {
++      self->matched = FALSE;
++    }
++  else
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Identify failed with status 0x%04x",
++                                                          self->status));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++id_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case ID_CAPTURE:
++      self->matched = FALSE;
++      tudor_start_capture (self, ssm, 0x14);
++      break;
++
++    case ID_PROCESS:
++      {
++        static const guint8 cmd[13] = { TUDOR_CMD_IDENTIFY, 0x01 };
++
++        if (self->cap_rejected)
++          {
++            self->op_error = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
++            fpi_ssm_mark_completed (ssm);
++            return;
++          }
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD_ANY_STATUS,
++                        id_done_cmd);
++      }
++      break;
++
++    case ID_LED:
++      tudor_led (self, ssm, self->matched ? led_ok : led_fail);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++verify_finish (FpiDeviceSynapticsTudor *self, GError *error)
++{
++  FpDevice *device = FP_DEVICE (self);
++  FpPrint *print = NULL;
++  guint8 id[TUDOR_DB2_ID_SIZE];
++
++  if (error && error->domain == FP_DEVICE_RETRY)
++    {
++      fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, error);
++      fpi_device_verify_complete (device, NULL);
++      return;
++    }
++  if (error)
++    {
++      fpi_device_verify_complete (device, error);
++      return;
++    }
++
++  fpi_device_get_verify_data (device, &print);
++  if (self->matched && tudor_print_get_id (print, id) &&
++      memcmp (id, self->template_id, sizeof (id)) == 0)
++    fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
++  else
++    fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
++  fpi_device_verify_complete (device, NULL);
++}
++
++static void
++identify_finish (FpiDeviceSynapticsTudor *self, GError *error)
++{
++  FpDevice *device = FP_DEVICE (self);
++  GPtrArray *gallery = NULL;
++  FpPrint *match = NULL;
++
++  if (error && error->domain == FP_DEVICE_RETRY)
++    {
++      fpi_device_identify_report (device, NULL, NULL, error);
++      fpi_device_identify_complete (device, NULL);
++      return;
++    }
++  if (error)
++    {
++      fpi_device_identify_complete (device, error);
++      return;
++    }
++
++  fpi_device_get_identify_data (device, &gallery);
++  for (guint i = 0; self->matched && i < gallery->len; i++)
++    {
++      FpPrint *candidate = g_ptr_array_index (gallery, i);
++      guint8 id[TUDOR_DB2_ID_SIZE];
++
++      if (tudor_print_get_id (candidate, id) &&
++          memcmp (id, self->template_id, sizeof (id)) == 0)
++        {
++          match = candidate;
++          break;
++        }
++    }
++
++  fpi_device_identify_report (device, match, NULL, NULL);
++  fpi_device_identify_complete (device, NULL);
++}
++
++static void
++verify_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  if (!error)
++    error = g_steal_pointer (&self->op_error);
++  tudor_finish_op (self, error, verify_finish);
++}
++
++static void
++identify_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  if (!error)
++    error = g_steal_pointer (&self->op_error);
++  tudor_finish_op (self, error, identify_finish);
+ }
+ 
+ static void
+ tudor_verify (FpDevice *device)
+ {
+-  /* FIXME: not implemented */
+-  fpi_device_verify_complete (device,
+-                              fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++  fpi_ssm_start (fpi_ssm_new (device, id_run_state, ID_NUM_STATES), verify_done);
+ }
+ 
+ static void
+ tudor_identify (FpDevice *device)
+ {
+-  /* FIXME: not implemented */
+-  fpi_device_identify_complete (device,
+-                                fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++  fpi_ssm_start (fpi_ssm_new (device, id_run_state, ID_NUM_STATES), identify_done);
++}
++
++/* Delete */
++
++enum {
++  DEL_INFO,
++  DEL_CHECK,
++  DEL_DELETE,
++  DEL_NUM_STATES,
++};
++
++static void
++del_info_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  static const guint8 ones[TUDOR_DB2_ID_SIZE] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++                                                  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++  static const guint8 zeros[TUDOR_DB2_ID_SIZE] = { 0 };
++
++  /* The user the template belongs to comes after a few bytes of header */
++  if (self->reply->len < 18 + TUDOR_DB2_ID_SIZE)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Object info reply too short"));
++      return;
++    }
++
++  memcpy (self->user_id, self->reply->data + 18, TUDOR_DB2_ID_SIZE);
++  fp_dbg ("template belongs to a user");
++  if (memcmp (self->user_id, ones, sizeof (ones)) == 0 ||
++      memcmp (self->user_id, zeros, sizeof (zeros)) == 0)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
++                                                          "Template not found"));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
++/* Before deleting make sure the user has this one template and nothing
++ * else, since the delete takes everything below the user with it */
++static void
++del_check_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  const guint8 *r = self->reply->data;
++
++  if (self->reply->len < 2 + TUDOR_DB2_ID_SIZE || get_u16le (r) != 1 ||
++      memcmp (r + 2, self->template_id, TUDOR_DB2_ID_SIZE) != 0)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                                          "The user of the template has other templates, "
++                                                          "not deleting"));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++del_delete_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++{
++  fp_info ("deleted %u objects", self->reply->len >= 2 ? get_u16le (self->reply->data) : 0);
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++del_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  guint8 cmd[5 + TUDOR_DB2_ID_SIZE] = { 0 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case DEL_INFO:
++      cmd[0] = TUDOR_CMD_DB2_OBJ_INFO;
++      cmd[1] = TUDOR_DB2_TYPE_TEMPLATE;
++      memcpy (cmd + 5, self->template_id, TUDOR_DB2_ID_SIZE);
++      tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, del_info_done);
++      break;
++
++    case DEL_CHECK:
++      cmd[0] = TUDOR_CMD_DB2_OBJ_LIST;
++      cmd[1] = TUDOR_DB2_TYPE_TEMPLATE;
++      memcpy (cmd + 5, self->user_id, TUDOR_DB2_ID_SIZE);
++      tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, del_check_done);
++      break;
++
++    case DEL_DELETE:
++      cmd[0] = TUDOR_CMD_DB2_OBJ_DELETE;
++      cmd[1] = TUDOR_DB2_TYPE_USER;
++      memcpy (cmd + 5, self->user_id, TUDOR_DB2_ID_SIZE);
++      tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, del_delete_done);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++del_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  fpi_device_delete_complete (device, error);
+ }
+ 
+ static void
+ tudor_delete (FpDevice *device)
+ {
+-  /* FIXME: not implemented */
+-  fpi_device_delete_complete (device,
+-                              fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  FpPrint *print = NULL;
++
++  fpi_device_get_delete_data (device, &print);
++  if (!tudor_print_get_id (print, self->template_id))
++    {
++      fpi_device_delete_complete (device, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                                    "Print has no template id"));
++      return;
++    }
++  fpi_ssm_start (fpi_ssm_new (device, del_run_state, DEL_NUM_STATES), del_done);
+ }
+ 
+ /* Class */
+@@ -968,8 +1909,7 @@ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+   dev_class->id_table = id_table;
+-  /* FIXME: placeholder until enrolling is figured out */
+-  dev_class->nr_enroll_stages = 1;
++  dev_class->nr_enroll_stages = TUDOR_ENROLL_STAGES;
+   dev_class->temp_hot_seconds = -1;
+ 
+   dev_class->open = tudor_open;
+@@ -980,6 +1920,5 @@ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+   dev_class->identify = tudor_identify;
+   dev_class->delete = tudor_delete;
+ 
+-  /* Only what works, not what the stubs would claim */
+-  dev_class->features = FP_DEVICE_FEATURE_STORAGE | FP_DEVICE_FEATURE_STORAGE_LIST;
++  fpi_device_class_auto_initialize_features (dev_class);
+ }
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.h b/libfprint/drivers/synaptics_tudor/tudor.h
+index aad48159..7abbc471 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.h
++++ b/libfprint/drivers/synaptics_tudor/tudor.h
+@@ -30,10 +30,28 @@
+ 
+ /* Commands the driver is allowed to send, see tudor_cmd_allowed() */
+ #define TUDOR_CMD_GET_VERSION     0x01
++#define TUDOR_CMD_LED_EX2         0x39
+ #define TUDOR_CMD_TLS_DATA        0x44
+ #define TUDOR_CMD_PAIR            0x93
+ #define TUDOR_CMD_DB2_GET_DB_INFO 0x9e
++#define TUDOR_CMD_FRAME_ACQ       0x80
++#define TUDOR_CMD_FRAME_FINISH    0x81
++#define TUDOR_CMD_EVENT_CONFIG    0x86
++#define TUDOR_CMD_EVENT_READ      0x87
++#define TUDOR_CMD_ENROLL          0x96
++#define TUDOR_CMD_IDENTIFY        0x99
+ #define TUDOR_CMD_DB2_OBJ_LIST    0x9f
++#define TUDOR_CMD_DB2_OBJ_INFO    0xa0
++#define TUDOR_CMD_DB2_OBJ_DELETE  0xa3
++
++/* Sub commands of TUDOR_CMD_ENROLL */
++#define TUDOR_ENROLL_BEGIN        0x01
++#define TUDOR_ENROLL_ADD          0x02
++#define TUDOR_ENROLL_COMMIT       0x03
++#define TUDOR_ENROLL_END          0x04
++
++/* Object types in the db2 commands */
++#define TUDOR_DB2_TYPE_USER       0x01
+ 
+ /* Version reply with the status bytes */
+ #define TUDOR_VERSION_REPLY_SIZE  38
+@@ -48,6 +66,7 @@
+ #define TUDOR_STATUS_OK           0x0000
+ #define TUDOR_STATUS_OK_412       0x0412
+ #define TUDOR_STATUS_OK_5CC       0x05cc
++#define TUDOR_STATUS_NO_MATCH     0x0905
+ 
+ /* Certificate in the Synaptics format, 400 bytes */
+ #define TUDOR_CERT_SIZE           400
+@@ -86,4 +105,5 @@ typedef struct
+   guint16 payloads_available;
+ } TudorDbInfo;
+ 
+-gboolean tudor_cmd_allowed (guint8 opcode);
++gboolean tudor_cmd_allowed (const guint8 *cmd,
++                            gsize         len);
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_led.h b/libfprint/drivers/synaptics_tudor/tudor_led.h
+new file mode 100644
+index 00000000..061eaafd
+--- /dev/null
++++ b/libfprint/drivers/synaptics_tudor/tudor_led.h
+@@ -0,0 +1,82 @@
++/*
++ * Synaptics Tudor match-on-chip driver for libfprint
++ * LED patterns as sent by the vendor driver, 125 bytes each
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include <glib.h>
++
++/* No match or failure */
++static const guint8 led_fail[125] = {
++    0x39, 0xe8, 0x03, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00,
++    0x20, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4b, 0x00, 0x00,
++    0x00, 0x01, 0x7f, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* Everything off */
++static const guint8 led_off[125] = {
++    0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* Success */
++static const guint8 led_ok[125] = {
++    0x39, 0xf4, 0x01, 0x00, 0x00, 0xf4, 0x01, 0x00, 0x00, 0x07, 0x7f, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf4, 0x01, 0x00,
++    0x00, 0x00, 0x7f, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* Waiting for a finger */
++static const guint8 led_wait[125] = {
++    0x39, 0x00, 0x71, 0x02, 0x00, 0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00, 0x20, 0x00, 0x00, 0x00,
++    0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
++    0x00, 0x05, 0x7f, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};

@@ -1,0 +1,26 @@
+# Template file for 'libfprint-tudor'
+pkgname=libfprint-tudor
+version=1.94.100
+revision=2
+_commit=6f9479c3d55f847c1b3769f28ceb99227f9858cf
+build_style=meson
+build_helper="gir qemu"
+configure_args="-Dudev_rules=disabled -Dgtk-examples=false -Ddoc=false -Dinstalled-tests=false"
+hostmakedepends="pkg-config glib-devel"
+makedepends="libusb-devel nss-devel glib-devel gdk-pixbuf-devel pixman-devel
+ libgusb-devel libglib-devel openssl-devel"
+depends="libfprint-udev-rules>=1.94.9_1"
+short_desc="Fingerprint reader library with a native Synaptics Tudor driver"
+maintainer="Lars Grahmann <lars@grahmann.family>"
+license="LGPL-2.1-or-later"
+homepage="https://git.grahmann.family/lars/libfprint-tudor"
+distfiles="https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/${_commit}/libfprint-${_commit}.tar.bz2"
+checksum=4c9257c5239f54b02517bed30ba9970a777409a4bf666ae3708cfd2056285f27
+wrksrc="libfprint-${_commit}"
+provides="libfprint-${version}_${revision}"
+replaces="libfprint>=0 libfprint-tod>=0"
+
+post_install() {
+	# headers and the unversioned .so would only fight libfprint-devel
+	rm -rf ${DESTDIR}/usr/include ${DESTDIR}/usr/lib/pkgconfig ${DESTDIR}/usr/lib/libfprint-2.so
+}

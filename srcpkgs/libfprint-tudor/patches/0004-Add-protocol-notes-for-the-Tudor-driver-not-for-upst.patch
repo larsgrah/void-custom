@@ -1,0 +1,269 @@
+From 0d15501e308bd6b3bd7537866c7d359f5152c18e Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 15:25:45 +0100
+Subject: [PATCH 4/8] Add protocol notes for the Tudor driver (not for
+ upstream)
+
+---
+ PROTOCOL.md | 252 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 252 insertions(+)
+ create mode 100644 PROTOCOL.md
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+new file mode 100644
+index 00000000..d38c0a37
+--- /dev/null
++++ b/PROTOCOL.md
+@@ -0,0 +1,252 @@
++# Synaptics Tudor (Kensington VeriMark DT, 047d:00f2) protocol notes
++
++Not for upstream. Sources: the python prototype from the synaTudor
++reverse engineering effort (06cb:00be, older firmware), plaintext traces
++of the Windows driver 6.0.11.1132 talking to this exact sensor
++(firmware 10.1), and live experiments with the driver in this branch.
++Where the prototype and the traces disagree the traces won.
++
++Everything here is verified on hardware unless it sits under "Unknowns".
++
++## USB
++
++- Two interfaces. Interface 0 is a FIDO U2F hid device and stays with
++  usbhid. Interface 1 is vendor class, with one interrupt IN endpoint 0x83
++  (8 bytes, events, unused so far). The driver claims interface 1 only.
++- Full speed, EP0 max packet 8 bytes.
++- Everything goes over vendor control transfers to the device, wIndex 0.
++  There are no bulk endpoints in use (the 06cb:00be prototype used some).
++
++| bmRequestType | bRequest | wValue | data | meaning |
++|---|---|---|---|---|
++| 0x40 out | 0x16 | len mod 8 | command | send a command |
++| 0xc0 in  | 0x17 | ignored | reply | read the reply of the last command |
++| 0x40 out | 0x19 | 1 | none | seen first thing in every open, purpose unknown, not needed |
++| 0xc0 in  | 0x1a | 0 | 1 byte | reads 0x01 after 0x19, purpose unknown, not needed |
++| 0xc0 in  | 0x14 | 0 | 2 bytes | TLS state, byte 0 is 1 inside a session, 0 outside |
++| 0x40 out | 0x1b | 0 | none | sent before the closing alert, "session end" in the vendor log |
++| 0x40 out | 0x15 | | | bootloader/DFT, never used |
++
++### wValue of request 0x16
++
++The data stage is padded with zeros to a multiple of 8 bytes and wValue is
++the real length mod 8 (0 when the length is a multiple of 8). The Windows
++driver values all fit: GET_VERSION 1 byte -> 1, IOTA_FIND 17 -> 1, PAIR
++401 -> 1, ClientHello 84 -> 4, second TLS flight 615 -> 7, a 31 byte
++record -> 7, a 38 byte record -> 6, a 50 byte record -> 2. Wrong values
++on a TLS record make the sensor answer with a fatal alert (20 bad record
++mac, or 47 for 0 and 8). For cleartext GET_VERSION the values 0, 1, 2, 4, 5, 6 and 7
++were all accepted, so the command length is implied by the opcode there.
++Bit 3 is ignored (15 works like 7).
++
++wValue of request 0x17 does not matter. The Windows driver uses 0x8000
++with wLength 4096 for IOTA reads and 0 otherwise, replies were identical
++for 0, 1, 0x4000 and 0x8000. wLength is only a cap, short replies are
++fine (256 for a 66 byte reply and so on). The driver uses 4096 for
++in-session commands.
++
++### Reply format
++
++Cleartext commands and in-session commands: 2 byte little endian status,
++then payload. Seen as success: 0x0000 (0x0412 and 0x05cc come from the
++prototype). TLS_DATA (0x44) replies are raw TLS records with no status.
++
++Right after a previous session ended without a close_notify (process
++killed), the first command gets an encrypted TLS alert record
++(`15 03 03 00 1a ...`) from the old session. Asking again returns the real
++reply. The driver retries up to 3 times.
++
++## Commands used
++
++Opcodes as seen on the wire. Names come from the vendor driver's own log
++("CMD SEND: VCSFW_CMD_...").
++
++| opcode | name | args | reply |
++|---|---|---|---|
++| 0x01 | GET_VERSION | none | 38 bytes, see below |
++| 0x93 | PAIR | host cert (400) | status, host cert (400), sensor cert (400) |
++| 0x44 | TLS_DATA | 3 zero bytes, then TLS records | raw TLS records |
++| 0x9e | DB2_GET_DB_INFO | `01` | 38 bytes payload, see below |
++| 0x9f | DB2_GET_OBJECT_LIST | type u8, 3 zero bytes, parent id (16) | count u16, then ids (16 each) |
++
++Seen in the Windows traces but not sent by this driver (not needed to get
++a session): 0x8e IOTA_FIND (`8e <id u16> 02 00 + zeros`, ids 0x09 and
++0x1a, 26 and 78 byte replies), 0xaf (`af 01 00 00 00`, 10 byte reply,
++unknown), 0x19 GET_STARTINFO (68 byte reply), 0x82 FRAME_STATE_GET.
++
++### Opcode names for 0x9d..0xa4
++
++The task description had 0x9d GET_DB_INFO, 0x9e OBJECT_LIST, 0x9f
++OBJECT_INFO, 0xa0 OBJECT_DATA. The live vendor driver log disagrees: the
++command that goes out as 0x9e is logged as DB2_GET_DB_INFO and 0x9f as
++DB2_GET_OBJECT_LIST, the same as proto.txt in the prototype repo. So the
++numbering from proto.txt (0x9e info, 0x9f list, 0xa0 object info, 0xa1
++object data, 0xa3 delete or cleanup, 0xa5 format) looks right and the
++0x9d-0xa4 table is shifted by one. The driver only sends 0x9e and 0x9f
++and refuses everything else, see tudor_cmd_allowed(). Nothing from 0xa0
++upwards is ever sent, so the safety rules hold under either numbering.
++
++### GET_VERSION reply (38 bytes with status)
++
++Offsets with the status bytes included.
++
++| offset | size | field |
++|---|---|---|
++| 6 | 4 | firmware build (0x00315df5 here) |
++| 10 | 1 | firmware major (10) |
++| 11 | 1 | firmware minor (1) |
++| 13 | 1 | product id ('A') |
++| 18 | 6 | sensor id |
++| 24 | 1 | flags1, bit 0 advanced security |
++| 25 | 1 | flags2, bit 5 selects the "-kf" sensor key |
++| 37 | 1 | provision state (3 = provisioned) |
++
++### DB2_GET_DB_INFO reply (38 bytes of payload)
++
++u16 dummy, u16 version major, u16 version minor, u32 pversion, then u16:
++UOP_len, TOP_len, POP_len, template slot size, payload slot size, then
++three counters (current, deleted, available) each for users, templates,
++payloads. Field names are from the vendor driver's verbose log, offsets
++matched by hand against the log values.
++
++This sensor: v1.0, pversion 4, users 3 (124 free), templates 2 (9 free),
++payloads 4 (+2 deleted, 19 free).
++
++### DB2_GET_OBJECT_LIST
++
++`9f 02 00 00 00 ff*16` lists templates (type 2) with any parent: reply is
++a u16 count and that many 16 byte ids. `9f 03 00 00 00 <template id>`
++lists the payloads (type 3) below a template. The Windows driver does
++exactly this at open: DB info, template list, payload list per template.
++On this sensor 2 templates, 0 payloads below each. DB info says there are
++3 users and 4 payloads so users and payloads hang off something else.
++Type 1 was never seen on the wire and is not sent.
++
++## Pairing
++
++PAIR sends a host certificate and the sensor answers with the host
++certificate countersigned and its own certificate. The Windows driver does
++this on every open with a new key pair, the traces of two runs show two
++different host keys, and the saved Windows store only holds the latest
++one. Nothing is reused. The driver does the same: a fresh P-256 key
++per open, no persistent data. (libfprint has no per-device persistent data
++API anyway, only prints stored by the caller.) 25 opens in a row worked.
++
++### Certificate format (400 bytes)
++
++All integers little endian.
++
++| offset | size | field |
++|---|---|---|
++| 0 | 2 | magic 0x5f3f (bytes `3f 5f`) |
++| 2 | 2 | curve, 23 = secp256r1 |
++| 4 | 68 | x, 32 bytes used, zero padded |
++| 72 | 68 | y, same |
++| 140 | 1 | zero |
++| 141 | 1 | type (0 host request, 2 countersigned host, device cert is 0) |
++| 142 | 2 | signature size |
++| 144 | 256 | signature, zero padded |
++
++The signed part is the first 142 bytes. Host request: DER ECDSA SHA-256
++signature (71 bytes typically) by the "HS key". The countersigned host
++cert has a 32 byte signature (not checked, scheme unknown). The sensor
++cert has a DER ECDSA SHA-256 signature, checked against a per firmware
++public key.
++
++HS key: P-256 private key, derived as the TLS 1.2 PRF (SHA-256) with
++secret `717cd72d0962bc4a2846138dbb2c2419`, label `HS_KEY_PAIR_GEN`, seed
++`2512a76407065f383846139d4bec2033aaaa`, first 32 bytes read as a little
++endian integer. The constants come from the Windows driver. Upstream may
++not like shipping them, needs a decision.
++
++Sensor keys are known for firmware 10.1 with and without the key flag
++(public points are embedded in tudor_tls.c, from the prototype's .tsk
++files). This sensor has the key flag. Other firmware versions fail with
++NOT_SUPPORTED at pairing.
++
++## TLS 1.2
++
++Records travel inside TLS_DATA (0x44) during the handshake. After it,
++application data records are sent as the command itself, in place of the
++cleartext command, padded and with wValue as above. The reply is one
++record. Handshake exchange is:
++
++1. TLS_DATA with the ClientHello, reply is ServerHello + CertificateRequest
++   + ServerHelloDone in one record.
++2. TLS_DATA with Certificate + ClientKeyExchange + CertificateVerify
++   (one handshake record), ChangeCipherSpec and an encrypted Finished.
++   Reply is the sensor's ChangeCipherSpec and encrypted Finished.
++
++All the deviations from the standard:
++
++- ClientHello: version 3.3, 32 random bytes, 7 byte session id of zeros,
++  suites c005 c02e 003d 008d 00a8 00a9 (the sensor picks c02e,
++  ECDH_ECDSA_WITH_AES_256_GCM_SHA384), **no compression methods** (length
++  byte 0), and the extensions follow **without an extensions length**:
++  supported_groups {secp256r1} and ec_point_formats {uncompressed}.
++- ServerHello: version field reads 0x0383, ignored. Session id is 7 bytes,
++  `54 4c 53` ("TLS") plus bytes 4..7 of the server random. No Certificate,
++  no ServerKeyExchange. CertificateRequest is `0d 000004 01 40 0000`.
++- Server key is the static key from the sensor certificate of the PAIR
++  reply. Premaster secret is the 32 byte x coordinate of the ECDH result
++  with an ephemeral client key.
++- Client Certificate message: `0b <len3> <400 as len3> <400 as len3> <2
++  junk bytes> <cert>`. The Windows driver leaves stack garbage in the junk
++  bytes, zeros work. The cert is the countersigned host cert from PAIR.
++- ClientKeyExchange is `04 x y` (65 bytes, big endian coordinates).
++- CertificateVerify is an ECDSA P-256 signature over the SHA-256 transcript
++  hash as is (prehashed). The sensor only accepts **exactly 70 bytes**:
++  `30 44 02 20 <r 32> 02 20 <s 32>` with no extra zero byte when the top
++  bit is set. DER from openssl is 71 or 72 bytes when r or s has the top
++  bit set (about half of the handshakes in testing) and those fail with alert 20 (bad
++  record mac) on the Finished. With the fixed layout 25 of 25 worked.
++- Transcript hash is SHA-256 over all handshake messages (4 byte header
++  included, as received/sent), the Finished messages are **not** part of
++  it, so client and server verify data use the same hash.
++- PRF is the TLS 1.2 PRF with HMAC-SHA-384. master secret = PRF(premaster,
++  "master secret", client_random + server_random, 48). Key block =
++  PRF(master, "key expansion", **client_random + server_random** (standard
++  is the other way round), 72). Client write key 32, server write key 32,
++  client salt 4, server salt 4.
++- Finished verify data = PRF(master, "client finished" or "server
++  finished", sha256 transcript, 12).
++- AES-256-GCM, explicit 8 byte random nonce in the record, nonce = salt +
++  explicit, AAD = seq (8, big endian) + type + 03 03 + plaintext length.
++  Sequence numbers count from 0 at the Finished.
++- Close: 0x1b, then 0x14 (still reads 1), then an encrypted close_notify
++  warning alert (`01 00`) as a command with wValue 7, the sensor answers
++  with its own close_notify.
++
++## Safety
++
++tudor_cmd_allowed() lets through only GET_VERSION, PAIR, TLS_DATA and the
++two DB reads. The driver never sends bootloader patch, peek/poke,
++provision, ownership commands, storage writes, DB writes, request 0x15, or
++anything else not seen in the traces.
++
++## Unknowns
++
++- Meaning of request 0x19/0x1a (a probe the Windows driver always does),
++  0x1b (session end).
++- Opcode 0xaf (`af 01 00 00 00`, 10 byte reply, after the status `0de2a15901ffffff`).
++- What the 2 templates and 4 payloads are in terms of fingers and users,
++  how a user object maps to a template, and what is in the 16 byte ids.
++  The 3 user objects are not listed by anything seen so far.
++- Payload object contents and the reply of OBJ_LIST for a template that
++  has payloads (only empty ones seen).
++- Status values other than 0.
++- The 32 byte signature scheme of the countersigned host cert, and whether
++  the sensor checks anything in the junk bytes of the Certificate message.
++- Whether other firmware versions use other TLS details. Only 10.1 tested.
++- Event endpoint 0x83 format (bytes 5 and 6 in the prototype notes are
++  frame index and event sequence).
++
++## What is needed for enroll, verify, identify
++
++Plaintext traces (same hook as for pair/reuse) with a finger on the
++sensor of: one enroll (all stages, including EVENT_CONFIG / EVENT_READ,
++LED_EX2, FRAME_ACQ/READ/FINISH, the DB2 object writes at the end and the
++reply of the final DB info and object list), one verify and one
++identify (IDENTIFY_WBF with its arguments and reply, and what happens on
++no match), and one delete of a single print. The two throwaway
++enrollments from capture-touch.sh would do.

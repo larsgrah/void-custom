@@ -1,0 +1,76 @@
+From 04a44f3538423016ec5202e378e8d63268bcf65c Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 16:39:45 +0100
+Subject: [PATCH 6/8] synaptics_tudor: Fix the no match status, print every
+ outcome in tudor-test
+
+---
+ PROTOCOL.md                               |  2 +-
+ examples/tudor-test.c                     | 16 ++++++++++++----
+ libfprint/drivers/synaptics_tudor/tudor.h |  2 +-
+ 3 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 1164652a..0bece407 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -295,7 +295,7 @@ DB info after an enroll: users, templates and payloads all go up by one.
+ `99 01` + 11 zeros after a capture, the same for verify (the sensor has no
+ verify). Status 0: match, payload is the template id (16) then fixed
+ fields and, from offset 0x40 of the payload, the same type/length/data
+-list as the commit (identity and payload of the match). Status 0x0905: no
++list as the commit (identity and payload of the match). Status 0x0509 (bytes `09 05`): no
+ match, nothing else in the reply. LED success or failure after it.
+ 
+ ### Object info and delete
+diff --git a/examples/tudor-test.c b/examples/tudor-test.c
+index ad1d44f5..e4c9a6f7 100644
+--- a/examples/tudor-test.c
++++ b/examples/tudor-test.c
+@@ -118,14 +118,19 @@ main (void)
+   if (before != G_MAXUINT && after != before + 1)
+     g_printerr ("Expected one more print, not going on to delete\n");
+ 
+-  for (int tries = 0; tries < 5 && !matched; tries++)
++  for (int tries = 0; tries < 5; tries++)
+     {
+       g_clear_error (&error);
+       say ("VERIFY: touch once");
+       if (fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
+-        g_print ("  verify result: %s\n", matched ? "match" : "no match");
+-      else if (!g_error_matches (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL) &&
+-               error->domain != FP_DEVICE_RETRY)
++        {
++          g_print ("  verify result: %s\n", matched ? "match" : "no match");
++          break;
++        }
++      g_print ("  verify error: %s%s\n", error->message,
++               error->domain == FP_DEVICE_RETRY ? " (retry)" : "");
++      fflush (stdout);
++      if (error->domain != FP_DEVICE_RETRY)
+         break;
+     }
+ 
+@@ -139,6 +144,9 @@ main (void)
+           g_print ("  identify result: %s\n", match ? "found the print" : "no match");
+           break;
+         }
++      g_print ("  identify error: %s%s\n", error->message,
++               error->domain == FP_DEVICE_RETRY ? " (retry)" : "");
++      fflush (stdout);
+       if (error->domain != FP_DEVICE_RETRY)
+         break;
+     }
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.h b/libfprint/drivers/synaptics_tudor/tudor.h
+index 7abbc471..63504e41 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.h
++++ b/libfprint/drivers/synaptics_tudor/tudor.h
+@@ -66,7 +66,7 @@
+ #define TUDOR_STATUS_OK           0x0000
+ #define TUDOR_STATUS_OK_412       0x0412
+ #define TUDOR_STATUS_OK_5CC       0x05cc
+-#define TUDOR_STATUS_NO_MATCH     0x0905
++#define TUDOR_STATUS_NO_MATCH     0x0509
+ 
+ /* Certificate in the Synaptics format, 400 bytes */
+ #define TUDOR_CERT_SIZE           400
