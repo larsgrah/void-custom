@@ -1,0 +1,1248 @@
+From fa33bd19014f69149c5f7bf719f3a967ada7787d Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars@grahmann.family>
+Date: Thu, 29 Oct 2026 13:29:20 +0100
+Subject: [PATCH 1/2] Support the Kensington VeriMark DT (047d:00f2)
+
+Runs Synaptics' 6.0.11.1132 driver for the VeriMark DT from the Microsoft
+Update Catalog instead of Lenovo's 104 build. The DLLs go in
+libtudor/verimark/ and are not tracked. Both firmware update entry points
+are patched to fail at load time, and a DLL that doesn't match the
+expected bytes is refused.
+
+The sensor is USB interface 1 next to a FIDO HID interface, so the first
+vendor interface is treated as interface 0 and the HID side stays bound.
+The adapter DLL brings its own match-on-chip storage adapter, which is used
+when exported: it opens the sensor database by the INF's GUID and its
+deletes run DB2_CLEANUP. Enrollments are committed with a payload, which
+this driver needs to match against a template.
+
+Fixes in the Windows emulation that the newer driver hit:
+TRACE_GUID_REGISTRATION holds a GUID pointer, which broke the stack cookie,
+timed waits and joins used relative instead of absolute deadlines, dead
+WDF object lists destroyed their head forever, ExitThread unwound through
+Windows frames, WMI request callbacks were called with the wrong ABI,
+events closed with waiters aborted, and opens with no create handler
+never completed. Added CryptoAPI AES encrypt/decrypt and key params,
+PROV_RSA_FULL, CryptAcquireContextW, security descriptor and hidden
+window stubs, power and session notification stubs, a few WDF functions,
+memoryless control transfers, and WPP trace output for unknown messages
+with -t.
+---
+ .gitignore                        |   4 +-
+ libtudor/inc/tudor/tudor.h        |   2 +
+ libtudor/meson.build              |  20 ++++--
+ libtudor/src/tudor/device.c       |  22 +++++-
+ libtudor/src/tudor/driver.c       |  64 +++++++++++++++---
+ libtudor/src/tudor/internal.h     |   1 +
+ libtudor/src/tudor/storage.c      |  40 +++++++++--
+ libtudor/src/tudor/winbio.h       |   2 +
+ libtudor/src/winapi/crypt/crypt.c | 107 +++++++++++++++++++++++++++++-
+ libtudor/src/winapi/crypt/crypt.h |   5 ++
+ libtudor/src/winapi/log.c         |  54 +++++++++++++--
+ libtudor/src/winapi/module.c      |   3 +
+ libtudor/src/winapi/proc.c        |   2 +-
+ libtudor/src/winapi/security.c    |  29 ++++++++
+ libtudor/src/winapi/suspend.c     |  18 ++++-
+ libtudor/src/winapi/sync.c        |  25 +++++--
+ libtudor/src/winapi/thread.c      |  21 +++++-
+ libtudor/src/winapi/wdf/device.c  |  24 ++++++-
+ libtudor/src/winapi/wdf/file.c    |   7 +-
+ libtudor/src/winapi/wdf/object.c  |   8 ++-
+ libtudor/src/winapi/wdf/queue.c   |   1 +
+ libtudor/src/winapi/wdf/usb.c     |  41 +++++++++---
+ libtudor/src/winapi/window.c      |  90 +++++++++++++++++++++++++
+ meson.build                       |   6 +-
+ 24 files changed, 543 insertions(+), 53 deletions(-)
+ create mode 100644 libtudor/src/winapi/security.c
+ create mode 100644 libtudor/src/winapi/window.c
+
+diff --git a/.gitignore b/.gitignore
+index c795b05..76035c7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,3 @@
+-build
+\ No newline at end of file
++build
++# Synaptics VeriMark driver DLLs, fetched from the Microsoft Update Catalog
++libtudor/verimark/*.dll
+diff --git a/libtudor/inc/tudor/tudor.h b/libtudor/inc/tudor/tudor.h
+index 56b532c..7349b00 100644
+--- a/libtudor/inc/tudor/tudor.h
++++ b/libtudor/inc/tudor/tudor.h
+@@ -66,6 +66,8 @@ struct tudor_record {
+     enum tudor_finger finger;
+     void *data;
+     size_t data_size;
++    void *payload;
++    size_t payload_size;
+ };
+ 
+ struct tudor_device {
+diff --git a/libtudor/meson.build b/libtudor/meson.build
+index 37b076a..efd6142 100644
+--- a/libtudor/meson.build
++++ b/libtudor/meson.build
+@@ -34,6 +34,8 @@ libtudor_src = [
+     'src/winapi/suspend.c',
+     'src/winapi/io.c',
+     'src/winapi/system.c',
++    'src/winapi/security.c',
++    'src/winapi/window.c',
+ 
+     'src/winapi/crypt/rsa_aes.c',
+     'src/winapi/crypt/evp_digest.c',
+@@ -65,17 +67,21 @@ libtudor_src = [
+ ]
+ 
+ driver_dll_names = [
+-    'synaFpAdapter104.dll',
+-    'synaWudfBioUsb104.dll'
++    'synaFpAdapter132.dll',
++    'synaWudfBioUsb132.dll'
+ ]
+ 
+ add_global_arguments('-Wno-incompatible-pointer-types', language : 'c')
+ 
+-driver_dlls = custom_target('driver-download', 
+-    output: driver_dll_names,
+-    input: ['download_driver.sh', 'installer.sha'],
+-    command: [find_program('bash'), '@INPUT0@', '@INPUT1@', '@PRIVATE_DIR@', '@OUTDIR@'] + driver_dll_names
+-)
++# VeriMark DT driver 6.0.11.1132 from the Microsoft Update Catalog
++driver_dlls = []
++foreach dll : driver_dll_names
++    driver_dlls += custom_target('copy-' + dll,
++        input: 'verimark/' + dll,
++        output: dll,
++        command: ['cp', '@INPUT@', '@OUTPUT@']
++    )
++endforeach
+ 
+ driver_dll_blobs = generator(find_program('ld'),
+     output: '@BASENAME@.o',
+diff --git a/libtudor/src/tudor/device.c b/libtudor/src/tudor/device.c
+index 48f4352..1c269ef 100644
+--- a/libtudor/src/tudor/device.c
++++ b/libtudor/src/tudor/device.c
+@@ -105,7 +105,7 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
+     device->pipeline->SensorHandle = device->winbio_file = winio_create_file(device, true, NULL, NULL, (winio_devctrl_fnc*) tudor_devctrl, (winio_cancel_fnc*) tudor_cancel, (winio_cleanup_fnc*) tudor_cleanup, NULL);
+     device->pipeline->EngineHandle = INVALID_HANDLE_VALUE;
+     device->pipeline->StorageHandle = INVALID_HANDLE_VALUE;
+-    device->pipeline->StorageContext = device;
++    if(!tudor_vendor_storage) device->pipeline->StorageContext = device;
+ 
+     log_debug("Attaching interfaces to pipeline...");
+     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Attach, device->pipeline);
+@@ -117,6 +117,16 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
+     WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineInit, device->pipeline);
+     WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineInit, device->pipeline);
+ 
++    if(tudor_vendor_storage) {
++        //The database ID the driver's INF registers, it has no file on the host
++        log_debug("Opening sensor database...");
++        GUID db_id = DEFINE_GUID(625ac644, 29f2, 4d93, b26b, 96e97c4c35b1), fmt = {0};
++        if((hres = tudor_storage_adapter->OpenDatabase(device->pipeline, &db_id, u"", u"")) != ERROR_SUCCESS) {
++            log_debug("Opening the sensor database failed with 0x%x, creating it...", hres);
++            WINBIO_CALL_PIPELINE(tudor_storage_adapter->CreateDatabase, device->pipeline, &db_id, WINBIO_TYPE_FINGERPRINT, &fmt, u"", u"", 0, 32);
++        }
++    }
++
+     //Reset the sensor
+     log_debug("Resetting sensor...");
+     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Reset, device->pipeline);
+@@ -149,6 +159,7 @@ bool tudor_close(struct tudor_device *device) {
+     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Deactivate, device->pipeline);
+     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Deactivate, device->pipeline);
+     WINBIO_CALL_PIPELINE(tudor_storage_adapter->Deactivate, device->pipeline);
++    if(tudor_vendor_storage) WINBIO_CALL_PIPELINE(tudor_storage_adapter->CloseDatabase, device->pipeline);
+ 
+     //Uninitialize the pipeline
+     log_debug("Uninitializing pipeline interfaces...");
+@@ -177,6 +188,7 @@ bool tudor_close(struct tudor_device *device) {
+     //Free records
+     cant_fail_ret(pthread_mutex_lock(&device->records_lock));
+     for(struct tudor_record *rec = device->records_head, *nrec = rec ? rec->next : NULL; rec; rec = nrec, nrec = rec ? rec->next : NULL) {
++        free(rec->payload);
+         free(rec->data);
+         free(rec->identity);
+         free(rec);
+@@ -295,10 +307,16 @@ bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate) {
+     log_debug("Committing enrollment...");
+ 
+     //The driver doesn't support enrollment hashes (so we don't call GetEnrollmentHash)
++    //Newer drivers skip on-sensor templates without a payload when matching, so
++    //store the identity and finger as one, it's opaque to the driver
++    struct {
++        RECGUID guid;
++        UCHAR finger;
++    } __attribute__((packed)) payload = { device->enroll_guid, (UCHAR) device->enroll_finger };
+     if((hres = tudor_engine_adapter->CommitEnrollment(device->pipeline, &(WINBIO_IDENTITY) {
+         .Type = WINBIO_ID_TYPE_GUID,
+         .TemplateGuid = *(GUID*) &device->enroll_guid
+-    }, (UCHAR) device->enroll_finger, NULL, 0)) != ERROR_SUCCESS) {
++    }, (UCHAR) device->enroll_finger, (UCHAR*) &payload, sizeof(payload))) != ERROR_SUCCESS) {
+         log_error("Error commiting enrollment: 0x%x!", hres);
+         if(hres == WINBIO_E_DUPLICATE_ENROLLMENT) *is_duplicate = true;
+         return false;
+diff --git a/libtudor/src/tudor/driver.c b/libtudor/src/tudor/driver.c
+index 5b86fb1..1bd781d 100644
+--- a/libtudor/src/tudor/driver.c
++++ b/libtudor/src/tudor/driver.c
+@@ -1,26 +1,29 @@
++#include <string.h>
++#include <unistd.h>
++#include <sys/mman.h>
+ #include "internal.h"
+ 
+-extern uint8_t _binary_libtudor_synaFpAdapter104_dll_start, _binary_libtudor_synaFpAdapter104_dll_end;
+-extern uint8_t _binary_libtudor_synaWudfBioUsb104_dll_start, _binary_libtudor_synaWudfBioUsb104_dll_end;
++extern uint8_t _binary_libtudor_synaFpAdapter132_dll_start, _binary_libtudor_synaFpAdapter132_dll_end;
++extern uint8_t _binary_libtudor_synaWudfBioUsb132_dll_start, _binary_libtudor_synaWudfBioUsb132_dll_end;
+ 
+ #define NUM_WINDRV_DLLS 2
+ struct windrv_dll tudor_windrv_dlls[] = {
+     {
+         .module = {
+-            .name = "synaFpAdapter104.dll",
+-            .cmdline = "synaFpAdapter104.dll",
++            .name = "synaFpAdapter132.dll",
++            .cmdline = "synaFpAdapter132.dll",
+             .environ = (const char*[]) { NULL }
+         },
+-        .pe_image = &_binary_libtudor_synaFpAdapter104_dll_start, .pe_image_end = &_binary_libtudor_synaFpAdapter104_dll_end,
++        .pe_image = &_binary_libtudor_synaFpAdapter132_dll_start, .pe_image_end = &_binary_libtudor_synaFpAdapter132_dll_end,
+         .is_adapter = true, .is_driver = false
+     },
+     {
+         .module = {
+-            .name = "synaWudfBioUsb104.dll",
+-            .cmdline = "synaWudfBioUsb104.dll",
++            .name = "synaWudfBioUsb132.dll",
++            .cmdline = "synaWudfBioUsb132.dll",
+             .environ = (const char*[]) { NULL }
+         },
+-        .pe_image = &_binary_libtudor_synaWudfBioUsb104_dll_start, .pe_image_end = &_binary_libtudor_synaWudfBioUsb104_dll_end,
++        .pe_image = &_binary_libtudor_synaWudfBioUsb132_dll_start, .pe_image_end = &_binary_libtudor_synaWudfBioUsb132_dll_end,
+         .is_adapter = false, .is_driver = true
+     }
+ };
+@@ -46,6 +49,39 @@ WINBIO_ENGINE_INTERFACE *tudor_engine_adapter;
+ static DRIVER_OBJECT umdf_driver;
+ struct winwdf_driver *tudor_wdf_driver;
+ 
++//Firmware updates through an emulated driver are how sensors get bricked, so
++//the two entry points into flashing are patched to fail. Both patches check the
++//original bytes first, a different driver build refuses to start instead.
++static const struct {
++    uint32_t rva;
++    uint8_t orig[8];
++} fw_update_blocks[] = {
++    { 0x8d8b0, { 0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec } }, //_tudorBootLoaderModeEnter
++    { 0x81fb0, { 0x44, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54 } }, //MFW/CFG patch download
++};
++
++static bool block_fw_updates(struct dll_image *img) {
++    //mov eax, 0x6e; ret - 0x6e is what the bootloader entry returns on failure too
++    static const uint8_t fail_ret[] = { 0xb8, 0x6e, 0x00, 0x00, 0x00, 0xc3 };
++    long page = sysconf(_SC_PAGESIZE);
++
++    for(size_t i = 0; i < sizeof(fw_update_blocks) / sizeof(fw_update_blocks[0]); i++) {
++        uint8_t *fnc = (uint8_t*) img->base_addr + fw_update_blocks[i].rva;
++        if(memcmp(fnc, fw_update_blocks[i].orig, sizeof(fw_update_blocks[i].orig)) != 0) {
++            log_error("Driver DLL doesn't match the firmware update block at RVA 0x%x, refusing to load it!", fw_update_blocks[i].rva);
++            return false;
++        }
++
++        uint8_t *pg = (uint8_t*) ((uintptr_t) fnc & ~(uintptr_t) (page-1));
++        if(mprotect(pg, page*2, PROT_READ | PROT_WRITE)) { perror("Couldn't unprotect driver code"); return false; }
++        memcpy(fnc, fail_ret, sizeof(fail_ret));
++        if(mprotect(pg, page*2, PROT_READ | PROT_EXEC)) { perror("Couldn't reprotect driver code"); return false; }
++    }
++
++    log_info("Blocked firmware updates in the driver DLL");
++    return true;
++}
++
+ bool tudor_init() {
+     //Register dummy modules
+     winmodule_register(&ntdll_module);
+@@ -83,6 +119,7 @@ bool tudor_init() {
+     }
+     if(!tudor_adapter_dll) abort();
+     if(!tudor_driver_dll) abort();
++    if(!block_fw_updates(&tudor_driver_dll->image)) return false;
+ 
+     //Initialize driver DLLs
+     for(int i = 0; i < NUM_WINDRV_DLLS; i++) {
+@@ -130,6 +167,17 @@ bool tudor_init() {
+         log_error("Error querying sensor interface: 0x%x!", hres);
+         return false;
+     }
++    //Match-on-chip adapters bring their own storage adapter that keeps the
++    //template list on the sensor, use that instead of ours when it's there
++    api_WbioQueryStorageInterface query_storage = find_dll_export(&tudor_adapter_dll->image, "WbioQueryStorageInterface");
++    if(query_storage) {
++        if((hres = query_storage(&tudor_storage_adapter)) != 0) {
++            log_error("Error querying storage interface: 0x%x!", hres);
++            return false;
++        }
++        tudor_vendor_storage = true;
++        log_info("Using the driver's own storage adapter");
++    }
+     if((hres = ((api_WbioQueryEngineInterface) find_dll_export(&tudor_adapter_dll->image, "WbioQueryEngineInterface"))(&tudor_engine_adapter)) != 0) {
+         log_error("Error querying engine interface: 0x%x!", hres);
+         return false;
+diff --git a/libtudor/src/tudor/internal.h b/libtudor/src/tudor/internal.h
+index 540366d..e325810 100644
+--- a/libtudor/src/tudor/internal.h
++++ b/libtudor/src/tudor/internal.h
+@@ -60,6 +60,7 @@ extern struct winwdf_driver *tudor_wdf_driver;
+ extern WINBIO_SENSOR_INTERFACE *tudor_sensor_adapter;
+ extern WINBIO_ENGINE_INTERFACE *tudor_engine_adapter;
+ extern WINBIO_STORAGE_INTERFACE *tudor_storage_adapter;
++extern bool tudor_vendor_storage;
+ 
+ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const char *val_name, bool is_write, void *buf, size_t *buf_size, enum winreg_val_type *val_type);
+ 
+diff --git a/libtudor/src/tudor/storage.c b/libtudor/src/tudor/storage.c
+index d1a0827..75cf3c9 100644
+--- a/libtudor/src/tudor/storage.c
++++ b/libtudor/src/tudor/storage.c
+@@ -1,6 +1,16 @@
+ #include "internal.h"
+ 
+ int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger) {
++    //With the driver's own storage the templates live on the sensor, delete them there too
++    if(tudor_vendor_storage) {
++        winmodule_set_cur(&tudor_adapter_dll->module);
++        WINBIO_IDENTITY ident = { .Type = guid ? WINBIO_ID_TYPE_GUID : WINBIO_ID_TYPE_WILDCARD };
++        if(guid) ident.TemplateGuid = *(GUID*) guid;
++        else ident.Null = WINBIO_IDENTITY_WILDCARD;
++        HRESULT hres = tudor_storage_adapter->DeleteRecord(device->pipeline, &ident, (UCHAR) finger);
++        log_info("Deleted sensor records: 0x%x", hres);
++    }
++
+     cant_fail_ret(pthread_mutex_lock(&device->records_lock));
+ 
+     //Find the record
+@@ -14,6 +24,7 @@ int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_fi
+             if(rec->prev) rec->prev->next = rec->next;
+             else device->records_head = rec->next;
+             if(rec->next) rec->next->prev = rec->prev;
++            free(rec->payload);
+             free(rec->data);
+             free(rec);
+ 
+@@ -48,6 +59,8 @@ bool tudor_add_record(struct tudor_device *device, RECGUID guid, enum tudor_fing
+ 
+     rec->guid  = guid;
+     rec->finger = finger;
++    rec->payload = NULL;
++    rec->payload_size = 0;
+     rec->data = malloc(data_size);
+     rec->data_size = data_size;
+     if(!rec->data)  { perror("Couldn't allocate record data"); abort(); }
+@@ -89,7 +102,7 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
+ 
+     //Validate record
+     if(srec->Identity->Type != WINBIO_ID_TYPE_GUID) return E_INVALIDARG;
+-    if(srec->IndexElementCount != 0 || srec->PayloadBlobSize != 0) return E_INVALIDARG;
++    if(srec->IndexElementCount != 0) return E_INVALIDARG;
+ 
+     log_verbose("WINBIO storage | AddRecord(guid=%08x... subfactor=%x) called", srec->Identity->TemplateGuid.PartA, srec->SubFactor);
+     cant_fail_ret(pthread_mutex_lock(&dev->records_lock));
+@@ -133,6 +146,23 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
+     }
+     memcpy(rec->data, srec->TemplateBlob, rec->data_size);
+ 
++    //Newer drivers commit a payload alongside the template
++    rec->payload = NULL;
++    rec->payload_size = 0;
++    if(srec->PayloadBlobSize) {
++        rec->payload = malloc(srec->PayloadBlobSize);
++        if(!rec->payload) {
++            HRESULT hr = winerr_from_errno();
++            free(rec->payload);
++            free(rec->data);
++            free(rec);
++            cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
++            return hr;
++        }
++        rec->payload_size = srec->PayloadBlobSize;
++        memcpy(rec->payload, srec->PayloadBlob, rec->payload_size);
++    }
++
+     if(dev->records_head) dev->records_head->prev = rec;
+     dev->records_head = rec;
+ 
+@@ -160,6 +190,7 @@ __winfnc static HRESULT storage_DeleteRecord(WINBIO_PIPELINE *pipeline, WINBIO_I
+             if(rec->prev) rec->prev->next = rec->next;
+             else dev->records_head = rec->next;
+             if(rec->next) rec->next->prev = rec->prev;
++            free(rec->payload);
+             free(rec->data);
+             free(rec->identity);
+             free(rec);
+@@ -212,7 +243,7 @@ __winfnc static HRESULT storage_QueryByContent(WINBIO_PIPELINE *pipeline, UCHAR
+     log_verbose("WINBIO storage | QueryByContent(subfactor=%x) called", subfactor);
+     return storage_QueryBySubject(pipeline, &(WINBIO_IDENTITY) {
+         .Type = WINBIO_ID_TYPE_WILDCARD,
+-        .Null = 0
++        .Null = WINBIO_IDENTITY_WILDCARD
+     }, subfactor);
+ }
+ 
+@@ -282,13 +313,14 @@ __winfnc static HRESULT storage_GetCurrentRecord(WINBIO_PIPELINE *pipeline, WINB
+     srec->IndexElementCount = 0;
+     srec->TemplateBlob = dev->result_records_cursor->data;
+     srec->TemplateBlobSize = dev->result_records_cursor->data_size;
+-    srec->PayloadBlob = NULL;
+-    srec->PayloadBlobSize = 0;
++    srec->PayloadBlob = dev->result_records_cursor->payload;
++    srec->PayloadBlobSize = dev->result_records_cursor->payload_size;
+ 
+     cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
+     return ERROR_SUCCESS;
+ }
+ 
++bool tudor_vendor_storage;
+ WINBIO_STORAGE_INTERFACE *tudor_storage_adapter = &(WINBIO_STORAGE_INTERFACE) {
+     .Version = { 5, 0 },
+     .Type = 3,
+diff --git a/libtudor/src/tudor/winbio.h b/libtudor/src/tudor/winbio.h
+index 0086f3c..da4206c 100644
+--- a/libtudor/src/tudor/winbio.h
++++ b/libtudor/src/tudor/winbio.h
+@@ -288,6 +288,7 @@ typedef struct {
+ 
+ #define WINBIO_ID_TYPE_NULL 0
+ #define WINBIO_ID_TYPE_WILDCARD 1
++#define WINBIO_IDENTITY_WILDCARD 0x25066282
+ #define WINBIO_ID_TYPE_GUID 2
+ #define WINBIO_ID_TYPE_SID 3
+ 
+@@ -585,5 +586,6 @@ typedef struct _WINBIO_STORAGE_INTERFACE {
+ typedef DWORD __winfnc (*api_WbioQuerySensorInterface)(WINBIO_SENSOR_INTERFACE** interface);
+ typedef DWORD __winfnc (*api_WbioQueryEngineInterface)(WINBIO_ENGINE_INTERFACE** interface);
+ typedef DWORD __winfnc (*api_WbioQueryStorageInterface)(WINBIO_STORAGE_INTERFACE** interface);
++typedef DWORD __winfnc (*api_WbioQueryStorageInterface)(WINBIO_STORAGE_INTERFACE** interface);
+ 
+ #endif
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/crypt/crypt.c b/libtudor/src/winapi/crypt/crypt.c
+index b842dc4..f758866 100644
+--- a/libtudor/src/winapi/crypt/crypt.c
++++ b/libtudor/src/winapi/crypt/crypt.c
+@@ -4,6 +4,8 @@
+ 
+ __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
+     switch(prov_type) {
++        //The VeriMark driver asks for PROV_RSA_FULL, the same provider does the job
++        case PROV_RSA_FULL:
+         case PROV_RSA_AES: *prov = &crypt_prov_rsa_aes; return TRUE;
+         default: {
+             log_warn("CryptAcquireContextA | Couldn't find provider for container '%s' provider '%s' provider type 0x%x flags 0x%x", cont_name, prov_name, prov_type, flags);
+@@ -13,6 +15,12 @@ __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *con
+ }
+ WINAPI(CryptAcquireContextA)
+ 
++__winfnc BOOL CryptAcquireContextW(struct crypt_provider **prov, const char16_t *cont_name, const char16_t *prov_name, DWORD prov_type, DWORD flags) {
++    //Names aren't used to pick a provider, only the type
++    return CryptAcquireContextA(prov, NULL, NULL, prov_type, flags);
++}
++WINAPI(CryptAcquireContextW)
++
+ __winfnc BOOL CryptReleaseContext(struct crypt_provider *prov, DWORD flags) {
+     return TRUE;
+ }
+@@ -33,6 +41,10 @@ __winfnc BOOL CryptImportKey(struct crypt_provider *prov, const BLOBHEADER *data
+     if(!key) { winerr_set_errno(); return FALSE; }
+     key->prov = prov;
+     key->key_data = NULL;
++    key->alg = data->aiKeyAlg;
++    key->mode = 1; //CRYPT_MODE_CBC is the CAPI default
++    memset(key->iv, 0, sizeof(key->iv));
++    memset(key->cur_iv, 0, sizeof(key->cur_iv));
+ 
+     if(data->bType == type_PLAINTEXTKEYBLOB) {
+         //Copy plaintext data
+@@ -264,4 +276,97 @@ __winfnc BOOL CryptGenRandom(HANDLE prov, DWORD len, BYTE *buf) {
+     LIBCRYPTO_ERR(RAND_bytes(buf, (int) len));
+     return TRUE;
+ }
+-WINAPI(CryptGenRandom)
+\ No newline at end of file
++WINAPI(CryptGenRandom)
++#define KP_IV 1
++#define KP_MODE 4
++#define CRYPT_MODE_CBC 1
++#define CRYPT_MODE_ECB 2
++
++__winfnc BOOL CryptSetKeyParam(struct crypt_key *key, DWORD param, const BYTE *data, DWORD flags) {
++    switch(param) {
++        case KP_IV:
++            memcpy(key->iv, data, sizeof(key->iv));
++            memcpy(key->cur_iv, data, sizeof(key->cur_iv));
++            return TRUE;
++        case KP_MODE:
++            key->mode = *(const DWORD*) data;
++            return TRUE;
++        default:
++            log_warn("CryptSetKeyParam | unsupported param %u", (unsigned) param);
++            winerr_set();
++            return FALSE;
++    }
++}
++WINAPI(CryptSetKeyParam)
++
++static const EVP_CIPHER *aes_cipher(struct crypt_key *key) {
++    bool ecb = key->mode == CRYPT_MODE_ECB;
++    switch(key->plain_size) {
++        case 16: return ecb ? EVP_aes_128_ecb() : EVP_aes_128_cbc();
++        case 24: return ecb ? EVP_aes_192_ecb() : EVP_aes_192_cbc();
++        case 32: return ecb ? EVP_aes_256_ecb() : EVP_aes_256_cbc();
++        default: return NULL;
++    }
++}
++
++//In-place AES like CAPI does it - without Final the chaining carries over to
++//the next call, with Final there's PKCS#7 padding and the IV resets
++static BOOL aes_crypt(struct crypt_key *key, bool enc, BOOL final, BYTE *data, DWORD *data_len, DWORD buf_len) {
++    const EVP_CIPHER *cipher = aes_cipher(key);
++    if(!cipher || (key->mode != CRYPT_MODE_CBC && key->mode != CRYPT_MODE_ECB)) {
++        log_warn("Crypt%scrypt | unsupported key alg 0x%x size %zu mode %u", enc ? "En" : "De", (unsigned) key->alg, key->plain_size, (unsigned) key->mode);
++        winerr_set();
++        return FALSE;
++    }
++
++    DWORD len = *data_len;
++    if(enc && final) {
++        DWORD pad = 16 - len % 16;
++        if(!data || buf_len < len + pad) {
++            *data_len = len + pad;
++            winerr_set_code(data ? 234 : ERROR_SUCCESS); //ERROR_MORE_DATA
++            return data == NULL;
++        }
++        memset(data + len, (int) pad, pad);
++        len += pad;
++    }
++    if(len % 16 != 0) { winerr_set(); return FALSE; }
++
++    //The next IV is the last ciphertext block, grab it before decrypting over it
++    BYTE next_iv[16];
++    if(len > 0) memcpy(next_iv, data + len - 16, 16);
++
++    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++    int out_len = 0;
++    bool ok = ctx
++        && EVP_CipherInit_ex(ctx, cipher, NULL, key->plain_data, key->mode == CRYPT_MODE_CBC ? key->cur_iv : NULL, enc ? 1 : 0)
++        && EVP_CIPHER_CTX_set_padding(ctx, 0)
++        && EVP_CipherUpdate(ctx, data, &out_len, data, (int) len);
++    EVP_CIPHER_CTX_free(ctx);
++    if(!ok) { winerr_set(); return FALSE; }
++
++    if(enc && len > 0) memcpy(next_iv, data + len - 16, 16);
++    if(final) memcpy(key->cur_iv, key->iv, 16);
++    else if(len > 0) memcpy(key->cur_iv, next_iv, 16);
++
++    if(!enc && final && len > 0) {
++        BYTE pad = data[len-1];
++        if(pad == 0 || pad > 16) { winerr_set(); return FALSE; }
++        len -= pad;
++    }
++
++    *data_len = len;
++    return TRUE;
++}
++
++__winfnc BOOL CryptEncrypt(struct crypt_key *key, HANDLE hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len, DWORD buf_len) {
++    if(hash) { log_warn("CryptEncrypt | hashing alongside isn't supported"); winerr_set(); return FALSE; }
++    return aes_crypt(key, true, final, data, data_len, buf_len);
++}
++WINAPI(CryptEncrypt)
++
++__winfnc BOOL CryptDecrypt(struct crypt_key *key, HANDLE hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len) {
++    if(hash) { log_warn("CryptDecrypt | hashing alongside isn't supported"); winerr_set(); return FALSE; }
++    return aes_crypt(key, false, final, data, data_len, *data_len);
++}
++WINAPI(CryptDecrypt)
+diff --git a/libtudor/src/winapi/crypt/crypt.h b/libtudor/src/winapi/crypt/crypt.h
+index 95559ff..c1b8b25 100644
+--- a/libtudor/src/winapi/crypt/crypt.h
++++ b/libtudor/src/winapi/crypt/crypt.h
+@@ -22,6 +22,11 @@ struct crypt_key {
+ 
+     void *plain_data;
+     size_t plain_size;
++
++    //CryptEncrypt/CryptDecrypt state for symmetric keys
++    ALG_ID alg;
++    DWORD mode;
++    BYTE iv[16], cur_iv[16];
+ };
+ 
+ extern struct crypt_provider crypt_prov_rsa_aes;
+diff --git a/libtudor/src/winapi/log.c b/libtudor/src/winapi/log.c
+index 669a36b..b2857a7 100644
+--- a/libtudor/src/winapi/log.c
++++ b/libtudor/src/winapi/log.c
+@@ -2,6 +2,8 @@
+ #include <pthread.h>
+ #include "internal.h"
+ 
++extern bool tudor_log_traces;
++
+ void winlog_printf(const char *format, bool ptr_mode, win_va_list va) {
+     for(const char *p = format; *p; p++) {
+         char c = *p;
+@@ -104,8 +106,30 @@ void winlog_trace(GUID guid, int num, win_va_list vas) {
+ 
+     cant_fail_ret(pthread_rwlock_unlock(&trace_msgs_lock));
+ 
+-    //Log the message
+-    if(!msg) return;
++    //Unknown messages get their raw arguments dumped, the driver's own log
++    //lines come through as preformatted strings that way
++    if(!msg) {
++        if(!tudor_log_traces) return;
++        cant_fail_ret(pthread_mutex_lock(&LOG_LOCK));
++        printf("[TRACE][%x][%02x]", guid.PartA, num);
++        for(int i = 0; i < 16; i++) {
++            const BYTE *data = win_va_arg(vas, const BYTE*);
++            if(!data) break;
++            size_t size = win_va_arg(vas, size_t);
++            size_t len = strnlen((const char*) data, size);
++            bool printable = len > 1;
++            for(size_t j = 0; j < len && printable; j++) printable = data[j] >= 0x20 || data[j] == '\n' || data[j] == '\t';
++            if(printable && size > 8) printf(" \"%.*s\"", (int) len, data);
++            else if(size == 4) printf(" 0x%x", *(const uint32_t*) data);
++            else if(size == 8) printf(" 0x%llx", (unsigned long long) *(const uint64_t*) data);
++            else if(size == 2) printf(" 0x%x", *(const uint16_t*) data);
++            else if(size == 1) printf(" 0x%x", *data);
++            else printf(" <%zu bytes>", size);
++        }
++        printf("\n");
++        cant_fail_ret(pthread_mutex_unlock(&LOG_LOCK));
++        return;
++    }
+ 
+     cant_fail_ret(pthread_mutex_lock(&LOG_LOCK));
+     printf("[TRACE][%u][%x...][%02x] ", win_get_thread_id(), guid.PartA, num);
+@@ -130,11 +154,11 @@ WINAPI(DbgPrintEx)
+ #define WMI_DISABLE_EVENTS 5
+ 
+ typedef struct {
+-    GUID Guid;
++    const GUID *Guid;
+     HANDLE RegHandle;
+ } TRACE_GUID_REGISTRATION;
+ 
+-typedef ULONG Wmidprequest(DWORD RequestCode, void *RequestContext, ULONG *BufferSize, void *Buffer);
++typedef ULONG __winfnc Wmidprequest(DWORD RequestCode, void *RequestContext, ULONG *BufferSize, void *Buffer);
+ 
+ struct trace_guid {
+     struct trace_provider *prov;
+@@ -170,17 +194,37 @@ __winfnc DWORD RegisterTraceGuidsA(Wmidprequest *request_fnc, void *request_ctx,
+ 
+     for(int i = 0; i < num_guids; i++) {
+         prov->guids[i].prov = prov;
+-        prov->guids[i].guid = trace_guids[i].Guid;
++        prov->guids[i].guid = *trace_guids[i].Guid;
+         prov->guids[i].handle = winhandle_create(&prov->guids[i], NULL);
+         trace_guids[i].RegHandle = prov->guids[i].handle;
+     }
+ 
+     *handle = winhandle_create(prov, (winhandle_destr_fnc*) trace_prov_destr);
+ 
++    //With traces on, enable the provider at full verbosity like a trace session would
++    if(tudor_log_traces && request_fnc) {
++        struct {
++            ULONG BufferSize, ProviderId;
++            ULONGLONG HistoricalContext;
++            BYTE rest[32];
++        } wnode = { .BufferSize = sizeof(wnode), .HistoricalContext = 1 };
++        ULONG size = sizeof(wnode);
++        request_fnc(WMI_ENABLE_EVENTS, request_ctx, &size, &wnode);
++    }
++
+     return ERROR_SUCCESS;
+ }
+ WINAPI(RegisterTraceGuidsA)
+ 
++__winfnc ULONGLONG GetTraceLoggerHandle(void *buf) { return 1; }
++WINAPI(GetTraceLoggerHandle)
++
++__winfnc ULONG GetTraceEnableFlags(ULONGLONG logger) { return 0xffffffff; }
++WINAPI(GetTraceEnableFlags)
++
++__winfnc UCHAR GetTraceEnableLevel(ULONGLONG logger) { return 0xff; }
++WINAPI(GetTraceEnableLevel)
++
+ __winfnc DWORD RegisterTraceGuidsW(Wmidprequest *request_fnc, void *request_ctx, GUID *control_guid, ULONG num_guids, TRACE_GUID_REGISTRATION *trace_guids, const char16_t *mof_image, const char16_t *mof_resource, HANDLE *handle) {
+     return RegisterTraceGuidsA(request_fnc, request_ctx, control_guid, num_guids, trace_guids, NULL, NULL, handle);
+ }
+diff --git a/libtudor/src/winapi/module.c b/libtudor/src/winapi/module.c
+index cb57daf..d99b39f 100644
+--- a/libtudor/src/winapi/module.c
++++ b/libtudor/src/winapi/module.c
+@@ -87,12 +87,15 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
+ WINAPI(FreeLibrary)
+ 
+ __winfnc HANDLE GetModuleHandleA(const char *name) {
++    //NULL means the process image, the closest we have is the current module
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     struct winmodule *module = (struct winmodule*) winmodule_find(name);
+     return module ? module->handle : NULL;
+ }
+ WINAPI(GetModuleHandleA)
+ 
+ __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
++    if(!name) return cur_module ? cur_module->handle : NULL;
+     char *cname = winstr_to_str(name);
+     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
+     free(cname);
+diff --git a/libtudor/src/winapi/proc.c b/libtudor/src/winapi/proc.c
+index e96a827..9b5306c 100644
+--- a/libtudor/src/winapi/proc.c
++++ b/libtudor/src/winapi/proc.c
+@@ -214,7 +214,7 @@ __winfnc BOOL FreeEnvironmentStringsW(const char16_t *env) {
+ WINAPI(FreeEnvironmentStringsW)
+ 
+ __winfnc BOOL IsProcessorFeaturePresent(DWORD feature) {
+-    log_debug("IsProcessorFeaturePresent | feature: %d", feature);
++    log_debug("IsProcessorFeaturePresent | feature: %d ret %p", feature, __builtin_return_address(0));
+     return FALSE;
+ }
+ WINAPI(IsProcessorFeaturePresent)
+diff --git a/libtudor/src/winapi/security.c b/libtudor/src/winapi/security.c
+new file mode 100644
+index 0000000..61a0cf4
+--- /dev/null
++++ b/libtudor/src/winapi/security.c
+@@ -0,0 +1,29 @@
++#include <stdlib.h>
++#include "internal.h"
++
++//Nothing enforces Windows ACLs here, so security descriptors are just accepted
++
++__winfnc BOOL AllocateAndInitializeSid(void *authority, BYTE num_sub, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5, DWORD s6, DWORD s7, void **sid) {
++    *sid = calloc(1, 68);
++    return *sid != NULL;
++}
++WINAPI(AllocateAndInitializeSid)
++
++__winfnc void *FreeSid(void *sid) {
++    free(sid);
++    return NULL;
++}
++WINAPI(FreeSid)
++
++__winfnc BOOL InitializeSecurityDescriptor(void *descr, DWORD rev) { return TRUE; }
++WINAPI(InitializeSecurityDescriptor)
++
++__winfnc BOOL SetSecurityDescriptorDacl(void *descr, BOOL present, void *dacl, BOOL defaulted) { return TRUE; }
++WINAPI(SetSecurityDescriptorDacl)
++
++__winfnc DWORD SetEntriesInAclA(ULONG num_entries, void *entries, void *old_acl, void **new_acl) {
++    //Freed by the driver with LocalFree, 8 is ERROR_NOT_ENOUGH_MEMORY
++    *new_acl = calloc(1, 8);
++    return *new_acl ? ERROR_SUCCESS : 8;
++}
++WINAPI(SetEntriesInAclA)
+diff --git a/libtudor/src/winapi/suspend.c b/libtudor/src/winapi/suspend.c
+index 25e20e9..43f3219 100644
+--- a/libtudor/src/winapi/suspend.c
++++ b/libtudor/src/winapi/suspend.c
+@@ -1,3 +1,4 @@
++#include <string.h>
+ #include "internal.h"
+ 
+ typedef ULONG __winfnc DEVICE_NOTIFY_CALLBACK_ROUTINE(void *Context, ULONG Type, void *setting);
+@@ -18,4 +19,19 @@ __winfnc DWORD PowerUnregisterSuspendResumeNotification(HANDLE handle) {
+     //TODO
+     return ERROR_SUCCESS;
+ }
+-WINAPI(PowerUnregisterSuspendResumeNotification)
+\ No newline at end of file
++WINAPI(PowerUnregisterSuspendResumeNotification)
++__winfnc NTSTATUS CallNtPowerInformation(int level, void *in, ULONG in_size, void *out, ULONG out_size) {
++    log_debug("CallNtPowerInformation | level %d in %u out %u", level, (unsigned) in_size, (unsigned) out_size);
++    if(out) memset(out, 0, out_size);
++    return STATUS_SUCCESS;
++}
++WINAPI(CallNtPowerInformation)
++
++__winfnc DWORD PowerSettingRegisterNotification(const GUID *setting, DWORD flags, HANDLE recipient, HANDLE *out) {
++    *out = (HANDLE) setting;
++    return ERROR_SUCCESS;
++}
++WINAPI(PowerSettingRegisterNotification)
++
++__winfnc DWORD PowerSettingUnregisterNotification(HANDLE handle) { return ERROR_SUCCESS; }
++WINAPI(PowerSettingUnregisterNotification)
+diff --git a/libtudor/src/winapi/sync.c b/libtudor/src/winapi/sync.c
+index 7557da9..f2a87bc 100644
+--- a/libtudor/src/winapi/sync.c
++++ b/libtudor/src/winapi/sync.c
+@@ -1,3 +1,4 @@
++#include <time.h>
+ #include <assert.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+@@ -93,6 +94,7 @@ static struct sync_event {
+     pthread_mutex_t lock;
+     pthread_cond_t cond;
+     bool state;
++    int num_waiters;
+ } *events_head;
+ 
+ static void evt_destr(struct sync_event *evt) {
+@@ -105,6 +107,13 @@ static void evt_destr(struct sync_event *evt) {
+ 
+     cant_fail_ret(pthread_rwlock_unlock(&events_lock));
+ 
++    //Windows lets a handle get closed while a thread still waits on it, the
++    //driver does that on shutdown, so leave the event to the waiter then
++    cant_fail_ret(pthread_mutex_lock(&evt->lock));
++    bool busy = evt->num_waiters > 0;
++    cant_fail_ret(pthread_mutex_unlock(&evt->lock));
++    if(busy) return;
++
+     //Free memory
+     cant_fail_ret(pthread_cond_destroy(&evt->cond));
+     cant_fail_ret(pthread_mutex_destroy(&evt->lock));
+@@ -116,12 +125,18 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
+     DWORD res = 0;
+     cant_fail_ret(pthread_mutex_lock(&evt->lock));
+ 
+-    //Wait for the event
++    //Wait for the event, timedwait wants an absolute deadline
++    struct timespec time;
++    if(timeout != INFINITE) {
++        clock_gettime(CLOCK_REALTIME, &time);
++        time.tv_sec += timeout / 1000;
++        time.tv_nsec += (timeout % 1000) * 1000000L;
++        if(time.tv_nsec >= 1000000000L) { time.tv_sec++; time.tv_nsec -= 1000000000L; }
++    }
++
++    evt->num_waiters++;
+     while(!evt->state) {
+         if(timeout != INFINITE) {
+-            struct timespec time;
+-            time.tv_nsec = timeout * 10000000L;
+-            time.tv_sec = timeout / 1000L;
+             int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &time);
+             if(err == ETIMEDOUT) {
+                 res = WAIT_TIMEOUT;
+@@ -133,6 +148,7 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
+ 
+     //Auto-reset event
+     if(res == 0 && !evt->manual_reset) evt->state = false;
++    evt->num_waiters--;
+ 
+     cant_fail_ret(pthread_mutex_unlock(&evt->lock));
+     return res;
+@@ -147,6 +163,7 @@ HANDLE win_create_event(const char *name, bool initial_state, bool manual_reset)
+ 
+     evt->name = name ? strdup(name) : NULL;
+     evt->state = initial_state;
++    evt->num_waiters = 0;
+     evt->manual_reset = manual_reset;
+     cant_fail_ret(pthread_mutex_init(&evt->lock, NULL));
+     cant_fail_ret(pthread_cond_init(&evt->cond, NULL));
+diff --git a/libtudor/src/winapi/thread.c b/libtudor/src/winapi/thread.c
+index 8b5f2a9..97ccb37 100644
+--- a/libtudor/src/winapi/thread.c
++++ b/libtudor/src/winapi/thread.c
+@@ -1,5 +1,7 @@
+ #include <pthread.h>
+ #include <errno.h>
++#include <setjmp.h>
++#include <time.h>
+ #include "internal.h"
+ 
+ typedef DWORD __winfnc THREAD_START_ROUTINE(void *param);
+@@ -40,9 +42,12 @@ static DWORD thread_wait(struct win_thread *thread, DWORD timeout) {
+     if(timeout == INFINITE) {
+         cant_fail_ret(pthread_join(thread->thread, NULL));
+     } else {
++        //timedjoin wants an absolute deadline
+         struct timespec time;
+-        time.tv_nsec = timeout * 10000000L;
+-        time.tv_sec = timeout / 1000L;
++        clock_gettime(CLOCK_REALTIME, &time);
++        time.tv_sec += timeout / 1000;
++        time.tv_nsec += (timeout % 1000) * 1000000L;
++        if(time.tv_nsec >= 1000000000L) { time.tv_sec++; time.tv_nsec -= 1000000000L; }
+         int err = pthread_timedjoin_np(thread->thread, NULL, &time);
+         if(err == ETIMEDOUT) return WAIT_TIMEOUT;
+         cant_fail(err);
+@@ -58,6 +63,10 @@ static void thread_wait_resume(struct win_thread *thread) {
+     cant_fail_ret(pthread_mutex_unlock(&thread->lock));
+ }
+ 
++//ExitThread jumps back here, pthread_exit would unwind through Windows frames
++//that have no DWARF unwind info and crash
++static __thread jmp_buf *thread_exit_jmp;
++
+ static void *thread_entry(void *arg) {
+     struct win_thread *thread = (struct win_thread*) arg;
+ 
+@@ -74,7 +83,12 @@ static void *thread_entry(void *arg) {
+ 
+     //Call the thread start routine
+     thread_wait_resume(thread);
+-    thread->start_proc(thread->start_param);
++    jmp_buf exit_jmp;
++    if(setjmp(exit_jmp) == 0) {
++        thread_exit_jmp = &exit_jmp;
++        thread->start_proc(thread->start_param);
++    }
++    thread_exit_jmp = NULL;
+ 
+     return (void*) 0;
+ }
+@@ -131,6 +145,7 @@ __winfnc DWORD ResumeThread(HANDLE handle) {
+ WINAPI(ResumeThread)
+ 
+ __winfnc void ExitThread(DWORD exit_code) {
++    if(thread_exit_jmp) longjmp(*thread_exit_jmp, 1);
+     pthread_exit((void*) (uintptr_t) exit_code);
+ }
+ WINAPI(ExitThread)
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/wdf/device.c b/libtudor/src/winapi/wdf/device.c
+index ffd727a..7498e2a 100644
+--- a/libtudor/src/winapi/wdf/device.c
++++ b/libtudor/src/winapi/wdf/device.c
+@@ -288,6 +288,7 @@ __winfnc void WdfDeviceInitSetFileObjectConfig(WDF_DRIVER_GLOBALS *globals, stru
+     dev_init->fs_obj_attrs = obj_attrs ? malloc(obj_attrs->Size) : NULL;
+     memcpy(dev_init->fs_cfg, config, config->Size);
+     if(obj_attrs) memcpy(dev_init->fs_obj_attrs, obj_attrs, obj_attrs->Size);
++    log_debug("WdfDeviceInitSetFileObjectConfig | create %p close %p cleanup %p", config->EvtDeviceFileCreate, config->EvtFileClose, config->EvtFileCleanup);
+ }
+ WDFFUNC(WdfDeviceInitSetFileObjectConfig, 23)
+ 
+@@ -362,4 +363,25 @@ __winfnc NTSTATUS WdfDeviceRetrieveDeviceInterfaceString(WDF_DRIVER_GLOBALS *glo
+     wdf_set_string((struct wdf_string*) str, buf);
+     return STATUS_SUCCESS;
+ }
+-WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
+\ No newline at end of file
++WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
++__winfnc void WdfDeviceSetPnpCapabilities(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *caps) {}
++WDFFUNC(WdfDeviceSetPnpCapabilities, 33)
++
++__winfnc NTSTATUS WdfDeviceAssignInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *prop_data, ULONG type, ULONG size, void *data) { return STATUS_SUCCESS; }
++WDFFUNC(WdfDeviceAssignInterfaceProperty, 50)
++
++typedef struct {
++    ULONG Size;
++    const GUID *InterfaceClassGUID;
++    const UNICODE_STRING *ReferenceString;
++    const struct { GUID fmtid; ULONG pid; } *PropertyKey;
++    ULONG Lcid;
++    ULONG Flags;
++} WDF_DEVICE_INTERFACE_PROPERTY_DATA;
++
++__winfnc NTSTATUS WdfDeviceAllocAndQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, WDF_DEVICE_INTERFACE_PROPERTY_DATA *prop_data, int pool_type, WDF_OBJECT_ATTRIBUTES *attrs, WDFOBJECT *mem, ULONG *type) {
++    const GUID *k = &prop_data->PropertyKey->fmtid;
++    log_debug("WdfDeviceAllocAndQueryInterfaceProperty | key %08x-%04x-%04x-%04x-%012llx pid %u", (unsigned) k->PartA, (unsigned) k->PartB, (unsigned) k->PartC, (unsigned) k->PartD, (unsigned long long) k->PartE, (unsigned) prop_data->PropertyKey->pid);
++    return 0xc0000225; //STATUS_NOT_FOUND
++}
++WDFFUNC(WdfDeviceAllocAndQueryInterfaceProperty, 51)
+diff --git a/libtudor/src/winapi/wdf/file.c b/libtudor/src/winapi/wdf/file.c
+index 0d7a8bd..0d863cb 100644
+--- a/libtudor/src/winapi/wdf/file.c
++++ b/libtudor/src/winapi/wdf/file.c
+@@ -46,8 +46,11 @@ NTSTATUS winwdf_open_device(struct winwdf_device *device, struct winwdf_file **o
+     WDF_FILEOBJECT_CONFIG *cfg = wdf_get_fs_config(device);
+     if(create_queue) {
+         wdf_queue_create(create_queue, req);
+-    } else if(cfg) {
+-        if(cfg->EvtDeviceFileCreate) cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
++    } else if(cfg && cfg->EvtDeviceFileCreate) {
++        cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
++    } else {
++        //No create handler at all, WDF just succeeds the open then
++        wdf_complete_request(req, STATUS_SUCCESS, NULL);
+     }
+ 
+     NTSTATUS status = winwdf_wait_request(req);
+diff --git a/libtudor/src/winapi/wdf/object.c b/libtudor/src/winapi/wdf/object.c
+index 549bf17..38001d6 100644
+--- a/libtudor/src/winapi/wdf/object.c
++++ b/libtudor/src/winapi/wdf/object.c
+@@ -103,7 +103,13 @@ void wdf_destroy_obj_list(struct wdf_object_list *list) {
+     cant_fail_ret(pthread_rwlock_wrlock(&list->lock));
+ 
+     list->dead = true;
+-    while(list->head) winwdf_destroy_object(list->head);
++    //Dead lists don't unlink, so pop each object before destroying it
++    while(list->head) {
++        struct wdf_object *obj = list->head;
++        list->head = obj->next;
++        if(list->head) list->head->prev = NULL;
++        winwdf_destroy_object(obj);
++    }
+ 
+     cant_fail_ret(pthread_rwlock_unlock(&list->lock));
+ 
+diff --git a/libtudor/src/winapi/wdf/queue.c b/libtudor/src/winapi/wdf/queue.c
+index ba80157..f404ead 100644
+--- a/libtudor/src/winapi/wdf/queue.c
++++ b/libtudor/src/winapi/wdf/queue.c
+@@ -105,6 +105,7 @@ __winfnc NTSTATUS WdfIoQueueCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device
+     wdf_create_obj((struct wdf_object*) winwdf_get_driver(globals), &queue->object, (wdf_obj_destr_fnc*) queue_destr, obj_attrs);
+     queue->device = (struct winwdf_device*) device;
+     queue->config = *config;
++    log_debug("WdfIoQueueCreate | dispatch %u power %u default %p devctrl %p", (unsigned) config->DispatchType, (unsigned) config->PowerManaged, config->EvtIoDefault, config->EvtIoDeviceControl);
+ 
+     queue->stopped = false;
+ 
+diff --git a/libtudor/src/winapi/wdf/usb.c b/libtudor/src/winapi/wdf/usb.c
+index 06836b3..28caa22 100644
+--- a/libtudor/src/winapi/wdf/usb.c
++++ b/libtudor/src/winapi/wdf/usb.c
+@@ -74,6 +74,7 @@ struct wdf_usb_device {
+ 
+     libusb_device_handle *libusb_dev;
+     struct libusb_config_descriptor *cfg_descr;
++    int if_base, num_ifs;
+ 
+     pthread_mutex_t ifs_lock;
+     struct wdf_usb_interface *ifs_head;
+@@ -177,13 +178,26 @@ __winfnc NTSTATUS WdfUsbTargetDeviceCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJEC
+         log_error("libusb_get_config_descriptor failed: %d [%s]", usb_err, libusb_error_name(usb_err));
+         return WINERR_SET_CODE;
+     }
+-    if((usb_err = libusb_set_configuration(usb_dev->libusb_dev, usb_dev->cfg_descr->bConfigurationValue)) != 0) {
++    //Only set the configuration when it's not active already, setting it again fails
++    //while another kernel driver holds a different interface of the device
++    int cur_cfg = -1;
++    libusb_get_configuration(usb_dev->libusb_dev, &cur_cfg);
++    if(cur_cfg != usb_dev->cfg_descr->bConfigurationValue && (usb_err = libusb_set_configuration(usb_dev->libusb_dev, usb_dev->cfg_descr->bConfigurationValue)) != 0) {
+         log_error("libusb_set_configuration failed: %d [%s]", usb_err, libusb_error_name(usb_err));
+         return WINERR_SET_CODE;
+     }
+ 
+-    //Detach kernel drivers
++    //On composite devices like the VeriMark DT the sensor is not interface 0,
++    //the driver only ever sees its own function, starting at the vendor interface
++    usb_dev->if_base = 0;
+     for(int i = 0; i < usb_dev->cfg_descr->bNumInterfaces; i++) {
++        if(usb_dev->cfg_descr->interface[i].altsetting[0].bInterfaceClass == LIBUSB_CLASS_VENDOR_SPEC) { usb_dev->if_base = i; break; }
++    }
++    usb_dev->num_ifs = usb_dev->cfg_descr->bNumInterfaces - usb_dev->if_base;
++    if(usb_dev->if_base) log_info("Sensor function starts at USB interface %d", usb_dev->if_base);
++
++    //Detach kernel drivers, only from the sensor function so the rest keeps working
++    for(int i = usb_dev->if_base; i < usb_dev->cfg_descr->bNumInterfaces; i++) {
+         if(libusb_kernel_driver_active(usb_dev->libusb_dev, i)) {
+             log_debug("Detaching USB kernel driver from interface %d...", i);
+             if((usb_err = libusb_detach_kernel_driver(usb_dev->libusb_dev, i)) != 0) {
+@@ -237,7 +251,7 @@ WDFFUNC(WdfUsbTargetDeviceResetPortSynchronously, 214)
+ 
+ __winfnc WDFOBJECT WdfUsbTargetDeviceGetInterface(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, UCHAR interface_idx) {
+     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) usb_dev_obj;
+-    if(interface_idx >= usb_dev->cfg_descr->bNumInterfaces) return NULL;
++    if(interface_idx >= usb_dev->num_ifs) return NULL;
+ 
+     //Create USB interface
+     struct wdf_usb_interface *usb_if = (struct wdf_usb_interface*) malloc(sizeof(struct wdf_usb_interface));
+@@ -245,16 +259,16 @@ __winfnc WDFOBJECT WdfUsbTargetDeviceGetInterface(WDF_DRIVER_GLOBALS *globals, W
+ 
+     wdf_create_obj((struct wdf_object*) winwdf_get_driver(globals), &usb_if->object, (wdf_obj_destr_fnc*) usb_if_destr, NULL);
+     usb_if->usb_device = usb_dev;
+-    usb_if->interface_idx = interface_idx;
++    usb_if->interface_idx = usb_dev->if_base + interface_idx;
+ 
+     //Claim the interface
+     int usb_err;
+-    if((usb_err = libusb_claim_interface(usb_dev->libusb_dev, interface_idx)) != 0) {
++    if((usb_err = libusb_claim_interface(usb_dev->libusb_dev, usb_if->interface_idx)) != 0) {
+         log_error("libusb_claim_interface failed: %d [%s]", usb_err, libusb_error_name(usb_err));
+         winwdf_destroy_object(&usb_if->object);
+         return NULL;
+     }
+-    usb_if->libusb_if = &usb_dev->cfg_descr->interface[interface_idx];
++    usb_if->libusb_if = &usb_dev->cfg_descr->interface[usb_if->interface_idx];
+ 
+     //Create pipes
+     const struct libusb_interface_descriptor *if_descrp = &usb_if->libusb_if->altsetting[0];
+@@ -384,6 +398,8 @@ static void pipe_transfer_callback(struct libusb_transfer *transfer) {
+         return;
+     }
+ 
++    log_debug("USB transfer done: ep 0x%02x status %d len %d", transfer->endpoint, transfer->status, transfer->actual_length);
++
+     NTSTATUS status = STATUS_SUCCESS;
+     if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+         log_warn("libusb transfer failed: %d [%s]", transfer->status, libusb_error_name(transfer->status));
+@@ -422,7 +438,7 @@ static void pipe_transfer_callback(struct libusb_transfer *transfer) {
+     params.IoStatus.Information = transfer->actual_length;
+     params.Parameters.Usb.Completion = &usb_params;
+ 
+-    if(ctx->ctrl_buf) {
++    if(ctx->ctrl_buf && ctx->mem) {
+         memcpy(ctx->mem->data + ctx->mem_off.BufferOffset, (BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->mem_off.BufferLength);
+     }
+ 
+@@ -440,7 +456,7 @@ static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_r
+     ctx->transfer->buffer = ctx->ctrl_buf ? ctx->ctrl_buf : (ctx->mem->data + ctx->mem_off.BufferOffset);
+     ctx->transfer->length = (ctx->ctrl_buf ? sizeof(struct libusb_control_setup) : 0) + (int) ctx->mem_off.BufferLength;
+ 
+-    if(ctx->ctrl_buf) {
++    if(ctx->ctrl_buf && ctx->mem) {
+         memcpy((BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->mem->data + ctx->mem_off.BufferOffset, ctx->mem_off.BufferLength);
+     }
+ 
+@@ -479,13 +495,18 @@ __winfnc NTSTATUS WdfUsbTargetDeviceFormatRequestForControlTransfer(WDF_DRIVER_G
+     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) malloc(sizeof(struct transfer_req_ctx));
+     if(!ctx) return winerr_from_errno();
+ 
++    //Control transfers without a data stage come with no memory object
+     ctx->mem = mem;
+-    ctx->mem_off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
++    ctx->mem_off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem ? mem->data_size : 0 });
+     ctx->request = req;
+ 
+     ctx->ctrl_buf = malloc(sizeof(struct libusb_control_setup) + ctx->mem_off.BufferLength);
+     if(!ctx->ctrl_buf) { free(ctx); return winerr_from_errno(); }
+     memcpy(ctx->ctrl_buf, packet, sizeof(struct libusb_control_setup));
++    {
++        struct libusb_control_setup *s = (struct libusb_control_setup*) ctx->ctrl_buf;
++        log_debug("USB control transfer: type 0x%02x req 0x%02x val 0x%04x idx 0x%04x len %u", s->bmRequestType, s->bRequest, s->wValue, s->wIndex, (unsigned) ctx->mem_off.BufferLength);
++    }
+     ((struct libusb_control_setup*) ctx->ctrl_buf)->wLength = (uint16_t) ctx->mem_off.BufferLength;
+     
+     ctx->transfer = libusb_alloc_transfer(0);
+@@ -538,6 +559,7 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForRead(WDF_DRIVER_GLOBALS *globa
+ 
+     ctx->transfer->dev_handle = usb_pipe->usb_if->usb_device->libusb_dev;
+     ctx->transfer->endpoint = usb_pipe->libusb_ep->bEndpointAddress;
++    log_debug("USB pipe transfer: ep 0x%02x len %u", usb_pipe->libusb_ep->bEndpointAddress, (unsigned) ctx->mem_off.BufferLength);
+     ctx->transfer->type = transfer_type;
+     ctx->transfer->flags = 0;
+ 
+@@ -584,6 +606,7 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForWrite(WDF_DRIVER_GLOBALS *glob
+ 
+     ctx->transfer->dev_handle = usb_pipe->usb_if->usb_device->libusb_dev;
+     ctx->transfer->endpoint = usb_pipe->libusb_ep->bEndpointAddress;
++    log_debug("USB pipe transfer: ep 0x%02x len %u", usb_pipe->libusb_ep->bEndpointAddress, (unsigned) ctx->mem_off.BufferLength);
+     ctx->transfer->type = transfer_type;
+     ctx->transfer->flags = 0;
+ 
+diff --git a/libtudor/src/winapi/window.c b/libtudor/src/winapi/window.c
+new file mode 100644
+index 0000000..0d1ab28
+--- /dev/null
++++ b/libtudor/src/winapi/window.c
+@@ -0,0 +1,90 @@
++#include <pthread.h>
++#include <string.h>
++#include "internal.h"
++
++//The driver makes a hidden window to get power and session notifications.
++//Nothing ever sends those here, so the message loop just waits for a quit.
++
++#define WM_QUIT 0x0012
++
++static pthread_mutex_t msg_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t msg_cond = PTHREAD_COND_INITIALIZER;
++static bool msg_quit = false;
++static LONG_PTR wnd_longs[8];
++
++static void post_quit() {
++    cant_fail_ret(pthread_mutex_lock(&msg_lock));
++    msg_quit = true;
++    cant_fail_ret(pthread_cond_broadcast(&msg_cond));
++    cant_fail_ret(pthread_mutex_unlock(&msg_lock));
++}
++
++__winfnc WORD RegisterClassExW(const void *cls) { return 0xc001; }
++WINAPI(RegisterClassExW)
++
++__winfnc BOOL UnregisterClassW(const char16_t *name, HANDLE inst) { return TRUE; }
++WINAPI(UnregisterClassW)
++
++__winfnc HANDLE CreateWindowExW(DWORD ex_style, const char16_t *cls, const char16_t *name, DWORD style, int x, int y, int w, int h, HANDLE parent, HANDLE menu, HANDLE inst, void *param) {
++    cant_fail_ret(pthread_mutex_lock(&msg_lock));
++    msg_quit = false;
++    memset(wnd_longs, 0, sizeof(wnd_longs));
++    cant_fail_ret(pthread_mutex_unlock(&msg_lock));
++    return (HANDLE) wnd_longs;
++}
++WINAPI(CreateWindowExW)
++
++__winfnc BOOL DestroyWindow(HANDLE wnd) {
++    post_quit();
++    return TRUE;
++}
++WINAPI(DestroyWindow)
++
++__winfnc LONG_PTR SetWindowLongPtrW(HANDLE wnd, int idx, LONG_PTR val) {
++    //GWLP_USERDATA is -21, the only one the driver should care about
++    LONG_PTR *slot = &wnd_longs[(-idx) & 7];
++    LONG_PTR old = *slot;
++    *slot = val;
++    return old;
++}
++WINAPI(SetWindowLongPtrW)
++
++__winfnc LONG_PTR GetWindowLongPtrW(HANDLE wnd, int idx) { return wnd_longs[(-idx) & 7]; }
++WINAPI(GetWindowLongPtrW)
++
++__winfnc BOOL GetMessageW(void *msg, HANDLE wnd, UINT min, UINT max) {
++    cant_fail_ret(pthread_mutex_lock(&msg_lock));
++    while(!msg_quit) cant_fail_ret(pthread_cond_wait(&msg_cond, &msg_lock));
++    msg_quit = false;
++    cant_fail_ret(pthread_mutex_unlock(&msg_lock));
++    return FALSE;
++}
++WINAPI(GetMessageW)
++
++__winfnc BOOL PostThreadMessageW(DWORD thread, UINT msg, ULONG_PTR wparam, LONG_PTR lparam) {
++    if(msg == WM_QUIT) post_quit();
++    else log_debug("PostThreadMessageW | ignored message 0x%x", msg);
++    return TRUE;
++}
++WINAPI(PostThreadMessageW)
++
++__winfnc BOOL TranslateMessage(const void *msg) { return FALSE; }
++WINAPI(TranslateMessage)
++
++__winfnc LONG_PTR DispatchMessageW(const void *msg) { return 0; }
++WINAPI(DispatchMessageW)
++
++__winfnc LONG_PTR DefWindowProcW(HANDLE wnd, UINT msg, ULONG_PTR wparam, LONG_PTR lparam) { return 0; }
++WINAPI(DefWindowProcW)
++
++__winfnc HANDLE RegisterPowerSettingNotification(HANDLE recipient, const GUID *setting, DWORD flags) { return (HANDLE) wnd_longs; }
++WINAPI(RegisterPowerSettingNotification)
++
++__winfnc BOOL UnregisterPowerSettingNotification(HANDLE handle) { return TRUE; }
++WINAPI(UnregisterPowerSettingNotification)
++
++__winfnc BOOL WTSRegisterSessionNotification(HANDLE wnd, DWORD flags) { return TRUE; }
++WINAPI(WTSRegisterSessionNotification)
++
++__winfnc BOOL WTSUnRegisterSessionNotification(HANDLE wnd) { return TRUE; }
++WINAPI(WTSUnRegisterSessionNotification)
+diff --git a/meson.build b/meson.build
+index 54d6dd9..d27d32a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -7,6 +7,6 @@ INSTALL_DIR = '/sbin/tudor'
+ 
+ subdir('libtudor')
+ subdir('cli')
+-subdir('tudor-host')
+-subdir('tudor-host-launcher')
+-subdir('libfprint-tod')
+\ No newline at end of file
++#subdir('tudor-host')
++#subdir('tudor-host-launcher')
++#subdir('libfprint-tod')
+\ No newline at end of file

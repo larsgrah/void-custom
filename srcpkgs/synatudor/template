@@ -1,0 +1,43 @@
+# Template file for 'synatudor'
+pkgname=synatudor
+version=0.0.20250617
+revision=1
+_commit=31dfdb06107fd1c35c9f9ceae72617e98eccc43a
+_driver=6.0.11.1132
+build_style=meson
+hostmakedepends="pkg-config glib-devel"
+makedepends="openssl-devel libusb-devel libcap-devel libseccomp-devel glib-devel
+ dbus-devel libgusb-devel json-glib-devel libfprint-tod-devel eudev-libudev-devel"
+depends="libfprint-tod dbus"
+short_desc="Synaptics Tudor fingerprint sensors via the relinked Windows driver"
+maintainer="Lars Grahmann <lars@grahmann.family>"
+license="LGPL-2.1-only, custom:Proprietary"
+homepage="https://github.com/Popax21/synaTudor"
+distfiles="https://github.com/Popax21/synaTudor/archive/${_commit}.tar.gz>synaTudor-${_commit}.tar.gz
+ https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2025/01/a8734baf-d593-496b-bf5c-e26004351a5c_42b86f1403f6f216c28153ef5119cd6988c03fb6.cab>synaptics-wbdi-${_driver}.cab"
+checksum="c9daa12695ee199580485fe25485a229a75197f727b567a6e9bca208d84e0550
+ aca28a6e263c1127fe7c8ca11df532d1f224e6963191c79c2f11c2ab1ec0691d"
+skip_extraction="synaptics-wbdi-${_driver}.cab"
+wrksrc="synaTudor-${_commit}"
+make_dirs="/var/lib/tudor 0700 root root"
+repository=nonfree
+restricted=yes
+# the driver DLLs are Windows PE images, leave them alone
+nostrip=yes
+
+post_extract() {
+	# Synaptics' driver for the Kensington VeriMark DT, the x64 build only
+	mkdir -p libtudor/verimark
+	bsdtar -xf "${XBPS_SRCDISTDIR}/${pkgname}-${version}/synaptics-wbdi-${_driver}.cab" \
+		-C libtudor/verimark --strip-components 1 \
+		x64/synaFpAdapter132.dll x64/synaWudfBioUsb132.dll
+}
+
+post_install() {
+	# dbus activates the launcher directly, there's no systemd
+	rm -r ${DESTDIR}/usr/lib/systemd
+	# upstream installs the rule into udevdir itself
+	vmkdir usr/lib/udev/rules.d
+	mv ${DESTDIR}/usr/lib/udev/60-tudor-libfprint-tod.rules ${DESTDIR}/usr/lib/udev/rules.d/
+	vlicense LICENSE
+}

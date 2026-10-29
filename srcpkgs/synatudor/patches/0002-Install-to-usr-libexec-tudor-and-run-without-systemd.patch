@@ -1,0 +1,145 @@
+From d78cb9e5d11f38bb0375607a18d64ad0ffa4f18f Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars@grahmann.family>
+Date: Thu, 29 Oct 2026 13:32:43 +0100
+Subject: [PATCH 2/2] Install to /usr/libexec/tudor and run without systemd
+
+/sbin is a symlink on Void, so the install dir moves to /usr/libexec/tudor
+and the host's sandbox bind-mounts it from a meson define. The launcher
+falls back to /var/lib/tudor when STATE_DIRECTORY isn't set and spawns
+tudor_host from the install dir instead of its cwd, both of which systemd
+used to provide and plain dbus activation doesn't.
+
+The plugin and udev rule pick up the VeriMark DT, and with the driver's
+own storage the committed enrollment is mirrored into the record list, so
+the host can hand the record back to fprintd.
+---
+ libfprint-tod/60-tudor-libfprint-tod.rules      | 4 +++-
+ libfprint-tod/src/device.c                      | 1 +
+ libtudor/src/tudor/device.c                     | 4 ++++
+ meson.build                                     | 9 +++++----
+ tudor-host-launcher/src/launch.c                | 3 ++-
+ tudor-host-launcher/src/pdata.c                 | 3 ++-
+ tudor-host-launcher/tudor-host-launcher.service | 4 ++--
+ tudor-host/src/sandbox.c                        | 4 ++--
+ 8 files changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/libfprint-tod/60-tudor-libfprint-tod.rules b/libfprint-tod/60-tudor-libfprint-tod.rules
+index 2ee7b8e..4d66f68 100644
+--- a/libfprint-tod/60-tudor-libfprint-tod.rules
++++ b/libfprint-tod/60-tudor-libfprint-tod.rules
+@@ -1,2 +1,4 @@
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="047d", ATTRS{idProduct}=="00f2", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="047d", ATTRS{idProduct}=="00f2", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+diff --git a/libfprint-tod/src/device.c b/libfprint-tod/src/device.c
+index fbe7010..595b855 100644
+--- a/libfprint-tod/src/device.c
++++ b/libfprint-tod/src/device.c
+@@ -14,6 +14,7 @@ GType fpi_tod_shared_driver_get_type() {
+ 
+ static FpIdEntry tudor_ids[] = {
+     { .vid = 0x06cb, .pid = 0x00be },
++    { .vid = 0x047d, .pid = 0x00f2 }, //Kensington VeriMark DT
+ //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+     { 0 }
+ };
+diff --git a/libtudor/src/tudor/device.c b/libtudor/src/tudor/device.c
+index 1c269ef..07bb288 100644
+--- a/libtudor/src/tudor/device.c
++++ b/libtudor/src/tudor/device.c
+@@ -322,6 +322,10 @@ bool tudor_enroll_commit(struct tudor_device *device, bool *is_duplicate) {
+         return false;
+     }
+ 
++    //The driver's own storage keeps the template on the sensor, mirror it in our
++    //record list so callers still get a record back - an existing one is fine
++    if(tudor_vendor_storage) tudor_add_record(device, device->enroll_guid, device->enroll_finger, &payload, sizeof(payload));
++
+     device->enrolling = false;
+     return true;
+ }
+diff --git a/meson.build b/meson.build
+index d27d32a..8832862 100644
+--- a/meson.build
++++ b/meson.build
+@@ -3,10 +3,11 @@ project('synaTudor', ['c'],
+     meson_version: '>= 0.57.0'
+ )
+ 
+-INSTALL_DIR = '/sbin/tudor'
++INSTALL_DIR = '/usr/libexec/tudor'
++add_global_arguments('-DTUDOR_INSTALL_DIR="' + INSTALL_DIR + '"', language: 'c')
+ 
+ subdir('libtudor')
+ subdir('cli')
+-#subdir('tudor-host')
+-#subdir('tudor-host-launcher')
+-#subdir('libfprint-tod')
+\ No newline at end of file
++subdir('tudor-host')
++subdir('tudor-host-launcher')
++subdir('libfprint-tod')
+\ No newline at end of file
+diff --git a/tudor-host-launcher/src/launch.c b/tudor-host-launcher/src/launch.c
+index 7c54588..362dff4 100644
+--- a/tudor-host-launcher/src/launch.c
++++ b/tudor-host-launcher/src/launch.c
+@@ -164,7 +164,8 @@ void launch_host_call(GDBusMethodInvocation *invoc, GVariant *params) {
+     g_assert_no_errno(fd_err = dup(STDERR_FILENO));
+ 
+     GError *error = NULL;
+-    gchar *cwd = g_get_current_dir();
++    //Run from the install dir, tudor_host is spawned by relative path
++    gchar *cwd = g_strdup(TUDOR_INSTALL_DIR);
+     if(!g_spawn_async_with_fds(cwd, argv, envp, G_SPAWN_DO_NOT_REAP_CHILD, host_setup, NULL, &pid, host_sock, fd_out, fd_err, &error)) {
+         g_assert_no_errno(close(fd_out));
+         g_assert_no_errno(close(fd_err));
+diff --git a/tudor-host-launcher/src/pdata.c b/tudor-host-launcher/src/pdata.c
+index 666b989..efdd235 100644
+--- a/tudor-host-launcher/src/pdata.c
++++ b/tudor-host-launcher/src/pdata.c
+@@ -164,8 +164,9 @@ void store_pdata_call(GDBusMethodInvocation *invoc, GVariant *params) {
+ 
+ void init_pdata() {
+     //Get the pairing data directory
++    //systemd sets this, plain dbus activation doesn't
+     pdata_dir = g_getenv("STATE_DIRECTORY");
+-    if(!pdata_dir) g_error("State directory environment variable not set!");
++    if(!pdata_dir) pdata_dir = "/var/lib/tudor";
+ }
+ 
+ void uninit_pdata() {}
+\ No newline at end of file
+diff --git a/tudor-host-launcher/tudor-host-launcher.service b/tudor-host-launcher/tudor-host-launcher.service
+index 29309df..ee69417 100644
+--- a/tudor-host-launcher/tudor-host-launcher.service
++++ b/tudor-host-launcher/tudor-host-launcher.service
+@@ -4,8 +4,8 @@ Description=Tudor host launcher DBus service
+ [Service]
+ Type=dbus
+ BusName=net.reactivated.TudorHostLauncher
+-ExecStart=/sbin/tudor/tudor_host_launcher
+-WorkingDirectory=/sbin/tudor/
++ExecStart=/usr/libexec/tudor/tudor_host_launcher
++WorkingDirectory=/usr/libexec/tudor/
+ StateDirectory=tudor
+ StateDirectoryMode=0700
+ 
+diff --git a/tudor-host/src/sandbox.c b/tudor-host/src/sandbox.c
+index 2394843..7d98d7d 100644
+--- a/tudor-host/src/sandbox.c
++++ b/tudor-host/src/sandbox.c
+@@ -114,8 +114,8 @@ static void unmount_root() {
+ #ifdef UNMOUNTFS
+     //Pivot root
+     cant_fail(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL));
+-    cant_fail(mount("/sbin/tudor", "/sbin/tudor", NULL, MS_BIND | MS_NOSUID | MS_RDONLY, NULL));
+-    cant_fail(chdir("/sbin/tudor"));
++    cant_fail(mount(TUDOR_INSTALL_DIR, TUDOR_INSTALL_DIR, NULL, MS_BIND | MS_NOSUID | MS_RDONLY, NULL));
++    cant_fail(chdir(TUDOR_INSTALL_DIR));
+     cant_fail(syscall(SYS_pivot_root, ".", "."));
+     cant_fail(umount2(".", MNT_DETACH));
+     cant_fail(chdir("/"));
