@@ -1,7 +1,7 @@
 From 6c3939a217b25ff8f4a2a4876ff7948427183b17 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 18:36:33 +0100
-Subject: [PATCH 14/20] examples: Add a crossmatch check for two fingers (not
+Subject: [PATCH 14/22] examples: Add a crossmatch check for two fingers (not
  for upstream)
 
 ---

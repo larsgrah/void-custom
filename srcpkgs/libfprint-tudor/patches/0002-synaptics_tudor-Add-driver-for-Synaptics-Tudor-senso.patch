@@ -1,7 +1,7 @@
 From f409279db1958b840cf042df1979039fd0ebcf0e Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 15:25:45 +0100
-Subject: [PATCH 02/20] synaptics_tudor: Add driver for Synaptics Tudor sensors
+Subject: [PATCH 02/22] synaptics_tudor: Add driver for Synaptics Tudor sensors
 
 Opens the sensor, pairs with a fresh host key, sets up the TLS session
 and can list the templates stored on the chip (Kensington VeriMark DT,

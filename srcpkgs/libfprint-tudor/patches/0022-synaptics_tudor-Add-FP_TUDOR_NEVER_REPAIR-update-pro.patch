@@ -1,0 +1,233 @@
+From 7cf8ae633d7a451f231dbb604744503e06113bf0 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:25:07 +0100
+Subject: [PATCH 22/22] synaptics_tudor: Add FP_TUDOR_NEVER_REPAIR, update
+ protocol notes (not for upstream)
+
+---
+ PROTOCOL.md                               | 128 +++++++++++++---------
+ libfprint/drivers/synaptics_tudor/tudor.c |  17 ++-
+ 2 files changed, 93 insertions(+), 52 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 8ef9dd21..c874c153 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -190,7 +190,7 @@ All integers little endian.
+ | 144 | 256 | signature, zero padded |
+ 
+ The signed part is the first 142 bytes. Host request: DER ECDSA SHA-256
+-signature (71 bytes typically) by the "HS key". The countersigned host
++signature (69 to 72 bytes) by the "HS key". The countersigned host
+ cert has a 32 byte signature (not checked, scheme unknown). The sensor
+ cert has a DER ECDSA SHA-256 signature, checked against a per firmware
+ public key.
+@@ -248,11 +248,16 @@ All the deviations from the standard:
+   bytes, zeros work. The cert is the countersigned host cert from PAIR.
+ - ClientKeyExchange is `04 x y` (65 bytes, big endian coordinates).
+ - CertificateVerify is an ECDSA P-256 signature over the SHA-256 transcript
+-  hash as is (prehashed). The sensor only accepts **exactly 70 bytes**:
+-  `30 44 02 20 <r 32> 02 20 <s 32>` with no extra zero byte when the top
+-  bit is set. DER from openssl is 71 or 72 bytes when r or s has the top
+-  bit set (about half of the handshakes in testing) and those fail with alert 20 (bad
+-  record mac) on the Finished. With the fixed layout 25 of 25 worked.
++  hash as is (prehashed), the body is the plain DER signature. Its length
++  varies, 69 to 72 bytes, with a leading zero byte in front of an r or s
++  with the top bit set. The vendor driver sent 70 bytes (`30 44 ...`) in
++  three handshakes of the traces and 72 bytes (`30 46 ...`, r and s 33
++  bytes each) in the other three, the sensor took all of them. 30
++  consecutive open, list, close cycles with the driver (69 bytes once, 70
++  four times, 71 seventeen times, 72 eight times) all went through. An
++  earlier version of these notes said only a fixed 70 byte form works, that
++  was wrong. The failures seen with it (alert 20 on the Finished) had
++  another cause, not the signature.
+ - Transcript hash is SHA-256 over all handshake messages (4 byte header
+   included, as received/sent), the Finished messages are **not** part of
+   it, so client and server verify data use the same hash.
+@@ -273,7 +278,8 @@ All the deviations from the standard:
+ ## Events, captures, enroll, match, delete
+ 
+ All from the finger-on-sensor trace of the Windows driver, implemented in
+-the driver but not yet run against a finger (see the test notes at the end).
++the driver and run against a finger on hardware (owner sessions 1 and 2,
++see "Hardware results").
+ 
+ ### Events
+ 
+@@ -342,9 +348,10 @@ its own. The payload is 17 bytes like Windows (guid and finger). The
+ libfprint user id string ("FP1-date-finger-random-username", zero
+ terminated) is stored in the identity, behind the type word and the guid:
+ the identity is always 76 bytes, bytes 20 to 75 are free, so at most 55
+-characters (about 31 for the user name). The sensor was never shown to
+-accept a non-zero tail there, the first run of the owner session decides.
+-Prints enrolled before have a zero tail and are listed without user name.
++characters (about 31 for the user name). The sensor takes
++a non-zero tail there: a print enrolled in owner session 1 came back from
++the list with its user name, finger and enroll date intact. Prints enrolled
++before have a zero tail and are listed without user name.
+ 
+ The Windows driver also asks DB info between commit and end, the driver
+ does too.
+@@ -380,8 +387,8 @@ payloads). The vendor driver runs all three right after a delete. Without
+ it a sensor runs dry: the owner's sensor sat at 1 template, 10 deleted, 0
+ available. The driver checks DB info before an enroll, reclaims when
+ something deleted is there and otherwise fails with DATA_FULL, and does
+-the cleanup after each delete. Cleanup is untested on hardware until the
+-owner session ran.
++the cleanup after each delete. Cleanup ran on hardware in owner session 1
++on a sensor with no free slots, the enroll after it succeeded.
+ 
+ The reply to `a1 03 00 00 00 <payload id>` is a reserved u16, the u32
+ length and then the list of entries the commit had (template id, identity,
+@@ -414,51 +421,70 @@ or formats, request 0x15, or anything else.
+ - Event endpoint 0x83 format (bytes 5 and 6 in the prototype notes are
+   frame index and event sequence).
+ 
+-## Open points for the hardware test
+-
+-- Does the sensor take a non-zero tail in the identity (user id string).
+-- Does cleanup change anything but the deleted counters.
+-- Duplicate check: the driver identifies once before the enroll (extra
+-  touch, tested by tudor-owner-session2.sh part A). The vendor trace has
+-  no command for it: the engine's CheckForDuplicate in synaFpAdapter132.dll
+-  calls the same internal identify as verify and expects NO_MATCH, but
+-  cross-enroll.trace shows no 0x99 between the last 0x96 02 and the
+-  commit. The only host side duplicate check seen (identity already in
+-  the record store, WINBIO_E_DUPLICATE_ENROLLMENT) is keyed by identity,
+-  not by finger. Whether identify works inside an open enroll session is
+-  still untested, it would save the extra touch.
++## Hardware results
++
++Owner session 1 (20261029-182227-*): list, delete of an unknown id
++(DATA_NOT_FOUND), cancelled identify, finger status flags, a cancelled
++enroll that stores nothing, a full enroll, metadata round trip (user name,
++finger, date), identify, delete and the cleanup all worked. The cleanup ran
++at the start of an enroll on a sensor with 0 free slots and the enroll then
++succeeded. One check failed, a verify with the other enrolled finger
++that was expected to not match the test print. A focused crossmatch
++(20261029-183701-crossmatch.log) identified the left index 5 of 5 times
++as the left index, so the failed check was most likely the wrong finger on
++the sensor. Delete refuses unless the parent query agrees on the user, and
++it worked, so the user id offset in the object info reply is right.
++
++Owner session 2 (20261029-221359-session2*): enrolling the left index again
++was refused with DATA_DUPLICATE after the first touch and stored nothing.
++An enroll with odd touches (fingertip, very light, edge of the sensor)
++finished without a reported retry, the sensor took all of them. Identify
++and a full enroll, verify and identify worked after the trimmed open.
++
++Other findings from the traces and logs:
++
++- Duplicate check: the driver identifies once before the enroll (one extra
++  touch). The vendor trace has no command for it: the engine's
++  CheckForDuplicate in synaFpAdapter132.dll calls the same internal
++  identify as verify and expects NO_MATCH, but cross-enroll.trace shows no
++  0x99 between the last 0x96 02 and the commit. The only host side
++  duplicate check seen (identity already in the record store,
++  WINBIO_E_DUPLICATE_ENROLLMENT) is keyed by identity, not by finger.
+ - Rejects: the frame event only has bit 31 of the flags, nothing else was
+   ever set. The vendor "reject detail 0x7" is WinBio POOR_QUALITY, a
+   constant for a flagged frame, so too short / off centre cannot be told
+-  apart and the driver says RETRY_GENERAL. A very short tap was accepted
+-  by the sensor (owner session 1, B8). Part B of the second session logs
+-  the flags of odd touches.
+-- A 0x96 02 reply whose capture mask did not grow (cross-enroll.trace has
+-  one, mask 3 twice) is a capture the sensor took without using. The driver
+-  reports it as a retry, not a stage.
+-- Open sequence: trimmed to version, pairing and TLS, see above. The old
+-  FP_TUDOR_OPEN_TRIM knob is gone.
+-- Duplicate check and rejects, owner session 2: enrolling the left index
+-  again was refused after the first touch and stored nothing. Odd touches
+-  (tip, very light, edge) in an enroll gave no reject and no retry, the
+-  sensor took them all.
+-- Is the user id offset in the object info reply right (the driver
+-  refuses to delete unless the parent filter query agrees).
+-- What a rejected capture does in an enroll.
+-- A trace of listing the data of an object would allow list to give real
+-  prints.
++  apart and the driver says RETRY_GENERAL. A very short tap and the odd
++  touches of session 2 were all accepted.
++- A 0x96 02 reply whose capture mask did not grow (cross-enroll.trace and
++  the crossmatch enroll each have one, stage 3 twice) is a capture the
++  sensor took without using. The driver reports it as a retry, not a stage.
++- Open sequence: version, pairing and TLS only, see above.
++- The a1 object data read works, so list returns real prints.
++
++## Debug environment
++
++`FP_TUDOR_PAIRING_DIR` moves the pairing directory. `FP_TUDOR_NEVER_REPAIR`
++(dev branch only, not upstream) makes an open fail where it would pair the
++sensor again, also when the sensor refuses the stored pairing, so a test
++run can never orphan the enrolled templates.
++
++## Still open
++
++- Whether identify works inside an open enroll session, it would save the
++  extra touch of the duplicate check.
++- What a rejected capture does in the middle of an enroll (no touch was
++  rejected so far, only the vendor trace has a flagged frame, in a verify).
++- Whether cleanup changes anything but the counters (slots were freed).
+ 
+ ## Commit plan for an upstream merge request
+ 
+-Squash the branch into these, dropping PROTOCOL.md, examples/tudor-*,
+-rollback-to-synatudor.sh and the owner session script:
++Branch `synaptics-tudor-upstream` has it, without PROTOCOL.md, the examples,
++rollback-to-synatudor.sh and the dev knobs:
+ 
+-1. `synaptics_tudor: Add TLS client` (tudor_tls.*, meson wiring)
+-2. `synaptics_tudor: Add driver` (tudor.c/h, tudor_led.h, id table)
++1. `synaptics_tudor: Add TLS client` (tudor_tls.*)
++2. `synaptics_tudor: Add driver for Synaptics Tudor sensors` (tudor.c/h,
++   tudor_led.h, meson wiring, unsupported list and generated hwdb)
+ 3. `tests: Add offline tests for the synaptics_tudor TLS client`
+-   (test-tudor-tls.c, vectors, generator, meson hunk)
+-4. `tests: Add synaptics_tudor umockdev test` once a recording exists
+-5. `data: Add the VeriMark DT to the autosuspend hwdb` (generated)
+ 
+-Open before sending: the issue for the key constants and the state file
+-(see above), a third device, provenance of the HS key secret and seed.
++Left: the umockdev test once a recording exists, the issue for the key
++constants and the state file, a third device.
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 943115dd..a51d5756 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1091,6 +1091,14 @@ enum {
+ static void open_use_pairing (FpiDeviceSynapticsTudor *self,
+                               FpiSsm                  *ssm);
+ 
++/* Debug env (dev branch only): FP_TUDOR_NEVER_REPAIR makes an open fail where
++ * it would pair the sensor again. Pairing again orphans every template. */
++static gboolean
++tudor_never_repair (void)
++{
++  return g_getenv ("FP_TUDOR_NEVER_REPAIR") != NULL;
++}
++
+ static void
+ open_version_done (FpiDeviceSynapticsTudor *self,
+                 FpiSsm                  *ssm)
+@@ -1242,7 +1250,7 @@ open_flight_done (FpiDeviceSynapticsTudor *self,
+       /* Only a clear no from the sensor means the pairing is gone. Anything
+        * else could be a glitch and the pairing is the only way to the
+        * templates, so it stays where it is. */
+-      if (self->pairing_from_file && rejected)
++      if (self->pairing_from_file && rejected && !tudor_never_repair ())
+         {
+           fp_warn ("sensor rejected the stored pairing (%s), pairing again, "
+                    "templates enrolled before will not match", error->message);
+@@ -1292,6 +1300,13 @@ open_run_state (FpiSsm   *ssm,
+         guint8 cmd[1 + TUDOR_CERT_SIZE] = { TUDOR_CMD_PAIR };
+         guint8 cert[TUDOR_CERT_SIZE];
+ 
++        if (tudor_never_repair ())
++          {
++            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                                "Would pair the sensor again, FP_TUDOR_NEVER_REPAIR is set"));
++            return;
++          }
++
+         /* Pairing replaces the host key the sensor knows, so the new one
+          * has to be storable first */
+         if (!fpi_device_emulation_mode_enabled (device) &&

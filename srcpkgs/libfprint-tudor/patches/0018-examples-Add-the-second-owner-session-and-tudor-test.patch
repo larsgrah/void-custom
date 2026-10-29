@@ -1,7 +1,7 @@
 From fdd85989ae132c84276e21aeab3ba10f231092ad Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 19:40:18 +0100
-Subject: [PATCH 18/20] examples: Add the second owner session and tudor-test
+Subject: [PATCH 18/22] examples: Add the second owner session and tudor-test
  --enroll-only (not for upstream)
 
 ---
