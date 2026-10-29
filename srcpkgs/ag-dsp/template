@@ -1,0 +1,20 @@
+# Template file for 'ag-dsp'
+pkgname=ag-dsp
+version=0.1.0
+revision=1
+_commit=ee0d22284f25c7aaaeb7af399f4a43bde002d95b
+build_wrksrc=ag-dsp
+build_style=cargo
+hostmakedepends="cargo rust pkg-config"
+makedepends="alsa-lib-devel"
+short_desc="Userspace driver for the Yamaha AG06/AG03 mk1 DSP"
+maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
+license="custom:private"
+homepage="https://git.grahmann.family/lars/ag-dsp"
+# private repo, the chroot can't fetch it. Drop the archive in place first:
+#   git -C ~/code/private/ag-dsp archive --format=tar.gz --prefix=ag-dsp/ \
+#     -o hostdir/sources/ag-dsp-${version}/ag-dsp-${_commit}.tar.gz ${_commit}
+distfiles="https://git.grahmann.family/lars/ag-dsp/archive/${_commit}.tar.gz>ag-dsp-${_commit}.tar.gz"
+checksum=e4513ac68727981be8bf6e1cba0fe37863b436fa3f352e7423dd602c75980f51
+archs="x86_64"
+create_wrksrc=yes
