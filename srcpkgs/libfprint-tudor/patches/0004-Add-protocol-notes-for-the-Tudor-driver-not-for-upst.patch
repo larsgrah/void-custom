@@ -1,7 +1,7 @@
 From 0d15501e308bd6b3bd7537866c7d359f5152c18e Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 15:25:45 +0100
-Subject: [PATCH 4/8] Add protocol notes for the Tudor driver (not for
+Subject: [PATCH 04/15] Add protocol notes for the Tudor driver (not for
  upstream)
 
 ---

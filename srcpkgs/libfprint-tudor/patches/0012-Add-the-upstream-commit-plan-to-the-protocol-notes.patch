@@ -1,0 +1,32 @@
+From 94705adb89acf89b074915791b18540d053562d3 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:20:44 +0100
+Subject: [PATCH 12/15] Add the upstream commit plan to the protocol notes
+
+---
+ PROTOCOL.md | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 17646284..78eb23d1 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -425,3 +425,18 @@ or formats, request 0x15, or anything else.
+ - What a rejected capture does in an enroll.
+ - A trace of listing the data of an object would allow list to give real
+   prints.
++
++## Commit plan for an upstream merge request
++
++Squash the branch into these, dropping PROTOCOL.md, examples/tudor-*,
++rollback-to-synatudor.sh and the owner session script:
++
++1. `synaptics_tudor: Add TLS client` (tudor_tls.*, meson wiring)
++2. `synaptics_tudor: Add driver` (tudor.c/h, tudor_led.h, id table)
++3. `tests: Add offline tests for the synaptics_tudor TLS client`
++   (test-tudor-tls.c, vectors, generator, meson hunk)
++4. `tests: Add synaptics_tudor umockdev test` once a recording exists
++5. `data: Add the VeriMark DT to the autosuspend hwdb` (generated)
++
++Open before sending: the issue for the key constants and the state file
++(see above), a third device, provenance of the HS key secret and seed.

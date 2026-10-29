@@ -1,7 +1,7 @@
 From 3dcf24e4149e9ff972ceb7a0c7d604b4a64ced77 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 17:22:07 +0100
-Subject: [PATCH 8/8] synaptics_tudor: Keep the pairing between opens
+Subject: [PATCH 08/15] synaptics_tudor: Keep the pairing between opens
 
 The sensor ties templates to the host key it was paired with, so pairing
 on every open lost them. The key and both certificates are stored per

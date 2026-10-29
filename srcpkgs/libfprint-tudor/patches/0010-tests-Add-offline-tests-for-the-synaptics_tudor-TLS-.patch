@@ -1,0 +1,1862 @@
+From 47f8d25799298a55c8801e528f9f3f5656d51d7d Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:19:41 +0100
+Subject: [PATCH 10/15] tests: Add offline tests for the synaptics_tudor TLS
+ client
+
+Fixed vectors made by an independent python implementation cover the
+PRF, the record layer with sequence numbers, tampering and wrong
+sequence, the whole client handshake against a real server flight
+recorded from the vendor driver, the 70 byte signature form, the host
+certificate and the pairing file. Also adds the umockdev test scaffold
+(without a recording yet) and tudor-session for hardware runs.
+---
+ examples/meson.build            |   2 +-
+ examples/tudor-session.c        | 452 ++++++++++++++++++++++++++
+ tests/meson.build               |  11 +
+ tests/synaptics_tudor/README.md |  15 +
+ tests/synaptics_tudor/custom.py |  65 ++++
+ tests/synaptics_tudor/device    |  23 ++
+ tests/test-tudor-tls-vectors.h  | 409 +++++++++++++++++++++++
+ tests/test-tudor-tls.c          | 557 ++++++++++++++++++++++++++++++++
+ tests/tudor-tls-vectors.py      | 226 +++++++++++++
+ 9 files changed, 1759 insertions(+), 1 deletion(-)
+ create mode 100644 examples/tudor-session.c
+ create mode 100644 tests/synaptics_tudor/README.md
+ create mode 100644 tests/synaptics_tudor/custom.py
+ create mode 100644 tests/synaptics_tudor/device
+ create mode 100644 tests/test-tudor-tls-vectors.h
+ create mode 100644 tests/test-tudor-tls.c
+ create mode 100644 tests/tudor-tls-vectors.py
+
+diff --git a/examples/meson.build b/examples/meson.build
+index 06f21a38..84decfb5 100644
+--- a/examples/meson.build
++++ b/examples/meson.build
+@@ -19,7 +19,7 @@ foreach example: examples
+ endforeach
+ 
+ if 'synaptics_tudor' in drivers
+-    foreach example : [ 'tudor-list', 'tudor-test', 'tudor-delete', 'tudor-match' ]
++    foreach example : [ 'tudor-list', 'tudor-test', 'tudor-delete', 'tudor-match', 'tudor-session' ]
+         executable(example,
+             example + '.c',
+             dependencies: [
+diff --git a/examples/tudor-session.c b/examples/tudor-session.c
+new file mode 100644
+index 00000000..7f8b8378
+--- /dev/null
++++ b/examples/tudor-session.c
+@@ -0,0 +1,452 @@
++/*
++ * Hardware session for the synaptics_tudor driver (not for upstream).
++ *
++ * Without options it only reads: inventory, a delete of an id that does not
++ * exist, a cancelled identify and the finger status flags that go with it.
++ * With --finger-tests it also enrolls a print of its own with a test finger,
++ * lists, verifies and identifies it and deletes it again. Prints that were on
++ * the sensor before the run are never deleted, only the one made in the run.
++ * --abandon-enroll starts an enroll and dies, to see the next one recover.
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <signal.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <libfprint/fprint.h>
++
++static FpDevice *dev;
++static guint failures;
++static guint stage_calls;
++static GCancellable *enroll_cancel;
++static guint cancel_after_stage;
++static GString *seen_status;
++
++static void say (const char *fmt,
++                 ...) G_GNUC_PRINTF (1, 2);
++
++static void
++say (const char *fmt, ...)
++{
++  va_list ap;
++
++  va_start (ap, fmt);
++  vprintf (fmt, ap);
++  va_end (ap);
++  printf ("\n");
++  fflush (stdout);
++}
++
++static void
++check (gboolean    ok,
++       const char *what)
++{
++  say ("  [%s] %s", ok ? "ok" : "FAIL", what);
++  if (!ok)
++    failures++;
++}
++
++static const char *
++finger_status_string (FpFingerStatusFlags f)
++{
++  switch ((int) f)
++    {
++    case FP_FINGER_STATUS_NONE:
++      return "none";
++
++    case FP_FINGER_STATUS_NEEDED:
++      return "needed";
++
++    case FP_FINGER_STATUS_PRESENT:
++      return "present";
++
++    case FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT:
++      return "needed+present";
++
++    default:
++      return "?";
++    }
++}
++
++static void
++status_cb (FpDevice   *d,
++           GParamSpec *pspec,
++           gpointer    data)
++{
++  const char *name = finger_status_string (fp_device_get_finger_status (d));
++
++  say ("  finger status: %s", name);
++  g_string_append_printf (seen_status, "%s ", name);
++}
++
++static gchar *
++print_id (FpPrint *print)
++{
++  g_autoptr(GVariant) data = NULL;
++  g_autoptr(GVariant) bytes = NULL;
++  gsize n = 0;
++  const guint8 *p;
++  GString *s = g_string_new (NULL);
++
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data)
++    return g_string_free (s, FALSE);
++  bytes = g_variant_get_child_value (data, 0);
++  p = g_variant_get_fixed_array (bytes, &n, 1);
++  for (gsize i = 0; i < n; i++)
++    g_string_append_printf (s, "%02x", p[i]);
++  return g_string_free (s, FALSE);
++}
++
++static GPtrArray *
++list_prints (const char *title)
++{
++  g_autoptr(GError) error = NULL;
++  GPtrArray *prints = fp_device_list_prints_sync (dev, NULL, &error);
++
++  if (!prints)
++    {
++      say ("  list failed: %s", error->message);
++      failures++;
++      return NULL;
++    }
++  say ("%s: %u prints", title, prints->len);
++  for (guint i = 0; i < prints->len; i++)
++    {
++      FpPrint *p = g_ptr_array_index (prints, i);
++      g_autofree gchar *id = print_id (p);
++
++      say ("    %s finger %d user %s id %.8s", fp_print_get_description (p),
++           fp_print_get_finger (p), fp_print_get_username (p) ? fp_print_get_username (p) : "-", id);
++    }
++  return prints;
++}
++
++static gboolean
++cancel_cb (gpointer data)
++{
++  g_cancellable_cancel (data);
++  return G_SOURCE_REMOVE;
++}
++
++static gboolean
++die_cb (gpointer data)
++{
++  raise (SIGKILL);
++  return G_SOURCE_REMOVE;
++}
++
++static gboolean
++in_list (GPtrArray  *prints,
++         const char *id)
++{
++  for (guint i = 0; prints && i < prints->len; i++)
++    {
++      g_autofree gchar *other = print_id (g_ptr_array_index (prints, i));
++
++      if (g_strcmp0 (other, id) == 0)
++        return TRUE;
++    }
++  return FALSE;
++}
++
++static void
++enroll_progress (FpDevice *d,
++                 gint      done,
++                 FpPrint  *print,
++                 gpointer  data,
++                 GError   *error)
++{
++  if (error)
++    {
++      say ("  retry: %s", error->message);
++      return;
++    }
++
++  say ("  enroll stage %d done", done);
++  stage_calls++;
++  if (cancel_after_stage && stage_calls >= cancel_after_stage && enroll_cancel)
++    g_cancellable_cancel (enroll_cancel);
++}
++
++static void
++match_cb (FpDevice *d,
++          FpPrint  *match,
++          FpPrint  *print,
++          gpointer  data,
++          GError   *error)
++{
++  if (error)
++    say ("  report: %s", error->message);
++}
++
++/* Part A: nothing here changes the sensor */
++static void
++read_only_part (GPtrArray **inventory)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpPrint) fake = fp_print_new (dev);
++  g_autoptr(GCancellable) cancel = g_cancellable_new ();
++  g_autoptr(GPtrArray) gallery = NULL;
++  g_autoptr(GPtrArray) again = NULL;
++  FpPrint *match = NULL;
++  guint8 id[16];
++
++  say ("A1 inventory");
++  *inventory = list_prints ("on the sensor");
++  check (*inventory != NULL, "list works");
++
++  say ("A2 delete of an id that is not there");
++  for (int i = 0; i < 16; i++)
++    id[i] = 0xa0 + i;
++  g_object_set (fake, "fpi-type", 1,
++                "fpi-data", g_variant_new ("(@ay)", g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, id, 16, 1)),
++                NULL);
++  check (!fp_device_delete_print_sync (dev, fake, NULL, &error) &&
++         g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_NOT_FOUND),
++         "error is DATA_NOT_FOUND");
++  g_clear_error (&error);
++
++  say ("A3 identify that is cancelled while it waits for a finger (do not touch)");
++  gallery = *inventory ? g_ptr_array_ref (*inventory) : g_ptr_array_new ();
++  g_string_truncate (seen_status, 0);
++  g_timeout_add (2000, cancel_cb, cancel);
++  check (!fp_device_identify_sync (dev, gallery, cancel, match_cb, NULL, &match, NULL, &error) &&
++         g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED),
++         "identify ends with CANCELLED");
++  if (error)
++    say ("  error was: %s", error->message);
++  g_clear_error (&error);
++  check (strstr (seen_status->str, "needed") != NULL, "finger status said needed while waiting");
++  check (fp_device_get_finger_status (dev) == FP_FINGER_STATUS_NONE, "finger status is none again");
++
++  say ("A4 the session still works after the cancel");
++  again = list_prints ("on the sensor");
++  check (again != NULL && *inventory && again->len == (*inventory)->len, "same prints as before");
++}
++
++/* Part B needs the owner */
++static void
++finger_part (GPtrArray *inventory)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FpPrint) template = NULL;
++  g_autoptr(FpPrint) print = NULL;
++  g_autoptr(GPtrArray) after = NULL;
++  g_autoptr(GPtrArray) gallery = NULL;
++  g_autofree gchar *new_id = NULL;
++  FpPrint *match = NULL;
++  FpPrint *listed = NULL;
++  gboolean matched = FALSE;
++  gboolean deleted = FALSE;
++
++  say ("B1 the test finger must not be enrolled already");
++  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  if (fp_device_identify_sync (dev, inventory, NULL, match_cb, NULL, &match, NULL, &error) && match)
++    {
++      check (FALSE, "the test finger matched an enrolled print, pick another finger");
++      return;
++    }
++  if (error)
++    say ("  identify said: %s", error->message);
++  check (TRUE, "test finger is not enrolled");
++  g_clear_error (&error);
++
++  say ("B2 enroll that is cancelled after two stages");
++  say (">>> TOUCH TWICE with the TEST finger (left index), lifting in between, then stop");
++  template = fp_print_new (dev);
++  fp_print_set_finger (template, FP_FINGER_LEFT_INDEX);
++  fp_print_set_username (template, "tudor-test");
++  enroll_cancel = g_cancellable_new ();
++  cancel_after_stage = 2;
++  stage_calls = 0;
++  print = fp_device_enroll_sync (dev, g_object_ref (template), enroll_cancel, enroll_progress, NULL, &error);
++  check (print == NULL && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED),
++         "enroll ends with CANCELLED");
++  if (error)
++    say ("  error was: %s", error->message);
++  g_clear_error (&error);
++  g_clear_object (&enroll_cancel);
++  cancel_after_stage = 0;
++  after = list_prints ("after the cancelled enroll");
++  check (after && inventory && after->len == inventory->len, "nothing was stored");
++  g_clear_pointer (&after, g_ptr_array_unref);
++
++  say ("B3 the real enroll");
++  say (">>> TOUCH the TEST finger (left index), lift, repeat until it says enrolled");
++  g_string_truncate (seen_status, 0);
++  print = fp_device_enroll_sync (dev, g_object_ref (template), NULL, enroll_progress, NULL, &error);
++  if (!print)
++    {
++      say ("  enroll failed: %s", error->message);
++      check (FALSE, "enroll");
++      return;
++    }
++  check (TRUE, "enroll finished");
++  check (strstr (seen_status->str, "needed") != NULL && strstr (seen_status->str, "present") != NULL,
++         "finger status went through needed and present");
++  check (fp_device_get_finger_status (dev) == FP_FINGER_STATUS_NONE, "finger status none at the end");
++  say ("  description of the new print: %s", fp_print_get_description (print));
++  new_id = print_id (print);
++
++  say ("B4 list shows the new print with its metadata");
++  after = list_prints ("on the sensor");
++  check (after && inventory && after->len == inventory->len + 1, "one more print");
++  for (guint i = 0; after && i < after->len; i++)
++    {
++      FpPrint *p = g_ptr_array_index (after, i);
++      g_autofree gchar *id = print_id (p);
++
++      if (g_strcmp0 (id, new_id) == 0)
++        listed = p;
++    }
++  if (listed)
++    {
++      check (g_strcmp0 (fp_print_get_username (listed), "tudor-test") == 0, "username survived");
++      check (fp_print_get_finger (listed) == FP_FINGER_LEFT_INDEX, "finger survived");
++      check (fp_print_get_enroll_date (listed) != NULL, "enroll date present");
++      check (fp_print_equal (listed, print), "listed print equals the enrolled one");
++    }
++  else
++    {
++      check (FALSE, "new print is in the list");
++    }
++
++  say ("B5 verify with the test finger");
++  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  matched = FALSE;
++  if (fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
++    check (matched, "verify matches");
++  else
++    check (FALSE, error->message);
++  g_clear_error (&error);
++
++  say ("B6 verify with another finger that is enrolled");
++  say (">>> TOUCH ONCE with your USUAL finger (one that was enrolled before)");
++  matched = TRUE;
++  if (fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
++    check (!matched, "no match for the test print");
++  else
++    say ("  verify said: %s (retry, not counted)", error->message);
++  g_clear_error (&error);
++
++  say ("B7 identify with the listed prints");
++  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  gallery = after ? g_ptr_array_ref (after) : g_ptr_array_new ();
++  match = NULL;
++  if (fp_device_identify_sync (dev, gallery, NULL, match_cb, NULL, &match, NULL, &error))
++    {
++      g_autofree gchar *mid = match ? print_id (match) : NULL;
++
++      check (match != NULL && g_strcmp0 (mid, new_id) == 0, "identify finds the test print");
++    }
++  else
++    {
++      check (FALSE, error->message);
++    }
++  g_clear_error (&error);
++
++  say ("B8 a very short tap, only for the log (what does a rejected touch look like)");
++  say (">>> TAP the TEST finger (left index) as briefly as you can, once");
++  if (!fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
++    say ("  result: %s%s", error->message, error->domain == FP_DEVICE_RETRY ? " (retry)" : "");
++  else
++    say ("  result: %s", matched ? "match" : "no match");
++  g_clear_error (&error);
++
++  say ("B9 delete the test print, this also cleans up deleted slots");
++  if (fp_device_delete_print_sync (dev, print, NULL, &error))
++    {
++      deleted = TRUE;
++      check (TRUE, "delete worked");
++    }
++  else
++    {
++      check (FALSE, error->message);
++    }
++  g_clear_error (&error);
++  g_clear_pointer (&after, g_ptr_array_unref);
++  after = list_prints ("on the sensor after the delete");
++  check (deleted && after && inventory && after->len == inventory->len, "back to the prints from before");
++  for (guint i = 0; inventory && i < inventory->len; i++)
++    {
++      g_autofree gchar *id = print_id (g_ptr_array_index (inventory, i));
++
++      check (in_list (after, id), "an earlier print is still there");
++    }
++}
++
++int
++main (int    argc,
++      char **argv)
++{
++  g_autoptr(FpContext) ctx = fp_context_new ();
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GPtrArray) inventory = NULL;
++  GPtrArray *devices = fp_context_get_devices (ctx);
++  gboolean finger_tests = FALSE, abandon = FALSE;
++
++  for (int i = 1; i < argc; i++)
++    {
++      finger_tests |= g_strcmp0 (argv[i], "--finger-tests") == 0;
++      abandon |= g_strcmp0 (argv[i], "--abandon-enroll") == 0;
++    }
++
++  for (guint i = 0; devices && i < devices->len; i++)
++    {
++      FpDevice *d = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (fp_device_get_driver (d), "synaptics_tudor") == 0)
++        dev = d;
++    }
++  if (!dev)
++    {
++      g_printerr ("No synaptics_tudor device found\n");
++      return 1;
++    }
++
++  seen_status = g_string_new (NULL);
++  if (!fp_device_open_sync (dev, NULL, &error))
++    {
++      g_printerr ("Open failed: %s\n", error->message);
++      return 1;
++    }
++  g_signal_connect (dev, "notify::finger-status", G_CALLBACK (status_cb), NULL);
++
++  if (abandon)
++    {
++      g_autoptr(FpPrint) template = fp_print_new (dev);
++
++      say ("starting an enroll and dying after two seconds");
++      fp_print_set_finger (template, FP_FINGER_LEFT_INDEX);
++      g_timeout_add (2000, die_cb, NULL);
++      fp_device_enroll_sync (dev, template, NULL, enroll_progress, NULL, &error);
++      return 1;
++    }
++
++  read_only_part (&inventory);
++  if (finger_tests)
++    finger_part (inventory);
++
++  if (!fp_device_close_sync (dev, NULL, &error))
++    {
++      say ("close failed: %s", error->message);
++      failures++;
++    }
++  say ("%s: %u check(s) failed", failures ? "FAILED" : "PASSED", failures);
++  return failures ? 1 : 0;
++}
+diff --git a/tests/meson.build b/tests/meson.build
+index d218e04d..fbd96d5e 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -66,6 +66,12 @@ drivers_tests = {
+     'secugen': {},
+ }
+ 
++# Needs a recording made on a sensor that can be paired from scratch, see
++# synaptics_tudor/README.md
++if fs.exists('synaptics_tudor/custom.pcapng')
++    drivers_tests += { 'synaptics_tudor': {} }
++endif
++
+ if get_option('introspection')
+   conf = configuration_data()
+   conf.set('SRCDIR', meson.project_source_root())
+@@ -324,6 +330,11 @@ endif
+ 
+ unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+ 
++if 'synaptics_tudor' in drivers
++    unit_tests += ['tudor-tls']
++    unit_tests_deps += { 'tudor-tls': [openssl_dep] }
++endif
++
+ foreach test_name: unit_tests
+     if unit_tests_deps.has_key(test_name)
+         missing_deps = false
+diff --git a/tests/synaptics_tudor/README.md b/tests/synaptics_tudor/README.md
+new file mode 100644
+index 00000000..4e32e1c5
+--- /dev/null
++++ b/tests/synaptics_tudor/README.md
+@@ -0,0 +1,15 @@
++# synaptics_tudor umockdev test
++
++`device` and `custom.py` are in place, `custom.pcapng` is missing, so the test
++is not run yet (tests/meson.build picks it up once the file exists).
++
++The recording replays byte for byte because in emulation mode the driver
++seeds all randomness, uses a fixed host key and never reads or writes the
++pairing file. That also means the sensor must be paired during the recording
++with that fixed key. A pairing replaces the host key the sensor knows, every
++template enrolled before stops matching. Record on a sensor that holds
++nothing of value, never on one in daily use.
++
++Record with `tests/capture.py` (see tests/README.md) running `custom.py`
++with `FP_DEVICE_EMULATION=1` and a finger for the 7 enroll touches, one
++verify and one identify. Anonymize the serial in `device`.
+diff --git a/tests/synaptics_tudor/custom.py b/tests/synaptics_tudor/custom.py
+new file mode 100644
+index 00000000..e2dedabd
+--- /dev/null
++++ b/tests/synaptics_tudor/custom.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import traceback
++import sys
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, included those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++d = devices[0]
++del devices
++
++assert d.get_driver() == "synaptics_tudor"
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++
++d.open_sync()
++
++# The recording starts on an empty sensor
++d.clear_storage_sync()
++
++template = FPrint.Print.new(d)
++template.set_finger(FPrint.Finger.LEFT_INDEX)
++template.set_username('tudor-test')
++
++def enroll_progress(*args):
++    assert d.get_finger_status() & FPrint.FingerStatusFlags.NEEDED
++    print('enroll progress: ' + str(args))
++
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++p = d.enroll_sync(template, None, enroll_progress, None)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++assert p.get_description() == 'FP1-00000000-2-00000000-tudor-test'
++
++stored = d.list_prints_sync()
++assert len(stored) == 1
++assert stored[0].equal(p)
++assert stored[0].get_description() == 'FP1-00000000-2-00000000-tudor-test'
++assert stored[0].get_username() == 'tudor-test'
++assert stored[0].get_finger() == FPrint.Finger.LEFT_INDEX
++
++verify_res, verify_print = d.verify_sync(p)
++assert verify_res
++
++match, _ = d.identify_sync(stored)
++assert match.equal(p)
++
++d.delete_print_sync(p)
++assert len(d.list_prints_sync()) == 0
++
++d.close_sync()
+diff --git a/tests/synaptics_tudor/device b/tests/synaptics_tudor/device
+new file mode 100644
+index 00000000..77e59dfd
+--- /dev/null
++++ b/tests/synaptics_tudor/device
+@@ -0,0 +1,23 @@
++P: /devices/pci0000:00/0000:00:08.1/0000:0a:00.3/usb3/3-2/3-2.4/3-2.4.2
++N: bus/usb/003/009=12010002000000087D04F20000000002010109023900020100A032090400000203000000092111010001222F00070501033C0004070581033C00040904010001FF00000007058303080004
++E: BUSNUM=003
++E: DEVNAME=/dev/bus/usb/003/009
++E: DEVNUM=009
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_BUS=usb
++E: ID_MODEL=VeriMark_DT_Fingerprint_Key
++E: ID_MODEL_ENC=VeriMark\x20DT\x20Fingerprint\x20Key
++E: ID_MODEL_ID=00f2
++E: ID_REVISION=0000
++E: ID_SERIAL=047d_VeriMark_DT_Fingerprint_Key_XXXX
++E: ID_SERIAL_SHORT=XXXX
++E: ID_USB_INTERFACES=:030000:ff0000:
++E: ID_VENDOR=047d
++E: ID_VENDOR_ENC=047d
++E: ID_VENDOR_ID=047d
++E: MAJOR=189
++E: MINOR=264
++E: PRODUCT=47d/f2/0
++E: SUBSYSTEM=usb
++E: TYPE=0/0/0
+diff --git a/tests/test-tudor-tls-vectors.h b/tests/test-tudor-tls-vectors.h
+new file mode 100644
+index 00000000..3d4e3d8e
+--- /dev/null
++++ b/tests/test-tudor-tls-vectors.h
+@@ -0,0 +1,409 @@
++/* Generated by tudor-tls-vectors.py, do not edit */
++
++static const guint8 vec_pair_reply[] = {
++  0x00, 0x00, 0x3f, 0x5f, 0x17, 0x00, 0xcb, 0x76, 0x13, 0xf5, 0xe4, 0xce,
++  0x4d, 0x8c, 0xff, 0x42, 0x5d, 0x95, 0x79, 0x36, 0x6e, 0xa5, 0xdc, 0xff,
++  0x49, 0x22, 0xdc, 0xa2, 0xb2, 0x25, 0xa6, 0xd0, 0xaa, 0x62, 0x87, 0x97,
++  0xf5, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x58, 0x8b, 0x79, 0x9f, 0xa1, 0xb2, 0x7c, 0xe1, 0xc9, 0xb6,
++  0x29, 0xcb, 0xfc, 0x3a, 0x5c, 0x3b, 0x4a, 0x76, 0x88, 0xf2, 0x9c, 0x0e,
++  0x6d, 0x10, 0x3c, 0x68, 0x19, 0x43, 0xa5, 0x9c, 0x77, 0x13, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
++  0x20, 0x00, 0x65, 0x4a, 0x19, 0x69, 0x7c, 0x52, 0xbc, 0x26, 0x0e, 0xb8,
++  0x11, 0xdf, 0x86, 0xc3, 0x10, 0xc4, 0xd3, 0x04, 0x5e, 0x5d, 0x4b, 0xc3,
++  0x56, 0xfd, 0xc5, 0x1f, 0xe4, 0x5d, 0xd9, 0x34, 0xe7, 0xa8, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x5f, 0x17, 0x00, 0x95, 0x7d,
++  0x20, 0x97, 0xec, 0x39, 0x96, 0x80, 0x50, 0xa5, 0xae, 0x14, 0xfc, 0xcc,
++  0x9b, 0x2a, 0xad, 0x46, 0xec, 0xf7, 0x9f, 0xed, 0xcc, 0xf6, 0x88, 0xe7,
++  0xac, 0x82, 0xef, 0x0f, 0x98, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x94, 0x1f, 0x98, 0x77, 0x5b, 0x68,
++  0x7c, 0x7c, 0xaa, 0x56, 0xbd, 0x7f, 0xcf, 0x81, 0x98, 0x67, 0x4c, 0x15,
++  0x05, 0x91, 0x3e, 0x01, 0xa4, 0x42, 0xa3, 0x59, 0x82, 0x75, 0x42, 0x68,
++  0x62, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x47, 0x00, 0x30, 0x45, 0x02, 0x21, 0x00, 0xb3,
++  0x83, 0xe0, 0xc3, 0xf6, 0x6a, 0x43, 0x3a, 0xee, 0x72, 0x2e, 0x2f, 0xf8,
++  0x55, 0x2f, 0xa0, 0xc0, 0x02, 0x09, 0xdd, 0xcd, 0x69, 0x8c, 0x43, 0x46,
++  0xad, 0x88, 0x6a, 0x37, 0x1b, 0xd7, 0x02, 0x02, 0x20, 0x1b, 0xe5, 0xfa,
++  0xf8, 0xf3, 0x0a, 0xd0, 0xc0, 0x12, 0x5d, 0x87, 0x0f, 0xc4, 0x3f, 0xc8,
++  0x49, 0xa6, 0xc4, 0x3f, 0x59, 0x44, 0xb4, 0x54, 0x27, 0xa5, 0x77, 0x44,
++  0xd7, 0x1b, 0xb0, 0x40, 0xe1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++static const guint8 vec_server_flight[] = {
++  0x16, 0x03, 0x03, 0x00, 0x3d, 0x02, 0x00, 0x00, 0x2d, 0x03, 0x83, 0x00,
++  0x01, 0x04, 0x3d, 0x0f, 0xbd, 0xea, 0xff, 0x71, 0xff, 0x2b, 0xf2, 0x0d,
++  0x97, 0xcc, 0x0b, 0xc2, 0xe0, 0xbe, 0x39, 0x4b, 0x90, 0xb5, 0x75, 0x3b,
++  0x95, 0x93, 0xd7, 0x82, 0xda, 0xe7, 0x69, 0x07, 0x54, 0x4c, 0x53, 0x0f,
++  0xbd, 0xea, 0xff, 0xc0, 0x2e, 0x00, 0x0d, 0x00, 0x00, 0x04, 0x01, 0x40,
++  0x00, 0x00, 0x0e, 0x00, 0x00, 0x00
++};
++
++static const guint8 vec_host_secret[] = {
++  0x9d, 0x18, 0xc1, 0xda, 0x06, 0x5c, 0x48, 0x6d, 0x14, 0x05, 0x4f, 0xc4,
++  0xfa, 0xd2, 0x73, 0xd4, 0xa4, 0x31, 0xdc, 0x97, 0x09, 0x49, 0xec, 0x9d,
++  0x84, 0x33, 0x6e, 0xb4, 0x6d, 0x1a, 0x15, 0xda
++};
++
++static const guint8 vec_hs_secret[] = {
++  0xe8, 0xa2, 0xa2, 0xb6, 0x65, 0x62, 0x54, 0xd6, 0xac, 0xb0, 0xef, 0x47,
++  0x9c, 0xae, 0x41, 0x40, 0xc7, 0xe8, 0xe2, 0x60, 0xdb, 0x3f, 0x64, 0x2e,
++  0x35, 0xd4, 0x09, 0x9c, 0x01, 0xb3, 0x6a, 0x86
++};
++
++static const guint8 vec_host_cert[] = {
++  0x3f, 0x5f, 0x17, 0x00, 0x4e, 0xdc, 0x8e, 0xdf, 0x54, 0x3e, 0x07, 0x5e,
++  0x49, 0x3c, 0xc7, 0x34, 0x84, 0xcb, 0x50, 0xee, 0x08, 0x62, 0x6c, 0x16,
++  0x4a, 0xd2, 0x0f, 0x00, 0xc6, 0x77, 0x8c, 0x33, 0xde, 0x32, 0x12, 0x1b,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xe2, 0x1a, 0x81, 0x22, 0x13, 0x0b, 0xb1, 0xc3, 0xb0, 0xa4, 0xf0, 0x5d,
++  0xfb, 0xce, 0x43, 0x4c, 0x76, 0xdd, 0x80, 0x50, 0x74, 0x23, 0x85, 0x95,
++  0xbb, 0x39, 0xa6, 0xe5, 0x8a, 0xe4, 0xc8, 0x01, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x00,
++  0x30, 0x44, 0x02, 0x20, 0x60, 0x02, 0xda, 0x11, 0x63, 0xdd, 0x28, 0x90,
++  0xca, 0x7b, 0x00, 0x9d, 0xc3, 0x27, 0xf1, 0x80, 0x17, 0x03, 0xe6, 0x9e,
++  0x39, 0x0b, 0xfa, 0x46, 0x7b, 0xd8, 0xab, 0xd2, 0xe8, 0x6d, 0x9c, 0x81,
++  0x02, 0x20, 0x64, 0x76, 0xa4, 0xe8, 0x76, 0x08, 0xb4, 0x28, 0x69, 0x5a,
++  0xc6, 0x25, 0xfd, 0x50, 0xa9, 0x3c, 0x51, 0x62, 0x0e, 0x36, 0x8a, 0xde,
++  0xc4, 0x3f, 0xa2, 0x1b, 0xb0, 0x01, 0x58, 0x00, 0xdc, 0x66, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00
++};
++
++static const guint8 vec_prf_secret[] = {
++  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
++  0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
++};
++
++static const guint8 vec_prf_seed[] = {
++  0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
++  0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
++  0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63,
++  0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
++  0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b,
++  0x7c, 0x7d, 0x7e, 0x7f
++};
++
++static const guint8 vec_prf_out[] = {
++  0x8c, 0xee, 0x24, 0x66, 0x2e, 0x7d, 0x12, 0xe9, 0xd6, 0xe7, 0x26, 0x47,
++  0xe7, 0xe6, 0x5c, 0x8a, 0x60, 0x54, 0xf5, 0xfd, 0xf1, 0xeb, 0xa8, 0x19,
++  0x4b, 0xe1, 0xad, 0x47, 0xa6, 0x85, 0xf1, 0x89, 0x92, 0x24, 0x05, 0x15,
++  0xd9, 0x3c, 0x74, 0x4f, 0x86, 0x8e, 0x31, 0x82, 0xce, 0xbc, 0x4b, 0xce,
++  0xa3, 0xb2, 0xeb, 0x71, 0x30, 0xd4, 0xb2, 0x38, 0x82, 0x47, 0xf6, 0x9d,
++  0xdf, 0xe5, 0x3d, 0xf1, 0xa0, 0x8e, 0xfb, 0x5c, 0x81, 0x18, 0xd3, 0x3e
++};
++
++static const guint8 vec_stream_first[] = {
++  0xe4, 0x77, 0xf0, 0x98, 0x01, 0x7c, 0x0b, 0x6b, 0x03, 0x57, 0x1c, 0x99,
++  0xc3, 0xee, 0x32, 0xbe, 0x61, 0xdb, 0x9f, 0xe8, 0xae, 0xa6, 0xba, 0xc7,
++  0x95, 0x8f, 0x13, 0x8e, 0x4b, 0x2d, 0x4c, 0x18, 0x1e, 0x77, 0xb1, 0xa3,
++  0xe3, 0x97, 0xd1, 0x3e
++};
++
++static const guint8 vec_rec_key[] = {
++  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
++  0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
++};
++
++static const guint8 vec_rec_salt[] = {
++  0xa1, 0xa2, 0xa3, 0xa4
++};
++
++static const guint8 vec_rec_plain[] = {
++  0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x74, 0x75, 0x64, 0x6f, 0x72, 0x2c,
++  0x20, 0x72, 0x65, 0x63, 0x6f, 0x72, 0x64, 0x20, 0x6c, 0x61, 0x79, 0x65,
++  0x72
++};
++
++static const guint8 vec_rec_sealed_seq5[] = {
++  0x17, 0x03, 0x03, 0x00, 0x31, 0xe4, 0x77, 0xf0, 0x98, 0x01, 0x7c, 0x0b,
++  0x6b, 0xc1, 0xbf, 0x34, 0xd3, 0x5d, 0xdb, 0x2d, 0xf8, 0xf1, 0x80, 0x16,
++  0x59, 0x3e, 0xb5, 0xa2, 0x68, 0x6c, 0x03, 0xe8, 0x5b, 0xe8, 0x4a, 0xe3,
++  0xe9, 0xe8, 0x7e, 0x9f, 0xc2, 0xeb, 0x86, 0xc7, 0x5e, 0xb7, 0xad, 0x32,
++  0xc6, 0xfe, 0x1b, 0xe8, 0xa0, 0x44
++};
++
++static const guint8 vec_rec_sealed_seq6_other_nonce[] = {
++  0x17, 0x03, 0x03, 0x00, 0x31, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
++  0x07, 0x3b, 0x04, 0x13, 0x3b, 0x9c, 0xff, 0x2f, 0x4b, 0xc9, 0x27, 0xa5,
++  0x1d, 0xe6, 0x77, 0xd9, 0x65, 0xff, 0x05, 0x71, 0xbb, 0x7f, 0xdc, 0x66,
++  0x9a, 0x4d, 0xe0, 0x11, 0x70, 0xad, 0x7c, 0xba, 0x37, 0xca, 0xac, 0xa2,
++  0x3f, 0x04, 0x1c, 0x67, 0x3f, 0x91
++};
++
++static const guint8 vec_client_hello[] = {
++  0x16, 0x03, 0x03, 0x00, 0x4b, 0x01, 0x00, 0x00, 0x47, 0x03, 0x03, 0xe4,
++  0x77, 0xf0, 0x98, 0x01, 0x7c, 0x0b, 0x6b, 0x03, 0x57, 0x1c, 0x99, 0xc3,
++  0xee, 0x32, 0xbe, 0x61, 0xdb, 0x9f, 0xe8, 0xae, 0xa6, 0xba, 0xc7, 0x95,
++  0x8f, 0x13, 0x8e, 0x4b, 0x2d, 0x4c, 0x18, 0x07, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x0c, 0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d, 0x00,
++  0x8d, 0x00, 0xa8, 0x00, 0xa9, 0x00, 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02,
++  0x00, 0x17, 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00
++};
++
++static const guint8 vec_flight[] = {
++  0x16, 0x03, 0x03, 0x02, 0x2b, 0x0b, 0x00, 0x01, 0x98, 0x00, 0x01, 0x90,
++  0x00, 0x01, 0x90, 0x00, 0x00, 0x3f, 0x5f, 0x17, 0x00, 0x4e, 0xdc, 0x8e,
++  0xdf, 0x54, 0x3e, 0x07, 0x5e, 0x49, 0x3c, 0xc7, 0x34, 0x84, 0xcb, 0x50,
++  0xee, 0x08, 0x62, 0x6c, 0x16, 0x4a, 0xd2, 0x0f, 0x00, 0xc6, 0x77, 0x8c,
++  0x33, 0xde, 0x32, 0x12, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0xe2, 0x1a, 0x81, 0x22, 0x13, 0x0b, 0xb1,
++  0xc3, 0xb0, 0xa4, 0xf0, 0x5d, 0xfb, 0xce, 0x43, 0x4c, 0x76, 0xdd, 0x80,
++  0x50, 0x74, 0x23, 0x85, 0x95, 0xbb, 0x39, 0xa6, 0xe5, 0x8a, 0xe4, 0xc8,
++  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x46, 0x00, 0x30, 0x44, 0x02, 0x20, 0x60, 0x02, 0xda,
++  0x11, 0x63, 0xdd, 0x28, 0x90, 0xca, 0x7b, 0x00, 0x9d, 0xc3, 0x27, 0xf1,
++  0x80, 0x17, 0x03, 0xe6, 0x9e, 0x39, 0x0b, 0xfa, 0x46, 0x7b, 0xd8, 0xab,
++  0xd2, 0xe8, 0x6d, 0x9c, 0x81, 0x02, 0x20, 0x64, 0x76, 0xa4, 0xe8, 0x76,
++  0x08, 0xb4, 0x28, 0x69, 0x5a, 0xc6, 0x25, 0xfd, 0x50, 0xa9, 0x3c, 0x51,
++  0x62, 0x0e, 0x36, 0x8a, 0xde, 0xc4, 0x3f, 0xa2, 0x1b, 0xb0, 0x01, 0x58,
++  0x00, 0xdc, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
++  0x41, 0x04, 0x00, 0x9e, 0x44, 0xe4, 0x82, 0x2a, 0x07, 0xdd, 0x2f, 0xa1,
++  0x3a, 0xd2, 0x2a, 0xa0, 0x48, 0x38, 0x0f, 0xc4, 0xcf, 0xf3, 0x6d, 0x75,
++  0x24, 0x00, 0x82, 0xd0, 0x2c, 0x64, 0xf9, 0xf1, 0x16, 0xaf, 0x1d, 0x23,
++  0x05, 0x25, 0x79, 0xf5, 0xae, 0x17, 0x9a, 0x2e, 0x5e, 0x87, 0x3c, 0xdd,
++  0xa7, 0x88, 0xde, 0x64, 0x9a, 0x2f, 0x66, 0xf9, 0x81, 0xa9, 0xa7, 0x66,
++  0x34, 0x7e, 0xaf, 0x09, 0x4e, 0xeb, 0x0f, 0x00, 0x00, 0x46, 0x30, 0x44,
++  0x02, 0x20, 0x2b, 0x72, 0x29, 0x24, 0xdd, 0x28, 0x92, 0x73, 0x4d, 0xfa,
++  0x39, 0x7c, 0x11, 0x4f, 0xeb, 0x70, 0x6c, 0x25, 0x19, 0xc7, 0x51, 0x73,
++  0x6c, 0x2d, 0x7e, 0xc0, 0x79, 0x3c, 0xd3, 0x7e, 0xd0, 0xaa, 0x02, 0x20,
++  0x9f, 0xf5, 0xe6, 0x78, 0xf6, 0xff, 0xef, 0xb1, 0x64, 0x02, 0x5b, 0xd8,
++  0xf6, 0xf0, 0xc8, 0x70, 0x00, 0xdd, 0x38, 0x1e, 0x44, 0x3f, 0x94, 0x26,
++  0x4a, 0x18, 0xbc, 0xdc, 0x7d, 0x01, 0x82, 0xd4, 0x14, 0x03, 0x03, 0x00,
++  0x01, 0x01, 0x16, 0x03, 0x03, 0x00, 0x28, 0xb3, 0xed, 0x6e, 0x97, 0x75,
++  0x5c, 0x56, 0xe2, 0x11, 0x7e, 0xd5, 0x16, 0xf7, 0x52, 0x8f, 0x3d, 0xdd,
++  0x0f, 0xb1, 0x4d, 0x53, 0xa1, 0x4a, 0x0b, 0xc3, 0xbc, 0x18, 0xfb, 0xc8,
++  0x22, 0x8c, 0xba, 0xf6, 0x7c, 0x5a, 0x6a, 0x73, 0x26, 0x61, 0xf6
++};
++
++static const guint8 vec_cv_digest[] = {
++  0xfb, 0x26, 0x05, 0x44, 0x42, 0x09, 0x84, 0xe7, 0x76, 0x4f, 0xf4, 0xa9,
++  0xa9, 0x76, 0xaf, 0x61, 0x86, 0x85, 0x9d, 0x04, 0x1f, 0x1c, 0x88, 0x1f,
++  0x1e, 0xa9, 0xb2, 0x48, 0x0c, 0x9b, 0x04, 0xf3
++};
++
++static const guint8 vec_master[] = {
++  0xf1, 0x9a, 0x51, 0x59, 0xbc, 0x48, 0xca, 0x1e, 0xd2, 0xe6, 0x24, 0xce,
++  0xfd, 0xea, 0x5f, 0xa6, 0x69, 0x0d, 0xf4, 0x76, 0xa3, 0xee, 0x3d, 0xfc,
++  0xcc, 0x1a, 0x30, 0x21, 0x2c, 0x02, 0x3c, 0x08, 0x1d, 0x6f, 0x83, 0xa6,
++  0x0b, 0xbb, 0x66, 0x7b, 0xf7, 0x51, 0xc1, 0xa9, 0xfb, 0x7b, 0x6c, 0x59
++};
++
++static const guint8 vec_keyblock[] = {
++  0x7a, 0x33, 0xc2, 0xfc, 0xac, 0xd5, 0x13, 0x16, 0x0f, 0xe2, 0x5f, 0x68,
++  0x2b, 0xe6, 0xf1, 0xc1, 0xb0, 0xca, 0xbf, 0x46, 0xf8, 0x03, 0xd6, 0xae,
++  0x96, 0xfb, 0xd6, 0x3d, 0xed, 0x31, 0x71, 0xf7, 0x62, 0xa9, 0x15, 0xb1,
++  0xa1, 0x8a, 0xc8, 0x2c, 0x3b, 0x63, 0x0e, 0xb4, 0xca, 0xd3, 0x74, 0x39,
++  0x41, 0xe5, 0x19, 0x9c, 0x54, 0x91, 0x4e, 0x52, 0x31, 0xe2, 0xe7, 0xaa,
++  0xed, 0x25, 0xb4, 0x2a, 0x61, 0x62, 0x4c, 0x9e, 0xc7, 0x26, 0x11, 0xfd
++};
++
++static const guint8 vec_server_finished[] = {
++  0x14, 0x03, 0x03, 0x00, 0x01, 0x01, 0x16, 0x03, 0x03, 0x00, 0x28, 0x53,
++  0x45, 0x52, 0x56, 0x45, 0x52, 0x49, 0x56, 0x41, 0x6a, 0x3f, 0x47, 0xee,
++  0xb0, 0x73, 0x25, 0x7b, 0xca, 0xe5, 0x58, 0x54, 0xf9, 0x4b, 0x56, 0x53,
++  0xe1, 0x00, 0x5d, 0xcb, 0x48, 0x9e, 0x79, 0xd5, 0x5c, 0xbf, 0xe8, 0x25,
++  0xc4, 0xdf, 0xb8
++};
++
++static const guint8 vec_app_cmd[] = {
++  0x9e, 0x01
++};
++
++static const guint8 vec_app_sent[] = {
++  0x17, 0x03, 0x03, 0x00, 0x1a, 0xe9, 0xbb, 0x6b, 0x28, 0x5e, 0xae, 0xad,
++  0xf8, 0x58, 0x0e, 0x1d, 0x08, 0xe2, 0x21, 0x8a, 0xe6, 0xb2, 0x65, 0x83,
++  0xab, 0xc0, 0xbe, 0xcc, 0xc0, 0x1d, 0x0a
++};
++
++static const guint8 vec_app_reply[] = {
++  0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
++};
++
++static const guint8 vec_app_recv_seq1[] = {
++  0x17, 0x03, 0x03, 0x00, 0x24, 0x52, 0x45, 0x50, 0x4c, 0x59, 0x30, 0x30,
++  0x31, 0x1a, 0xc5, 0xcb, 0xe6, 0x19, 0xcf, 0x71, 0x18, 0x2e, 0xb4, 0x31,
++  0x32, 0x68, 0x3f, 0xf7, 0x30, 0x56, 0xa8, 0x37, 0x44, 0xd1, 0x19, 0xb6,
++  0x7e, 0x1b, 0x21, 0x7f, 0x7e
++};
++
++static const guint8 vec_app_recv_seq2[] = {
++  0x17, 0x03, 0x03, 0x00, 0x24, 0x52, 0x45, 0x50, 0x4c, 0x59, 0x30, 0x30,
++  0x32, 0xd8, 0xd9, 0xe3, 0xce, 0x20, 0xcf, 0x74, 0x6a, 0x6e, 0xb8, 0xf7,
++  0xd0, 0xe2, 0x22, 0x01, 0x44, 0x18, 0x3a, 0x1d, 0x97, 0x1b, 0x11, 0xd1,
++  0xf6, 0x9f, 0x33, 0xe9, 0xe8
++};
++
++static const guint8 vec_server_alert[] = {
++  0x15, 0x03, 0x03, 0x00, 0x1a, 0x41, 0x4c, 0x45, 0x52, 0x54, 0x30, 0x30,
++  0x31, 0x44, 0x1b, 0xa8, 0xa1, 0xf2, 0x34, 0xc3, 0xee, 0x36, 0x95, 0xc6,
++  0xdd, 0x80, 0x15, 0x73, 0x4b, 0xa5, 0xf5
++};
++
++static const guint8 vec_close_notify[] = {
++  0x15, 0x03, 0x03, 0x00, 0x1a, 0x6e, 0xb3, 0xa9, 0x07, 0xdb, 0xb4, 0x4d,
++  0x74, 0x25, 0x97, 0x32, 0x05, 0x54, 0x1c, 0x8a, 0xc0, 0x5a, 0x65, 0xec,
++  0x2e, 0xb9, 0x8d, 0x94, 0x49, 0xb4, 0x72
++};
++
++static const guint8 vec_sig0_der[] = {
++  0x30, 0x08, 0x02, 0x02, 0x12, 0x34, 0x02, 0x02, 0x56, 0x78
++};
++
++static const guint8 vec_sig0_fixed[] = {
++  0x30, 0x44, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34,
++  0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56, 0x78
++};
++
++static const guint8 vec_sig1_der[] = {
++  0x30, 0x26, 0x02, 0x21, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x05, 0x02, 0x01, 0x07
++};
++
++static const guint8 vec_sig1_fixed[] = {
++  0x30, 0x44, 0x02, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
++  0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07
++};
++
++static const guint8 vec_sig2_der[] = {
++  0x30, 0x26, 0x02, 0x01, 0x09, 0x02, 0x21, 0x00, 0x80, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x03
++};
++
++static const guint8 vec_sig2_fixed[] = {
++  0x30, 0x44, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
++  0x02, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
++};
++
++static const guint8 vec_sig3_der[] = {
++  0x30, 0x46, 0x02, 0x21, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x01, 0x02, 0x21, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02
++};
++
++static const guint8 vec_sig3_fixed[] = {
++  0x30, 0x44, 0x02, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
++  0x02, 0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02
++};
++
++static const guint8 vec_sig4_der[] = {
++  0x30, 0x31, 0x02, 0x20, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0x02, 0x0d, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00
++};
++
++static const guint8 vec_sig4_fixed[] = {
++  0x30, 0x44, 0x02, 0x20, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++  0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++#define VEC_SIG_CASES 5
++
+diff --git a/tests/test-tudor-tls.c b/tests/test-tudor-tls.c
+new file mode 100644
+index 00000000..37fda85f
+--- /dev/null
++++ b/tests/test-tudor-tls.c
+@@ -0,0 +1,557 @@
++/*
++ * Offline tests for the TLS client of the synaptics_tudor driver
++ *
++ * The expected bytes in test-tudor-tls-vectors.h come from
++ * tudor-tls-vectors.py, an independent implementation, and the server side
++ * of the handshake is real data from a trace of the vendor driver. The C
++ * file is included so the static helpers can be tested too.
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "../libfprint/drivers/synaptics_tudor/tudor_tls.c"
++
++#include "test-tudor-tls-vectors.h"
++
++#define SEED ((const guint8 *) "tudor emulation seed, not secret")
++
++#define assert_bytes(actual, actual_len, expected) \
++  G_STMT_START { \
++    g_assert_cmpuint ((actual_len), ==, sizeof (expected)); \
++    g_assert_cmpmem ((actual), (actual_len), (expected), sizeof (expected)); \
++  } G_STMT_END
++
++static void
++test_stream (void)
++{
++  guint8 buf[40];
++
++  tudor_tls_set_seed (SEED);
++  g_assert_true (tls_random (buf, sizeof (buf)));
++  tudor_tls_set_seed (NULL);
++  assert_bytes (buf, sizeof (buf), vec_stream_first);
++}
++
++static void
++test_prf (void)
++{
++  guint8 out[72];
++  guint8 secret[32];
++  g_autoptr(EVP_PKEY) key = NULL;
++  g_autoptr(GError) error = NULL;
++
++  g_assert_true (tls_prf (EVP_sha384 (), vec_prf_secret, sizeof (vec_prf_secret),
++                          "key expansion", vec_prf_seed, sizeof (vec_prf_seed),
++                          out, sizeof (out)));
++  assert_bytes (out, sizeof (out), vec_prf_out);
++
++  /* The key the vendor signs host certificates with */
++  key = hs_key_new (&error);
++  g_assert_no_error (error);
++  g_assert_true (tudor_key_export (key, secret, &error));
++  assert_bytes (secret, sizeof (secret), vec_hs_secret);
++}
++
++static void
++test_cert (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(EVP_PKEY) host = tudor_key_import (vec_host_secret, &error);
++  g_autoptr(EVP_PKEY) pub = NULL;
++  g_autoptr(EVP_PKEY) pub2 = NULL;
++  guint8 cert[TUDOR_CERT_SIZE];
++  guint8 sensor[TUDOR_CERT_SIZE];
++  guint8 point[65], point2[65];
++  gsize len = 0, len2 = 0;
++
++  g_assert_no_error (error);
++
++  /* Host certificate, RFC 6979 signatures make the bytes repeatable */
++  tudor_tls_set_seed (SEED);
++  g_assert_true (tudor_cert_make_host (host, cert, &error));
++  tudor_tls_set_seed (NULL);
++  g_assert_no_error (error);
++  assert_bytes (cert, sizeof (cert), vec_host_cert);
++
++  /* The public key survives the round trip */
++  pub = tudor_cert_get_pubkey (cert, &error);
++  g_assert_no_error (error);
++  g_assert_true (EVP_PKEY_get_octet_string_param (host, OSSL_PKEY_PARAM_PUB_KEY, point,
++                                                  sizeof (point), &len));
++  g_assert_true (EVP_PKEY_get_octet_string_param (pub, OSSL_PKEY_PARAM_PUB_KEY, point2,
++                                                  sizeof (point2), &len2));
++  g_assert_cmpmem (point, len, point2, len2);
++
++  /* Not a certificate */
++  cert[0] ^= 1;
++  g_assert_null (tudor_cert_get_pubkey (cert, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_clear_error (&error);
++
++  /* The sensor certificate of the real pairing reply is signed by the
++   * key for its firmware */
++  memcpy (sensor, vec_pair_reply + 2 + TUDOR_CERT_SIZE, sizeof (sensor));
++  g_assert_true (tudor_cert_verify_sensor (sensor, 10, 1, TRUE, &error));
++  g_assert_no_error (error);
++  pub2 = tudor_cert_get_pubkey (sensor, &error);
++  g_assert_no_error (error);
++  g_assert_nonnull (pub2);
++
++  g_assert_false (tudor_cert_verify_sensor (sensor, 10, 1, FALSE, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_clear_error (&error);
++  g_assert_false (tudor_cert_verify_sensor (sensor, 9, 9, TRUE, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED);
++  g_clear_error (&error);
++  sensor[10] ^= 1;
++  g_assert_false (tudor_cert_verify_sensor (sensor, 10, 1, TRUE, &error));
++  g_clear_error (&error);
++  sensor[10] ^= 1;
++  sensor[CERT_OFF_SIGLEN] = 0;
++  sensor[CERT_OFF_SIGLEN + 1] = 0;
++  g_assert_false (tudor_cert_verify_sensor (sensor, 10, 1, TRUE, &error));
++  g_clear_error (&error);
++}
++
++static void
++test_record (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GByteArray) pt = NULL;
++  g_autoptr(GByteArray) sealed = g_byte_array_new ();
++  guint8 tampered[sizeof (vec_rec_sealed_seq5)];
++
++  /* Decrypt a record the python side made */
++  pt = gcm_open (vec_rec_key, vec_rec_salt, 5, TLS_APPDATA,
++                 vec_rec_sealed_seq5 + 5, sizeof (vec_rec_sealed_seq5) - 5, &error);
++  g_assert_no_error (error);
++  assert_bytes (pt->data, pt->len, vec_rec_plain);
++  g_clear_pointer (&pt, g_byte_array_unref);
++
++  /* The explicit nonce is whatever the record carries */
++  pt = gcm_open (vec_rec_key, vec_rec_salt, 6, TLS_APPDATA,
++                 vec_rec_sealed_seq6_other_nonce + 5,
++                 sizeof (vec_rec_sealed_seq6_other_nonce) - 5, &error);
++  g_assert_no_error (error);
++  assert_bytes (pt->data, pt->len, vec_rec_plain);
++  g_clear_pointer (&pt, g_byte_array_unref);
++
++  /* Sequence number, record type and every single byte are authenticated */
++  g_assert_null (gcm_open (vec_rec_key, vec_rec_salt, 6, TLS_APPDATA,
++                           vec_rec_sealed_seq5 + 5, sizeof (vec_rec_sealed_seq5) - 5, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_clear_error (&error);
++  g_assert_null (gcm_open (vec_rec_key, vec_rec_salt, 5, TLS_ALERT,
++                           vec_rec_sealed_seq5 + 5, sizeof (vec_rec_sealed_seq5) - 5, &error));
++  g_clear_error (&error);
++  for (gsize i = 5; i < sizeof (tampered); i++)
++    {
++      memcpy (tampered, vec_rec_sealed_seq5, sizeof (tampered));
++      tampered[i] ^= 0x40;
++      g_assert_null (gcm_open (vec_rec_key, vec_rec_salt, 5, TLS_APPDATA,
++                               tampered + 5, sizeof (tampered) - 5, &error));
++      g_clear_error (&error);
++    }
++
++  /* Too short to hold a nonce and a tag */
++  g_assert_null (gcm_open (vec_rec_key, vec_rec_salt, 5, TLS_APPDATA,
++                           vec_rec_sealed_seq5 + 5, 23, &error));
++  g_clear_error (&error);
++
++  /* Sealing with the seeded stream gives the python bytes */
++  tudor_tls_set_seed (SEED);
++  g_assert_true (gcm_seal (vec_rec_key, vec_rec_salt, 5, TLS_APPDATA,
++                           vec_rec_plain, sizeof (vec_rec_plain), sealed));
++  tudor_tls_set_seed (NULL);
++  g_assert_cmpmem (sealed->data, sealed->len, vec_rec_sealed_seq5 + 5,
++                   sizeof (vec_rec_sealed_seq5) - 5);
++}
++
++static void
++test_sig_fixed (void)
++{
++  static const struct
++  {
++    const guint8 *der;
++    gsize         der_len;
++    const guint8 *fixed;
++  } cases[VEC_SIG_CASES] = {
++    { vec_sig0_der, sizeof (vec_sig0_der), vec_sig0_fixed },
++    { vec_sig1_der, sizeof (vec_sig1_der), vec_sig1_fixed },
++    { vec_sig2_der, sizeof (vec_sig2_der), vec_sig2_fixed },
++    { vec_sig3_der, sizeof (vec_sig3_der), vec_sig3_fixed },
++    { vec_sig4_der, sizeof (vec_sig4_der), vec_sig4_fixed },
++  };
++  guint8 out[70];
++
++  for (guint i = 0; i < G_N_ELEMENTS (cases); i++)
++    {
++      memset (out, 0xee, sizeof (out));
++      g_assert_true (sig_to_fixed (cases[i].der, cases[i].der_len, out));
++      g_assert_cmpmem (out, sizeof (out), cases[i].fixed, 70);
++    }
++
++  g_assert_false (sig_to_fixed (vec_sig0_der, 3, out));
++  g_assert_false (sig_to_fixed (vec_prf_seed, 20, out));
++}
++
++static TudorTls *
++new_tls (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(EVP_PKEY) host = tudor_key_import (vec_host_secret, &error);
++  g_autoptr(EVP_PKEY) sensor = tudor_cert_get_pubkey (vec_pair_reply + 2 + TUDOR_CERT_SIZE, &error);
++  TudorTls *tls;
++
++  g_assert_no_error (error);
++  tls = tudor_tls_new (host, vec_host_cert, sensor);
++  g_assert_nonnull (tls);
++  return tls;
++}
++
++/* The state of the session once the handshake is through */
++static TudorTls *
++established_tls (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GByteArray) hello = NULL;
++  g_autoptr(GByteArray) flight = NULL;
++  TudorTls *tls = new_tls ();
++  gboolean rejected;
++
++  tudor_tls_set_seed (SEED);
++  hello = tudor_tls_client_hello (tls, &error);
++  g_assert_no_error (error);
++  flight = tudor_tls_handle_server_hello (tls, vec_server_flight, sizeof (vec_server_flight), &error);
++  g_assert_no_error (error);
++  g_assert_true (tudor_tls_handle_server_finished (tls, vec_server_finished,
++                                                   sizeof (vec_server_finished),
++                                                   &rejected, &error));
++  g_assert_no_error (error);
++  return tls;
++}
++
++static void
++test_handshake (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GByteArray) hello = NULL;
++  g_autoptr(GByteArray) flight = NULL;
++  g_autoptr(GByteArray) wrapped = NULL;
++  g_autoptr(GByteArray) plain = NULL;
++  g_autoptr(GByteArray) bye = NULL;
++  TudorTls *tls = new_tls ();
++  gboolean rejected = TRUE;
++
++  tudor_tls_set_seed (SEED);
++
++  hello = tudor_tls_client_hello (tls, &error);
++  g_assert_no_error (error);
++  assert_bytes (hello->data, hello->len, vec_client_hello);
++
++  /* The real server hello, certificate request and done go in, the whole
++   * client flight comes out: certificate, key exchange, certificate
++   * verify, change cipher spec and the encrypted finished */
++  flight = tudor_tls_handle_server_hello (tls, vec_server_flight, sizeof (vec_server_flight), &error);
++  g_assert_no_error (error);
++  g_assert_nonnull (flight);
++  assert_bytes (flight->data, flight->len, vec_flight);
++  g_assert_false (tudor_tls_is_established (tls));
++
++  /* The master secret and key block are what python derived */
++  g_assert_cmpmem (tls->c_key, 32, vec_keyblock, 32);
++  g_assert_cmpmem (tls->s_key, 32, vec_keyblock + 32, 32);
++  g_assert_cmpmem (tls->c_salt, 4, vec_keyblock + 64, 4);
++  g_assert_cmpmem (tls->s_salt, 4, vec_keyblock + 68, 4);
++
++  g_assert_true (tudor_tls_handle_server_finished (tls, vec_server_finished,
++                                                   sizeof (vec_server_finished),
++                                                   &rejected, &error));
++  g_assert_no_error (error);
++  g_assert_false (rejected);
++  g_assert_true (tudor_tls_is_established (tls));
++
++  /* Both directions count from 0 at the finished */
++  wrapped = tudor_tls_wrap (tls, vec_app_cmd, sizeof (vec_app_cmd));
++  assert_bytes (wrapped->data, wrapped->len, vec_app_sent);
++
++  plain = tudor_tls_unwrap (tls, vec_app_recv_seq1, sizeof (vec_app_recv_seq1), &error);
++  g_assert_no_error (error);
++  assert_bytes (plain->data, plain->len, vec_app_reply);
++
++  /* The same record again is the wrong sequence number */
++  g_assert_null (tudor_tls_unwrap (tls, vec_app_recv_seq1, sizeof (vec_app_recv_seq1), &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_clear_error (&error);
++
++  g_clear_pointer (&plain, g_byte_array_unref);
++  plain = tudor_tls_unwrap (tls, vec_app_recv_seq2, sizeof (vec_app_recv_seq2), &error);
++  g_assert_no_error (error);
++  assert_bytes (plain->data, plain->len, vec_app_reply);
++
++  bye = tudor_tls_close_notify (tls);
++  assert_bytes (bye->data, bye->len, vec_close_notify);
++
++  tudor_tls_set_seed (NULL);
++  tudor_tls_free (tls);
++}
++
++static void
++test_unwrap_errors (void)
++{
++  g_autoptr(GError) error = NULL;
++  TudorTls *tls = established_tls ();
++  guint8 bad[sizeof (vec_app_recv_seq1) + 3];
++  guint8 two[2 * sizeof (vec_app_recv_seq1)];
++  GByteArray *ok;
++
++  tudor_tls_set_seed (NULL);
++
++  /* A record from the future does not move the counter */
++  g_assert_null (tudor_tls_unwrap (tls, vec_app_recv_seq2, sizeof (vec_app_recv_seq2), &error));
++  g_clear_error (&error);
++
++  /* Flipped bits */
++  memcpy (bad, vec_app_recv_seq1, sizeof (vec_app_recv_seq1));
++  bad[sizeof (vec_app_recv_seq1) - 1] ^= 1;
++  g_assert_null (tudor_tls_unwrap (tls, bad, sizeof (vec_app_recv_seq1), &error));
++  g_clear_error (&error);
++
++  /* Truncated */
++  for (gsize i = 0; i < sizeof (vec_app_recv_seq1); i++)
++    {
++      g_assert_null (tudor_tls_unwrap (tls, vec_app_recv_seq1, i, &error));
++      g_clear_error (&error);
++    }
++
++  /* Two records in one reply */
++  memcpy (two, vec_app_recv_seq1, sizeof (vec_app_recv_seq1));
++  memcpy (two + sizeof (vec_app_recv_seq1), vec_app_recv_seq1, sizeof (vec_app_recv_seq1));
++  g_assert_null (tudor_tls_unwrap (tls, two, sizeof (two), &error));
++  g_clear_error (&error);
++
++  /* Wrong record type */
++  memcpy (bad, vec_app_recv_seq1, sizeof (vec_app_recv_seq1));
++  bad[0] = TLS_HANDSHAKE;
++  g_assert_null (tudor_tls_unwrap (tls, bad, sizeof (vec_app_recv_seq1), &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_clear_error (&error);
++
++  /* After all that the real record still decrypts, nothing moved */
++  ok = tudor_tls_unwrap (tls, vec_app_recv_seq1, sizeof (vec_app_recv_seq1), &error);
++  g_assert_no_error (error);
++  g_assert_nonnull (ok);
++  g_byte_array_unref (ok);
++
++  /* An alert from the sensor is an error with its description */
++  g_assert_null (tudor_tls_unwrap (tls, vec_server_alert, sizeof (vec_server_alert), &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_assert_nonnull (strstr (error->message, "description 40"));
++  g_clear_error (&error);
++
++  tudor_tls_free (tls);
++}
++
++static void
++test_rejection (void)
++{
++  static const guint8 handshake_failure[] = { 0x15, 3, 3, 0, 2, 2, 40 };
++  static const guint8 unknown_ca[] = { 0x15, 3, 3, 0, 2, 2, 48 };
++  static const guint8 bad_record_mac[] = { 0x15, 3, 3, 0, 2, 2, 20 };
++  static const guint8 warning[] = { 0x15, 3, 3, 0, 2, 1, 40 };
++  static const guint8 garbage[] = { 0x15, 3, 3, 0, 9, 1, 2, 3 };
++  static const struct
++  {
++    const guint8 *data;
++    gsize         len;
++    gboolean      rejected;
++  } cases[] = {
++    { handshake_failure, sizeof (handshake_failure), TRUE },
++    { unknown_ca, sizeof (unknown_ca), TRUE },
++    { bad_record_mac, sizeof (bad_record_mac), FALSE },
++    { warning, sizeof (warning), FALSE },
++    { garbage, sizeof (garbage), FALSE },
++    { vec_server_alert, sizeof (vec_server_alert), FALSE },
++  };
++
++  /* Only a plain fatal alert about the certificate counts as a rejection of
++   * the pairing, a broken reply never does */
++  for (guint i = 0; i < G_N_ELEMENTS (cases); i++)
++    {
++      g_autoptr(GError) error = NULL;
++      g_autoptr(GByteArray) hello = NULL;
++      g_autoptr(GByteArray) flight = NULL;
++      TudorTls *tls = new_tls ();
++      gboolean rejected = !cases[i].rejected;
++
++      tudor_tls_set_seed (SEED);
++      hello = tudor_tls_client_hello (tls, &error);
++      flight = tudor_tls_handle_server_hello (tls, vec_server_flight, sizeof (vec_server_flight), &error);
++      g_assert_no_error (error);
++      tudor_tls_set_seed (NULL);
++
++      g_assert_false (tudor_tls_handle_server_finished (tls, cases[i].data, cases[i].len,
++                                                        &rejected, &error));
++      g_assert_nonnull (error);
++      g_assert_cmpint (rejected, ==, cases[i].rejected);
++      g_assert_false (tudor_tls_is_established (tls));
++      tudor_tls_free (tls);
++    }
++
++  /* A truncated finished */
++  for (gsize i = 0; i < sizeof (vec_server_finished); i++)
++    {
++      g_autoptr(GError) error = NULL;
++      g_autoptr(GByteArray) flight = NULL;
++      TudorTls *tls = new_tls ();
++      gboolean rejected = TRUE;
++
++      tudor_tls_set_seed (SEED);
++      g_byte_array_unref (tudor_tls_client_hello (tls, &error));
++      flight = tudor_tls_handle_server_hello (tls, vec_server_flight, sizeof (vec_server_flight), &error);
++      tudor_tls_set_seed (NULL);
++      g_assert_false (tudor_tls_handle_server_finished (tls, vec_server_finished, i,
++                                                        &rejected, &error));
++      g_assert_false (rejected);
++      tudor_tls_free (tls);
++    }
++}
++
++static void
++test_malformed_hello (void)
++{
++  guint8 bad[sizeof (vec_server_flight)];
++
++  /* Every cut of the real flight and flipped bytes in it must end in an
++   * error or a flight, never in a crash */
++  for (gsize i = 0; i < sizeof (vec_server_flight); i++)
++    {
++      g_autoptr(GError) error = NULL;
++      g_autoptr(GByteArray) flight = NULL;
++      TudorTls *tls = new_tls ();
++
++      tudor_tls_set_seed (SEED);
++      g_byte_array_unref (tudor_tls_client_hello (tls, &error));
++      flight = tudor_tls_handle_server_hello (tls, vec_server_flight, i, &error);
++      g_assert_null (flight);
++      g_assert_nonnull (error);
++      tudor_tls_free (tls);
++    }
++
++  for (gsize i = 0; i < sizeof (vec_server_flight); i++)
++    {
++      g_autoptr(GError) error = NULL;
++      g_autoptr(GByteArray) flight = NULL;
++      TudorTls *tls = new_tls ();
++
++      memcpy (bad, vec_server_flight, sizeof (bad));
++      bad[i] ^= 0xff;
++      tudor_tls_set_seed (SEED);
++      g_byte_array_unref (tudor_tls_client_hello (tls, &error));
++      flight = tudor_tls_handle_server_hello (tls, bad, sizeof (bad), &error);
++      tudor_tls_free (tls);
++    }
++
++  /* Without a hello there is nothing to answer */
++  {
++    g_autoptr(GError) error = NULL;
++    TudorTls *tls = new_tls ();
++
++    g_assert_null (tudor_tls_handle_server_hello (tls, vec_server_flight,
++                                                  sizeof (vec_server_flight), &error));
++    g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL);
++    tudor_tls_free (tls);
++  }
++  tudor_tls_set_seed (NULL);
++}
++
++static void
++test_pairing_file (void)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(EVP_PKEY) host = tudor_key_import (vec_host_secret, &error);
++  g_autoptr(EVP_PKEY) back = NULL;
++  guint8 data[TUDOR_PAIRING_SIZE];
++  guint8 host_cert[TUDOR_CERT_SIZE];
++  guint8 dev_cert[TUDOR_CERT_SIZE];
++  guint8 secret[32];
++
++  g_assert_true (tudor_pairing_encode (host, vec_host_cert, vec_pair_reply + 2 + TUDOR_CERT_SIZE,
++                                       data, &error));
++  g_assert_no_error (error);
++  g_assert_cmpmem (data, 10, "TUDORPAIR1", 10);
++  g_assert_cmpmem (data + 10, 32, vec_host_secret, 32);
++
++  back = tudor_pairing_decode (data, sizeof (data), host_cert, dev_cert, &error);
++  g_assert_no_error (error);
++  g_assert_nonnull (back);
++  g_assert_true (tudor_key_export (back, secret, &error));
++  assert_bytes (secret, sizeof (secret), vec_host_secret);
++  assert_bytes (host_cert, sizeof (host_cert), vec_host_cert);
++  g_assert_cmpmem (dev_cert, sizeof (dev_cert), vec_pair_reply + 2 + TUDOR_CERT_SIZE,
++                   TUDOR_CERT_SIZE);
++  g_clear_pointer (&back, EVP_PKEY_free);
++
++  /* Truncated at every length and with too much */
++  for (gsize i = 0; i < sizeof (data); i++)
++    {
++      g_assert_null (tudor_pairing_decode (data, i, host_cert, dev_cert, &error));
++      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++      g_clear_error (&error);
++    }
++  {
++    g_autofree guint8 *big = g_malloc0 (sizeof (data) + 1);
++
++    memcpy (big, data, sizeof (data));
++    g_assert_null (tudor_pairing_decode (big, sizeof (data) + 1, host_cert, dev_cert, &error));
++    g_clear_error (&error);
++  }
++
++  /* Corrupt magic */
++  data[3] ^= 1;
++  g_assert_null (tudor_pairing_decode (data, sizeof (data), host_cert, dev_cert, &error));
++  g_clear_error (&error);
++  data[3] ^= 1;
++
++  /* A key that is not on the curve is refused, not crashed on */
++  memset (data + 10, 0xff, 32);
++  back = tudor_pairing_decode (data, sizeof (data), host_cert, dev_cert, &error);
++  g_assert_null (back);
++  g_clear_error (&error);
++  memset (data + 10, 0, 32);
++  back = tudor_pairing_decode (data, sizeof (data), host_cert, dev_cert, &error);
++  g_assert_null (back);
++  g_clear_error (&error);
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/tudor-tls/stream", test_stream);
++  g_test_add_func ("/tudor-tls/prf", test_prf);
++  g_test_add_func ("/tudor-tls/cert", test_cert);
++  g_test_add_func ("/tudor-tls/record", test_record);
++  g_test_add_func ("/tudor-tls/sig-fixed", test_sig_fixed);
++  g_test_add_func ("/tudor-tls/handshake", test_handshake);
++  g_test_add_func ("/tudor-tls/unwrap-errors", test_unwrap_errors);
++  g_test_add_func ("/tudor-tls/rejection", test_rejection);
++  g_test_add_func ("/tudor-tls/malformed-hello", test_malformed_hello);
++  g_test_add_func ("/tudor-tls/pairing-file", test_pairing_file);
++
++  return g_test_run ();
++}
+diff --git a/tests/tudor-tls-vectors.py b/tests/tudor-tls-vectors.py
+new file mode 100644
+index 00000000..a2d137bb
+--- /dev/null
++++ b/tests/tudor-tls-vectors.py
+@@ -0,0 +1,226 @@
++#!/usr/bin/env python3
++# Dev script, not run by the build. Writes test-tudor-tls-vectors.h, the
++# expected bytes for test-tudor-tls.c, computed with python-cryptography and
++# hmac only, so they are independent of the C code. The server side bytes
++# are real ones from a trace of the vendor driver talking to a sensor, the
++# client side uses fixed keys and the seeded random stream of the driver.
++#
++#   tudor-tls-vectors.py PAIR_REPLY.bin SERVER_HELLO_FLIGHT.bin > test-tudor-tls-vectors.h
++#
++# PAIR_REPLY.bin is the data stage of the pairing reply (status, host cert,
++# sensor cert), SERVER_HELLO_FLIGHT.bin the record the sensor answers the
++# client hello with.
++
++import hashlib
++import hmac
++import sys
++
++from cryptography.hazmat.primitives import hashes
++from cryptography.hazmat.primitives.asymmetric import ec
++from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
++from cryptography.hazmat.primitives.ciphers.aead import AESGCM
++
++N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
++SEED = b"tudor emulation seed, not secret"
++HS_SECRET = bytes.fromhex("717cd72d0962bc4a2846138dbb2c2419")
++HS_SEED = bytes.fromhex("2512a76407065f383846139d4bec2033aaaa")
++
++
++def prf(h, secret, label, seed, n):
++    seed = label + seed
++    a = seed
++    out = b""
++    while len(out) < n:
++        a = hmac.new(secret, a, h).digest()
++        out += hmac.new(secret, a + seed, h).digest()
++    return out[:n]
++
++
++class Stream:
++    def __init__(self, seed):
++        self.seed, self.n = seed, 0
++
++    def take(self, n):
++        out = b""
++        while len(out) < n:
++            out += hashlib.sha256(self.seed + self.n.to_bytes(8, "big")).digest()[:min(32, n - len(out))]
++            self.n += 1
++        return out
++
++
++def k_for(d, h1):
++    x = d.to_bytes(32, "big")
++    h = (int.from_bytes(h1, "big") % N).to_bytes(32, "big")
++    v, k = b"\x01" * 32, b"\x00" * 32
++    k = hmac.new(k, v + b"\x00" + x + h, hashlib.sha256).digest()
++    v = hmac.new(k, v, hashlib.sha256).digest()
++    k = hmac.new(k, v + b"\x01" + x + h, hashlib.sha256).digest()
++    v = hmac.new(k, v, hashlib.sha256).digest()
++    while True:
++        v = hmac.new(k, v, hashlib.sha256).digest()
++        c = int.from_bytes(v, "big")
++        if 1 <= c < N:
++            return c
++        k = hmac.new(k, v + b"\x00", hashlib.sha256).digest()
++        v = hmac.new(k, v, hashlib.sha256).digest()
++
++
++def sign(d, h1):
++    k = k_for(d, h1)
++    r = ec.derive_private_key(k, ec.SECP256R1()).public_key().public_numbers().x % N
++    s = pow(k, -1, N) * (int.from_bytes(h1, "big") % N + r * d) % N
++    return r, s
++
++
++def pub(d):
++    return ec.derive_private_key(d, ec.SECP256R1()).public_key().public_numbers()
++
++
++def be(n):
++    return n.to_bytes(32, "big")
++
++
++def u24(n):
++    return n.to_bytes(3, "big")
++
++
++def record(t, body):
++    return bytes([t, 3, 3]) + len(body).to_bytes(2, "big") + body
++
++
++def hs(t, body):
++    return bytes([t]) + u24(len(body)) + body
++
++
++def seal(key, salt, seq, t, pt, nonce):
++    aad = seq.to_bytes(8, "big") + bytes([t, 3, 3]) + len(pt).to_bytes(2, "big")
++    return nonce + AESGCM(key).encrypt(salt + nonce, pt, aad)
++
++
++def cert(host_d, hs_d):
++    p = pub(host_d)
++    c = bytearray(400)
++    c[0:2] = bytes.fromhex("3f5f")
++    c[2:4] = (23).to_bytes(2, "little")
++    c[4:36] = be(p.x)[::-1]
++    c[72:104] = be(p.y)[::-1]
++    c[141] = 0
++    h1 = hashlib.sha256(bytes(c[:142])).digest()
++    r, s = sign(hs_d, h1)
++    der = encode_dss_signature(r, s)
++    c[142:144] = len(der).to_bytes(2, "little")
++    c[144:144 + len(der)] = der
++    return bytes(c)
++
++
++out = []
++
++
++def arr(name, data):
++    lines = []
++    for i in range(0, len(data), 12):
++        lines.append("  " + ", ".join("0x%02x" % b for b in data[i:i + 12]))
++    out.append("static const guint8 %s[] = {\n%s\n};\n" % (name, ",\n".join(lines)))
++
++
++pair = open(sys.argv[1], "rb").read()
++sh_record = open(sys.argv[2], "rb").read()
++assert len(pair) == 802 and sh_record[0] == 22
++
++host_d = int.from_bytes(hashlib.sha256(b"tudor test host key").digest(), "big") % N
++hs_d = int.from_bytes(prf(hashlib.sha256, HS_SECRET, b"HS_KEY_PAIR_GEN", HS_SEED, 32)[::-1], "big")
++sensor_cert = pair[2 + 400:]
++host_cert = cert(host_d, hs_d)
++sp = sensor_cert
++sx = int.from_bytes(sp[4:36][::-1], "big")
++sy = int.from_bytes(sp[72:104][::-1], "big")
++sensor_pub = ec.EllipticCurvePublicNumbers(sx, sy, ec.SECP256R1()).public_key()
++
++arr("vec_pair_reply", pair)
++arr("vec_server_flight", sh_record)
++arr("vec_host_secret", be(host_d))
++arr("vec_hs_secret", be(hs_d))
++arr("vec_host_cert", host_cert)
++
++# standalone PRF vector, SHA-384 like the session
++pm = bytes(range(32))
++seed64 = bytes(range(64, 128))
++arr("vec_prf_secret", pm)
++arr("vec_prf_seed", seed64)
++arr("vec_prf_out", prf(hashlib.sha384, pm, b"key expansion", seed64, 72))
++
++# the stream and one record sealed with fixed keys
++st = Stream(SEED)
++arr("vec_stream_first", st.take(40))
++key = bytes(range(32))
++salt = bytes.fromhex("a1a2a3a4")
++msg = b"hello tudor, record layer"
++nonce = Stream(SEED).take(8)
++arr("vec_rec_key", key)
++arr("vec_rec_salt", salt)
++arr("vec_rec_plain", msg)
++arr("vec_rec_sealed_seq5", record(23, seal(key, salt, 5, 23, msg, nonce)))
++arr("vec_rec_sealed_seq6_other_nonce", record(23, seal(key, salt, 6, 23, msg, bytes(range(8)))))
++
++# handshake
++st = Stream(SEED)
++cr = st.take(32)
++ch_body = (bytes([3, 3]) + cr + bytes([7]) + bytes(7) +
++           bytes.fromhex("000cc005c02e003d008d00a800a9") + b"\x00" +
++           bytes.fromhex("000a000400020017000b000201" "00"))
++ch = hs(1, ch_body)
++arr("vec_client_hello", record(22, ch))
++
++sh_payload = sh_record[5:]
++sr = sh_payload[4 + 2:4 + 2 + 32]
++eph_d = int.from_bytes(st.take(32), "big")
++ep = pub(eph_d)
++cert_msg = hs(11, u24(400) + u24(400) + bytes(2) + host_cert)
++cke = hs(16, b"\x04" + be(ep.x) + be(ep.y))
++transcript = ch + sh_payload + cert_msg + cke
++cv_digest = hashlib.sha256(transcript).digest()
++r, s = sign(host_d, cv_digest)
++cv = hs(15, bytes([0x30, 0x44, 2, 0x20]) + be(r) + bytes([2, 0x20]) + be(s))
++digest = hashlib.sha256(transcript + cv).digest()
++shared = ec.derive_private_key(eph_d, ec.SECP256R1()).exchange(ec.ECDH(), sensor_pub)
++master = prf(hashlib.sha384, shared, b"master secret", cr + sr, 48)
++kb = prf(hashlib.sha384, master, b"key expansion", cr + sr, 72)
++ck, sk, cs, ss = kb[:32], kb[32:64], kb[64:68], kb[68:72]
++cfin = hs(20, prf(hashlib.sha384, master, b"client finished", digest, 12))
++nonce = st.take(8)
++flight = (record(22, cert_msg + cke + cv) + bytes.fromhex("140303000101") +
++          record(22, seal(ck, cs, 0, 22, cfin, nonce)))
++arr("vec_flight", flight)
++arr("vec_cv_digest", cv_digest)
++arr("vec_master", master)
++arr("vec_keyblock", kb)
++sfin = hs(20, prf(hashlib.sha384, master, b"server finished", digest, 12))
++arr("vec_server_finished", bytes.fromhex("140303000101") + record(22, seal(sk, ss, 0, 22, sfin, b"SERVERIV")))
++
++# after the handshake: the client sends sequence 1, the sensor answers 1 and 2
++cmd = bytes.fromhex("9e01")
++arr("vec_app_cmd", cmd)
++arr("vec_app_sent", record(23, seal(ck, cs, 1, 23, cmd, st.take(8))))
++reply = bytes.fromhex("0000") + bytes(range(10))
++arr("vec_app_reply", reply)
++arr("vec_app_recv_seq1", record(23, seal(sk, ss, 1, 23, reply, b"REPLY001")))
++arr("vec_app_recv_seq2", record(23, seal(sk, ss, 2, 23, reply, b"REPLY002")))
++arr("vec_server_alert", record(21, seal(sk, ss, 2, 21, bytes([2, 40]), b"ALERT001")))
++arr("vec_close_notify", record(21, seal(ck, cs, 2, 21, bytes([1, 0]), st.take(8))))
++
++# signature encodings: der in, fixed 70 bytes out
++cases = [
++    (0x1234, 0x5678),
++    (1 << 255 | 5, 7),
++    (9, 1 << 255 | 3),
++    (1 << 255 | 1, 1 << 255 | 2),
++    ((1 << 248) - 1, 1 << 100),
++]
++for i, (r, s) in enumerate(cases):
++    der = encode_dss_signature(r, s)
++    arr("vec_sig%d_der" % i, der)
++    arr("vec_sig%d_fixed" % i, bytes([0x30, 0x44, 2, 0x20]) + be(r) + bytes([2, 0x20]) + be(s))
++out.append("#define VEC_SIG_CASES %d\n" % len(cases))
++
++print("/* Generated by tudor-tls-vectors.py, do not edit */\n")
++print("\n".join(out))

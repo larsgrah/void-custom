@@ -1,0 +1,26 @@
+From 8e43b0c9c44634c3c3c5245783adc671310f2575 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:38:02 +0100
+Subject: [PATCH 15/15] examples: Find the new print by diffing the lists (not
+ for upstream)
+
+---
+ examples/tudor-crossmatch.sh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/examples/tudor-crossmatch.sh b/examples/tudor-crossmatch.sh
+index ccaeeb9b..22c77746 100755
+--- a/examples/tudor-crossmatch.sh
++++ b/examples/tudor-crossmatch.sh
+@@ -18,7 +18,10 @@ sudo "$devmode" on || exit 1
+ echo ">>> RIGHT MIDDLE finger for this whole first part: enroll (touch, lift, repeat),"
+ echo "    then one touch for VERIFY and one for IDENTIFY"
+ "$ex/tudor-test" --keep 2>/dev/null | tee -a "$log" | grep -E 'ENROLL|VERIFY|IDENTIFY|enrolled|result|tudor-template'
+-new=$(grep -o 'tudor-template-[0-9a-f]*' "$log" | sort | uniq -c | awk '$1==2{print $2}' | head -1)
++# print names are the four-space indented lines, the new one is the one that
++# was not there before the enroll
++before=$(sed -n '/^before:/,/^ENROLL/p' "$log" | sed -n 's/^    //p')
++new=$(sed -n '/^after enroll:/,/^VERIFY/p' "$log" | sed -n 's/^    //p' | grep -vxF "$before" | head -1)
+ echo "temporary print: ${new:-unknown}" | tee -a "$log"
+ 
+ for i in 1 2 3 4 5; do

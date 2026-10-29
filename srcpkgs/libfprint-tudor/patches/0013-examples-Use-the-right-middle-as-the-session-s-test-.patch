@@ -1,0 +1,112 @@
+From 6343156277551be0a25e15f5a48d1ded8eeb560e Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:21:40 +0100
+Subject: [PATCH 13/15] examples: Use the right middle as the session's test
+ finger (not for upstream)
+
+---
+ examples/tudor-owner-session.sh |  4 ++--
+ examples/tudor-session.c        | 18 +++++++++---------
+ 2 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/examples/tudor-owner-session.sh b/examples/tudor-owner-session.sh
+index b4d6b978..4786bc32 100755
+--- a/examples/tudor-owner-session.sh
++++ b/examples/tudor-owner-session.sh
+@@ -7,7 +7,7 @@
+ # interrupted. It only deletes the one print it enrolls itself. Logs go to
+ # ~/.cache/tudor-traces/owner-session/.
+ #
+-# Fingers: the TEST finger is the LEFT INDEX finger, which must not be
++# Fingers: the TEST finger is the RIGHT MIDDLE finger, which must not be
+ # enrolled on the sensor. The USUAL finger is one that already is.
+ # Needs 7 touches for the enroll, about 20 touches all in all.
+ 
+@@ -44,7 +44,7 @@ env G_MESSAGES_DEBUG=all "$bin" --abandon-enroll 2> "$logdir/$stamp-abandon.debu
+ 
+ echo
+ echo "Step 3 of 3: finger tests. You will be told which finger and when."
+-echo "  TEST finger  = LEFT INDEX (must not be enrolled yet)"
++echo "  TEST finger  = RIGHT MIDDLE (must not be enrolled yet)"
+ echo "  USUAL finger = a finger that is enrolled already"
+ printf "Press enter to start, ctrl-c to stop: "
+ read -r _
+diff --git a/examples/tudor-session.c b/examples/tudor-session.c
+index 7f8b8378..8ac3b307 100644
+--- a/examples/tudor-session.c
++++ b/examples/tudor-session.c
+@@ -255,7 +255,7 @@ finger_part (GPtrArray *inventory)
+   gboolean deleted = FALSE;
+ 
+   say ("B1 the test finger must not be enrolled already");
+-  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  say (">>> TOUCH ONCE with the TEST finger (right middle)");
+   if (fp_device_identify_sync (dev, inventory, NULL, match_cb, NULL, &match, NULL, &error) && match)
+     {
+       check (FALSE, "the test finger matched an enrolled print, pick another finger");
+@@ -267,9 +267,9 @@ finger_part (GPtrArray *inventory)
+   g_clear_error (&error);
+ 
+   say ("B2 enroll that is cancelled after two stages");
+-  say (">>> TOUCH TWICE with the TEST finger (left index), lifting in between, then stop");
++  say (">>> TOUCH TWICE with the TEST finger (right middle), lifting in between, then stop");
+   template = fp_print_new (dev);
+-  fp_print_set_finger (template, FP_FINGER_LEFT_INDEX);
++  fp_print_set_finger (template, FP_FINGER_RIGHT_MIDDLE);
+   fp_print_set_username (template, "tudor-test");
+   enroll_cancel = g_cancellable_new ();
+   cancel_after_stage = 2;
+@@ -287,7 +287,7 @@ finger_part (GPtrArray *inventory)
+   g_clear_pointer (&after, g_ptr_array_unref);
+ 
+   say ("B3 the real enroll");
+-  say (">>> TOUCH the TEST finger (left index), lift, repeat until it says enrolled");
++  say (">>> TOUCH the TEST finger (right middle), lift, repeat until it says enrolled");
+   g_string_truncate (seen_status, 0);
+   print = fp_device_enroll_sync (dev, g_object_ref (template), NULL, enroll_progress, NULL, &error);
+   if (!print)
+@@ -317,7 +317,7 @@ finger_part (GPtrArray *inventory)
+   if (listed)
+     {
+       check (g_strcmp0 (fp_print_get_username (listed), "tudor-test") == 0, "username survived");
+-      check (fp_print_get_finger (listed) == FP_FINGER_LEFT_INDEX, "finger survived");
++      check (fp_print_get_finger (listed) == FP_FINGER_RIGHT_MIDDLE, "finger survived");
+       check (fp_print_get_enroll_date (listed) != NULL, "enroll date present");
+       check (fp_print_equal (listed, print), "listed print equals the enrolled one");
+     }
+@@ -327,7 +327,7 @@ finger_part (GPtrArray *inventory)
+     }
+ 
+   say ("B5 verify with the test finger");
+-  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  say (">>> TOUCH ONCE with the TEST finger (right middle)");
+   matched = FALSE;
+   if (fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
+     check (matched, "verify matches");
+@@ -345,7 +345,7 @@ finger_part (GPtrArray *inventory)
+   g_clear_error (&error);
+ 
+   say ("B7 identify with the listed prints");
+-  say (">>> TOUCH ONCE with the TEST finger (left index)");
++  say (">>> TOUCH ONCE with the TEST finger (right middle)");
+   gallery = after ? g_ptr_array_ref (after) : g_ptr_array_new ();
+   match = NULL;
+   if (fp_device_identify_sync (dev, gallery, NULL, match_cb, NULL, &match, NULL, &error))
+@@ -361,7 +361,7 @@ finger_part (GPtrArray *inventory)
+   g_clear_error (&error);
+ 
+   say ("B8 a very short tap, only for the log (what does a rejected touch look like)");
+-  say (">>> TAP the TEST finger (left index) as briefly as you can, once");
++  say (">>> TAP the TEST finger (right middle) as briefly as you can, once");
+   if (!fp_device_verify_sync (dev, print, NULL, match_cb, NULL, &matched, NULL, &error))
+     say ("  result: %s%s", error->message, error->domain == FP_DEVICE_RETRY ? " (retry)" : "");
+   else
+@@ -432,7 +432,7 @@ main (int    argc,
+       g_autoptr(FpPrint) template = fp_print_new (dev);
+ 
+       say ("starting an enroll and dying after two seconds");
+-      fp_print_set_finger (template, FP_FINGER_LEFT_INDEX);
++      fp_print_set_finger (template, FP_FINGER_RIGHT_MIDDLE);
+       g_timeout_add (2000, die_cb, NULL);
+       fp_device_enroll_sync (dev, template, NULL, enroll_progress, NULL, &error);
+       return 1;

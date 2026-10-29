@@ -1,0 +1,3346 @@
+From 9db6fe12a28ab6644544c9c3f9c303cb135025b5 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:19:13 +0100
+Subject: [PATCH 09/15] synaptics_tudor: Fix pairing loss, session handling and
+ slot exhaustion
+
+The pairing is only replaced when the sensor answers the handshake with a
+certificate alert, and the old file is kept as .pairing.old. The directory
+has to be writable before the sensor is paired and a failed save fails
+the open. Command transfers no longer take the cancellable, a failure
+inside the session marks it dead so later commands fail fast. A failed
+open ends the session and frees everything.
+
+Enroll checks for free slots first and reclaims deleted ones with the
+cleanup the vendor driver runs after a delete, otherwise it fails with
+DATA_FULL. Delete does the cleanup too and maps a missing template to
+DATA_NOT_FOUND. List reads the payload so username, finger and date come
+back, clear_storage deletes every template, finger status is reported.
+
+Also: only status 0 is success, bad prints are refused up front, the
+enroll capture count is capped, TLS results and randomness are checked,
+secrets are cleansed and tudor_cmd_allowed is static. A seed makes every
+random value reproducible for emulation and tests.
+---
+ libfprint/drivers/synaptics_tudor/tudor.c     | 1675 ++++++++++++-----
+ libfprint/drivers/synaptics_tudor/tudor.h     |   48 +-
+ libfprint/drivers/synaptics_tudor/tudor_led.h |    1 +
+ libfprint/drivers/synaptics_tudor/tudor_tls.c |  357 +++-
+ libfprint/drivers/synaptics_tudor/tudor_tls.h |   31 +-
+ 5 files changed, 1520 insertions(+), 592 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 47c21630..3928c865 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1,5 +1,6 @@
+ /*
+  * Synaptics Tudor match-on-chip driver for libfprint
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -19,6 +20,7 @@
+ #define FP_COMPONENT "synaptics_tudor"
+ 
+ #include <string.h>
++#include <unistd.h>
+ #include <glib/gstdio.h>
+ 
+ #include "drivers_api.h"
+@@ -57,52 +59,59 @@ typedef void (*TudorFinishFunc) (FpiDeviceSynapticsTudor *self,
+ 
+ struct _FpiDeviceSynapticsTudor
+ {
+-  FpDevice      parent;
++  FpDevice        parent;
+ 
+-  TudorVersion  version;
+-  EVP_PKEY     *host_key;
+-  guint8        host_cert[TUDOR_CERT_SIZE];
+-  guint8        dev_cert[TUDOR_CERT_SIZE];
+-  TudorTls     *tls;
++  TudorVersion    version;
++  EVP_PKEY       *host_key;
++  guint8          host_cert[TUDOR_CERT_SIZE];
++  guint8          dev_cert[TUDOR_CERT_SIZE];
++  TudorTls       *tls;
++  gboolean        session_dead;
++  GError         *open_error;
+ 
+   /* Last exchange */
+-  GByteArray   *raw;
+-  GByteArray   *reply;
+-  guint16       status;
+-  gboolean      stale_alert;
+-  GByteArray   *flight;
++  GByteArray     *raw;
++  GByteArray     *reply;
++  guint16         status;
++  gboolean        stale_alert;
++  GByteArray     *flight;
+ 
+   /* Open */
+-  guint         version_tries;
+-  guint         probe_idx;
+-  guint         probe_pass;
+-  gboolean      pairing_from_file;
++  guint           version_tries;
++  guint           probe_idx;
++  guint           probe_pass;
++  gboolean        pairing_from_file;
++  gboolean        session_end_tried;
+ 
+   /* List */
+-  TudorDbInfo   db_info;
+-  GPtrArray    *template_ids;
+-  guint         list_idx;
+-  GPtrArray    *prints;
++  TudorDbInfo     db_info;
++  GPtrArray      *template_ids;
++  GBytes         *payload_id;
++  guint           list_idx;
++  gboolean        list_full;
++  GPtrArray      *prints;
+ 
+   /* Events and captures */
+-  guint16       event_seq;
+-  guint32       event_seen;
+-  gboolean      event_reject;
+-  gboolean      pin_short;
+-  gboolean      pin_timed_out;
+-  gboolean      finger_is_down;
+-  gboolean      cap_rejected;
+-  guint8        acq_arg;
+-  TudorDoneFunc after;
++  guint16         event_seq;
++  guint32         event_seen;
++  gboolean        event_reject;
++  gboolean        pin_short;
++  gboolean        pin_timed_out;
++  gboolean        finger_is_down;
++  gboolean        cap_rejected;
++  guint8          acq_arg;
++  TudorDoneFunc   after;
+ 
+   /* Operations */
+-  gboolean      cleanup;
+-  gboolean      enroll_begun;
+-  guint8        template_id[TUDOR_DB2_ID_SIZE];
+-  guint8        user_id[TUDOR_DB2_ID_SIZE];
+-  gboolean      matched;
+-  guint         enroll_stages;
+-  GError       *op_error;
++  gboolean        cleanup;
++  gboolean        clearing;
++  gboolean        enroll_begun;
++  guint           enroll_captures;
++  guint8          template_id[TUDOR_DB2_ID_SIZE];
++  guint8          user_id[TUDOR_DB2_ID_SIZE];
++  gboolean        matched;
++  guint           enroll_stages;
++  GError         *op_error;
+   TudorFinishFunc finish;
+ };
+ 
+@@ -123,12 +132,13 @@ typedef struct
+   TudorDoneFunc done;
+ } TudorXfer;
+ 
+-/* Only commands that were seen in captures of the vendor driver. The
+- * delete is only ever sent with a user id that was looked up from a
+- * template first. Everything else, formats and firmware commands in
+- * particular, is refused here no matter who asks. */
+-gboolean
+-tudor_cmd_allowed (const guint8 *cmd, gsize len)
++/* Only commands that the vendor driver sends. The delete is only ever sent
++ * with a user id that was looked up from a template first and the cleanup
++ * only for the three partitions. Everything else, formats and firmware
++ * commands in particular, is refused here no matter who asks. */
++static gboolean
++tudor_cmd_allowed (const guint8 *cmd,
++                   gsize         len)
+ {
+   switch (cmd[0])
+     {
+@@ -155,7 +165,13 @@ tudor_cmd_allowed (const guint8 *cmd, gsize len)
+       return len > 1 && cmd[1] >= TUDOR_ENROLL_BEGIN && cmd[1] <= TUDOR_ENROLL_END;
+ 
+     case TUDOR_CMD_DB2_OBJ_INFO:
+-      return len > 1 && cmd[1] == TUDOR_DB2_TYPE_TEMPLATE;
++      return len > 1 && (cmd[1] == TUDOR_DB2_TYPE_TEMPLATE || cmd[1] == TUDOR_DB2_TYPE_PAYLOAD);
++
++    case TUDOR_CMD_DB2_OBJ_DATA:
++      return len == 5 + TUDOR_DB2_ID_SIZE && cmd[1] == TUDOR_DB2_TYPE_PAYLOAD;
++
++    case TUDOR_CMD_DB2_CLEANUP:
++      return len == 2 && cmd[1] >= TUDOR_DB2_TYPE_USER && cmd[1] <= TUDOR_DB2_TYPE_PAYLOAD;
+ 
+     case TUDOR_CMD_DB2_OBJ_DELETE:
+       return len == 5 + TUDOR_DB2_ID_SIZE && cmd[1] == TUDOR_DB2_TYPE_USER;
+@@ -166,7 +182,9 @@ tudor_cmd_allowed (const guint8 *cmd, gsize len)
+ }
+ 
+ static void
+-dbg_hex (const char *what, const guint8 *data, gsize len)
++dbg_hex (const char   *what,
++         const guint8 *data,
++         gsize         len)
+ {
+   g_autoptr(GString) str = g_string_new (NULL);
+ 
+@@ -182,30 +200,16 @@ in_session (FpiDeviceSynapticsTudor *self)
+   return self->tls && tudor_tls_is_established (self->tls);
+ }
+ 
+-static guint16
+-get_u16le (const guint8 *p)
+-{
+-  return p[0] | (p[1] << 8);
+-}
+-
+-static guint32
+-get_u32le (const guint8 *p)
+-{
+-  return p[0] | (p[1] << 8) | (p[2] << 16) | ((guint32) p[3] << 24);
+-}
+-
+ /* Transport */
+ 
+-/* Cleanup runs after a cancel, so it must not use the cancelled cancellable,
+- * and it carries on when single steps fail */
+-static GCancellable *
+-tudor_cancellable (FpiDeviceSynapticsTudor *self)
+-{
+-  return self->cleanup ? NULL : fpi_device_get_cancellable (FP_DEVICE (self));
+-}
+-
++/* Command and reply transfers never get the cancellable. Dropping a reply
++ * would leave the TLS sequence numbers out of step, so they run to the end
++ * and only the waits for the finger are cancellable. Cleanup carries on
++ * when single steps fail. */
+ static void
+-tudor_xfer_fail (FpiDeviceSynapticsTudor *self, FpiSsm *ssm, GError *error)
++tudor_xfer_fail (FpiDeviceSynapticsTudor *self,
++                 FpiSsm                  *ssm,
++                 GError                  *error)
+ {
+   if (self->cleanup)
+     {
+@@ -223,8 +227,22 @@ tudor_xfer_free (TudorXfer *x)
+   g_free (x);
+ }
+ 
++/* A failed exchange inside the session leaves the sequence numbers out of
++ * step with the sensor, nothing sent after it would decrypt */
++static void
++tudor_session_broke (FpiDeviceSynapticsTudor *self)
++{
++  if (in_session (self))
++    {
++      fp_dbg ("transport failed inside the session, not using it any more");
++      self->session_dead = TRUE;
++    }
++}
++
+ static void
+-tudor_decode_reply (FpiDeviceSynapticsTudor *self, TudorXfer *x, GError **error)
++tudor_decode_reply (FpiDeviceSynapticsTudor *self,
++                    TudorXfer               *x,
++                    GError                 **error)
+ {
+   g_autoptr(GByteArray) plain = NULL;
+   const guint8 *data = self->raw->data;
+@@ -244,7 +262,10 @@ tudor_decode_reply (FpiDeviceSynapticsTudor *self, TudorXfer *x, GError **error)
+     {
+       plain = tudor_tls_unwrap (self->tls, data, len, error);
+       if (!plain)
+-        return;
++        {
++          self->session_dead = TRUE;
++          return;
++        }
+       dbg_hex ("tls reply", plain->data, plain->len);
+       data = plain->data;
+       len = plain->len;
+@@ -266,11 +287,8 @@ tudor_decode_reply (FpiDeviceSynapticsTudor *self, TudorXfer *x, GError **error)
+       return;
+     }
+ 
+-  self->status = get_u16le (data);
+-  if (x->decode != TUDOR_DECODE_CMD_ANY_STATUS &&
+-      self->status != TUDOR_STATUS_OK &&
+-      self->status != TUDOR_STATUS_OK_412 &&
+-      self->status != TUDOR_STATUS_OK_5CC)
++  self->status = tudor_get_u16le (data);
++  if (x->decode != TUDOR_DECODE_CMD_ANY_STATUS && self->status != TUDOR_STATUS_OK)
+     {
+       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                    "Command failed with status 0x%04x", self->status);
+@@ -294,6 +312,7 @@ tudor_read_done (FpiUsbTransfer *transfer,
+   if (error)
+     {
+       tudor_xfer_free (x);
++      tudor_session_broke (self);
+       tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+@@ -317,7 +336,7 @@ tudor_read_done (FpiUsbTransfer *transfer,
+ }
+ 
+ static void
+-tudor_write_done (FpiUsbTransfer *transfer,
++tudor_write_done (FpiUsbTransfer *transfer G_GNUC_UNUSED,
+                   FpDevice       *device,
+                   gpointer        user_data,
+                   GError         *error)
+@@ -331,6 +350,7 @@ tudor_write_done (FpiUsbTransfer *transfer,
+       FpiSsm *ssm = x->ssm;
+ 
+       tudor_xfer_free (x);
++      tudor_session_broke (self);
+       tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+@@ -341,8 +361,7 @@ tudor_write_done (FpiUsbTransfer *transfer,
+                                  G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  TUDOR_REQ_RESP, 0, 0, x->read_cap);
+-  fpi_usb_transfer_submit (in, TUDOR_TIMEOUT_MS, tudor_cancellable (self),
+-                           tudor_read_done, x);
++  fpi_usb_transfer_submit (in, TUDOR_TIMEOUT_MS, NULL, tudor_read_done, x);
+ }
+ 
+ /* Sends data to the command pipe and reads the reply that follows. The
+@@ -372,9 +391,7 @@ tudor_exchange (FpiSsm       *ssm,
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  TUDOR_REQ_CMD, len % TUDOR_OUT_ALIGN, 0, padded);
+   memcpy (out->buffer, data, len);
+-  fpi_usb_transfer_submit (out, TUDOR_TIMEOUT_MS,
+-                           tudor_cancellable (FPI_DEVICE_SYNAPTICS_TUDOR (device)),
+-                           tudor_write_done, x);
++  fpi_usb_transfer_submit (out, TUDOR_TIMEOUT_MS, NULL, tudor_write_done, x);
+ }
+ 
+ /* Sends a command, inside the TLS session once there is one */
+@@ -397,6 +414,14 @@ tudor_send_cmd (FpiDeviceSynapticsTudor *self,
+       return;
+     }
+ 
++  if (in_session (self) && self->session_dead)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                          "The session with the sensor broke, "
++                                                          "close and open the device again"));
++      return;
++    }
++
+   if (in_session (self))
+     {
+       wrapped = tudor_tls_wrap (self->tls, cmd, len);
+@@ -416,10 +441,9 @@ tudor_send_cmd (FpiDeviceSynapticsTudor *self,
+ 
+ /* TLS handshake records travel inside this command */
+ static void
+-tudor_send_tls_data (FpiDeviceSynapticsTudor *self,
+-                     FpiSsm                  *ssm,
+-                     GByteArray              *records,
+-                     TudorDoneFunc            done)
++tudor_send_tls_data (FpiSsm       *ssm,
++                     GByteArray   *records,
++                     TudorDoneFunc done)
+ {
+   g_autoptr(GByteArray) cmd = g_byte_array_new ();
+   guint8 head[4] = { TUDOR_CMD_TLS_DATA, 0, 0, 0 };
+@@ -432,7 +456,7 @@ tudor_send_tls_data (FpiDeviceSynapticsTudor *self,
+ static void
+ tudor_ctrl_done (FpiUsbTransfer *transfer,
+                  FpDevice       *device,
+-                 gpointer        user_data,
++                 gpointer        user_data G_GNUC_UNUSED,
+                  GError         *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+@@ -440,6 +464,7 @@ tudor_ctrl_done (FpiUsbTransfer *transfer,
+ 
+   if (error)
+     {
++      tudor_session_broke (self);
+       tudor_xfer_fail (self, ssm, error);
+       return;
+     }
+@@ -453,7 +478,11 @@ tudor_ctrl_done (FpiUsbTransfer *transfer,
+ 
+ /* The few requests outside of the command pipe */
+ static void
+-tudor_control (FpiSsm *ssm, gboolean in, guint8 request, guint16 value, gsize length)
++tudor_control (FpiSsm   *ssm,
++               gboolean  in,
++               guint8    request,
++               guint16   value,
++               gsize     length)
+ {
+   FpDevice *device = fpi_ssm_get_device (ssm);
+   FpiUsbTransfer *transfer = fpi_usb_transfer_new (device);
+@@ -466,18 +495,13 @@ tudor_control (FpiSsm *ssm, gboolean in, guint8 request, guint16 value, gsize le
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+                                  request, value, 0, length);
+   transfer->ssm = ssm;
+-  fpi_usb_transfer_submit (transfer, TUDOR_TIMEOUT_MS,
+-                           tudor_cancellable (FPI_DEVICE_SYNAPTICS_TUDOR (device)),
+-                           tudor_ctrl_done, NULL);
++  fpi_usb_transfer_submit (transfer, TUDOR_TIMEOUT_MS, NULL, tudor_ctrl_done, NULL);
+ }
+ 
+ /* Pairing storage. The sensor ties its templates to the host key it was
+- * paired with, so the pairing has to survive between opens. This is the
+- * only place that knows where it lives. */
++ * paired with, so the pairing has to survive between opens. */
+ 
+ #define TUDOR_PAIRING_DIR     "/var/lib/fprint/synaptics_tudor"
+-#define TUDOR_PAIRING_MAGIC   "TUDORPAIR1"
+-#define TUDOR_PAIRING_SIZE    (sizeof (TUDOR_PAIRING_MAGIC) - 1 + 32 + 2 * TUDOR_CERT_SIZE)
+ 
+ static gchar *
+ tudor_pairing_path (FpiDeviceSynapticsTudor *self)
+@@ -496,9 +520,10 @@ static gboolean
+ tudor_pairing_load (FpiDeviceSynapticsTudor *self)
+ {
+   g_autofree gchar *path = tudor_pairing_path (self);
+-  g_autofree gchar *data = NULL;
+   g_autoptr(GError) error = NULL;
+-  gsize len = 0, magic = sizeof (TUDOR_PAIRING_MAGIC) - 1;
++  gchar *data = NULL;
++  gsize len = 0;
++  gboolean ok = FALSE;
+   EVP_PKEY *key;
+ 
+   if (!g_file_get_contents (path, &data, &len, &error))
+@@ -506,74 +531,548 @@ tudor_pairing_load (FpiDeviceSynapticsTudor *self)
+       fp_dbg ("no stored pairing: %s", error->message);
+       return FALSE;
+     }
+-  if (len != TUDOR_PAIRING_SIZE || memcmp (data, TUDOR_PAIRING_MAGIC, magic) != 0)
++
++  key = tudor_pairing_decode ((const guint8 *) data, len, self->host_cert,
++                              self->dev_cert, &error);
++  if (!key)
+     {
+-      fp_warn ("ignoring malformed pairing file %s", path);
+-      return FALSE;
++      fp_warn ("ignoring unusable pairing file %s: %s", path, error->message);
++    }
++  else
++    {
++      g_clear_pointer (&self->host_key, EVP_PKEY_free);
++      self->host_key = key;
++      ok = TRUE;
+     }
+ 
+-  key = tudor_key_import ((const guint8 *) data + magic, &error);
+-  if (!key)
++  OPENSSL_cleanse (data, len);
++  g_free (data);
++  return ok;
++}
++
++/* Pairing replaces the host key on the sensor, so there has to be a place to
++ * keep the new one before that happens */
++static gboolean
++tudor_pairing_check_storage (FpiDeviceSynapticsTudor  *self,
++                             GError                  **error)
++{
++  g_autofree gchar *path = tudor_pairing_path (self);
++  g_autofree gchar *dir = g_path_get_dirname (path);
++
++  if (g_mkdir_with_parents (dir, 0700) != 0 || g_access (dir, W_OK) != 0)
+     {
+-      fp_warn ("ignoring unusable pairing: %s", error->message);
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                   "Cannot keep the pairing in %s, not pairing the sensor", dir);
+       return FALSE;
+     }
+-  g_clear_pointer (&self->host_key, EVP_PKEY_free);
+-  self->host_key = key;
+-  memcpy (self->host_cert, data + magic + 32, TUDOR_CERT_SIZE);
+-  memcpy (self->dev_cert, data + magic + 32 + TUDOR_CERT_SIZE, TUDOR_CERT_SIZE);
+   return TRUE;
+ }
+ 
++static gboolean
++tudor_pairing_save (FpiDeviceSynapticsTudor  *self,
++                    GError                  **error)
++{
++  g_autofree gchar *path = tudor_pairing_path (self);
++  guint8 data[TUDOR_PAIRING_SIZE];
++  gboolean ok;
++
++  if (!tudor_pairing_encode (self->host_key, self->host_cert, self->dev_cert, data, error))
++    return FALSE;
++
++  ok = g_file_set_contents_full (path, (const gchar *) data, sizeof (data),
++                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, error);
++  OPENSSL_cleanse (data, sizeof (data));
++  if (ok)
++    fp_dbg ("stored pairing in %s", path);
++  return ok;
++}
++
++/* The sensor said no to the stored pairing, keep the file around */
+ static void
+-tudor_pairing_save (FpiDeviceSynapticsTudor *self)
++tudor_pairing_retire (FpiDeviceSynapticsTudor *self)
+ {
+   g_autofree gchar *path = tudor_pairing_path (self);
+-  g_autofree gchar *dir = g_path_get_dirname (path);
+-  g_autoptr(GError) error = NULL;
+-  g_autoptr(GByteArray) data = g_byte_array_new ();
+-  guint8 secret[32];
++  g_autofree gchar *old = g_strconcat (path, ".old", NULL);
++
++  if (g_rename (path, old) != 0)
++    fp_warn ("could not move %s out of the way", path);
++}
++
++/* Database */
++
++/* Where the print metadata goes. The sensor keeps what the commit command
++ * gave it, with the identity as the first 76 bytes. Those start with a type
++ * word, 2 for a guid, then the 16 byte guid (all the vendor driver puts
++ * there) and 56 more bytes that are free. The user id string of libfprint
++ * is kept in them, zero terminated. */
++#define TUDOR_IDENTITY_SIZE   76
++#define TUDOR_IDENTITY_GUID   2
++#define TUDOR_IDENTITY_TEXT   20
++#define TUDOR_IDENTITY_TEXT_MAX (TUDOR_IDENTITY_SIZE - TUDOR_IDENTITY_TEXT)
++
++/* Types of the entries in the commit command and in the object data */
++#define TUDOR_TLV_TEMPLATE    0
++#define TUDOR_TLV_IDENTITY    1
++#define TUDOR_TLV_SUBFACTOR   2
++#define TUDOR_TLV_PAYLOAD     3
++
++/* Windows numbers the right hand 1 to 5 and the left 6 to 10, libfprint the
++ * other way round. Swapping them is its own inverse. */
++static guint8
++tudor_subfactor (FpFinger finger)
++{
++  if (finger >= FP_FINGER_LEFT_THUMB && finger <= FP_FINGER_LEFT_LITTLE)
++    return finger + 5;
++  if (finger >= FP_FINGER_RIGHT_THUMB && finger <= FP_FINGER_RIGHT_LITTLE)
++    return finger - 5;
++  return 0;
++}
++
++typedef struct
++{
++  FpFinger finger;
++  gchar   *user_id;
++} TudorPayloadInfo;
++
++static void
++tudor_payload_info_clear (TudorPayloadInfo *info)
++{
++  g_clear_pointer (&info->user_id, g_free);
++}
++
++/* Reply of the object data read for a payload: a reserved word, the length
++ * and then the same list of entries the commit command had. */
++static gboolean
++tudor_parse_payload (const guint8      *data,
++                     gsize              len,
++                     TudorPayloadInfo  *info)
++{
++  guint32 total;
++  gsize off = 6;
++
++  info->finger = FP_FINGER_UNKNOWN;
++  info->user_id = NULL;
++
++  if (len < off)
++    return FALSE;
++  total = tudor_get_u32le (data + 2);
++  if (total > len - off)
++    return FALSE;
++  len = off + total;
+ 
+-  if (!tudor_key_export (self->host_key, secret, &error))
++  while (len - off >= 6)
+     {
+-      fp_warn ("could not store pairing: %s", error->message);
+-      return;
++      guint16 type = tudor_get_u16le (data + off);
++      guint32 size = tudor_get_u32le (data + off + 2);
++      const guint8 *body = data + off + 6;
++
++      if (size > len - off - 6)
++        return FALSE;
++
++      if (type == TUDOR_TLV_SUBFACTOR && size == 1)
++        {
++          FpFinger finger = tudor_subfactor (body[0]);
++
++          if (finger != FP_FINGER_UNKNOWN)
++            info->finger = finger;
++        }
++      else if (type == TUDOR_TLV_IDENTITY && size >= TUDOR_IDENTITY_SIZE &&
++               tudor_get_u32le (body) == TUDOR_IDENTITY_GUID)
++        {
++          const guint8 *text = body + TUDOR_IDENTITY_TEXT;
++          gsize text_len = strnlen ((const char *) text, TUDOR_IDENTITY_TEXT_MAX);
++
++          if (text_len < TUDOR_IDENTITY_TEXT_MAX && g_str_has_prefix ((const char *) text, "FP1-"))
++            info->user_id = g_strdup ((const char *) text);
++        }
++      off += 6 + size;
+     }
+-  g_byte_array_append (data, (const guint8 *) TUDOR_PAIRING_MAGIC, sizeof (TUDOR_PAIRING_MAGIC) - 1);
+-  g_byte_array_append (data, secret, sizeof (secret));
+-  g_byte_array_append (data, self->host_cert, TUDOR_CERT_SIZE);
+-  g_byte_array_append (data, self->dev_cert, TUDOR_CERT_SIZE);
+-  OPENSSL_cleanse (secret, sizeof (secret));
++  return TRUE;
++}
++
++static void
++tudor_parse_db_info (FpiDeviceSynapticsTudor *self,
++                     GError                 **error)
++{
++  const guint8 *r = self->reply->data;
++  TudorDbInfo *i = &self->db_info;
+ 
+-  if (g_mkdir_with_parents (dir, 0700) != 0 ||
+-      !g_file_set_contents_full (path, (const gchar *) data->data, data->len,
+-                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
++  /* Dummy word, versions, then the counters */
++  if (self->reply->len < 38)
+     {
+-      fp_warn ("could not store pairing in %s: %s", dir, error ? error->message : "mkdir failed");
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Database info reply too short");
+       return;
+     }
+-  fp_dbg ("stored pairing in %s", path);
++
++  i->version_major = tudor_get_u16le (r + 2);
++  i->version_minor = tudor_get_u16le (r + 4);
++  i->pversion = tudor_get_u32le (r + 6);
++  i->uop_len = tudor_get_u16le (r + 10);
++  i->top_len = tudor_get_u16le (r + 12);
++  i->pop_len = tudor_get_u16le (r + 14);
++  i->template_slot_size = tudor_get_u16le (r + 16);
++  i->payload_slot_size = tudor_get_u16le (r + 18);
++  i->users_current = tudor_get_u16le (r + 20);
++  i->users_deleted = tudor_get_u16le (r + 22);
++  i->users_available = tudor_get_u16le (r + 24);
++  i->templates_current = tudor_get_u16le (r + 26);
++  i->templates_deleted = tudor_get_u16le (r + 28);
++  i->templates_available = tudor_get_u16le (r + 30);
++  i->payloads_current = tudor_get_u16le (r + 32);
++  i->payloads_deleted = tudor_get_u16le (r + 34);
++  i->payloads_available = tudor_get_u16le (r + 36);
++
++  fp_dbg ("database v%u.%u pversion %u: users %u (+%u deleted, %u free), "
++          "templates %u (+%u deleted, %u free), payloads %u (+%u deleted, %u free)",
++          i->version_major, i->version_minor, i->pversion,
++          i->users_current, i->users_deleted, i->users_available,
++          i->templates_current, i->templates_deleted, i->templates_available,
++          i->payloads_current, i->payloads_deleted, i->payloads_available);
++}
++
++static void
++db_info_done (FpiDeviceSynapticsTudor *self,
++              FpiSsm                  *ssm)
++{
++  GError *error = NULL;
++
++  tudor_parse_db_info (self, &error);
++  if (error)
++    fpi_ssm_mark_failed (ssm, error);
++  else
++    fpi_ssm_next_state (ssm);
+ }
+ 
+ static void
+-tudor_pairing_forget (FpiDeviceSynapticsTudor *self)
++tudor_send_db_info (FpiDeviceSynapticsTudor *self,
++                    FpiSsm                  *ssm,
++                    TudorDoneFunc            done)
+ {
+-  g_autofree gchar *path = tudor_pairing_path (self);
++  static const guint8 cmd[] = { TUDOR_CMD_DB2_GET_DB_INFO, 0x01 };
+ 
+-  g_unlink (path);
++  tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, done);
+ }
+ 
+-/* Open */
++/* Deleting only marks objects as deleted, the room comes back with a
++ * cleanup of each partition. The vendor driver does that after every
++ * delete, the argument of the command is the object type. */
++
++enum {
++  CLEAN_DB_USERS,
++  CLEAN_DB_TEMPLATES,
++  CLEAN_DB_PAYLOADS,
++  CLEAN_DB_INFO,
++  CLEAN_DB_NUM_STATES,
++};
++
++static void
++clean_db_done (FpiDeviceSynapticsTudor *self,
++               FpiSsm                  *ssm)
++{
++  /* The objects are deleted already, a refusal here only costs room */
++  if (self->status != TUDOR_STATUS_OK)
++    fp_warn ("cleanup of partition %u failed with status 0x%04x",
++             fpi_ssm_get_cur_state (ssm) + 1, self->status);
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++clean_db_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  guint8 cmd[2] = { TUDOR_CMD_DB2_CLEANUP };
++  guint state = fpi_ssm_get_cur_state (ssm);
++
++  if (state == CLEAN_DB_INFO)
++    {
++      tudor_send_db_info (self, ssm, db_info_done);
++      return;
++    }
++
++  cmd[1] = TUDOR_DB2_TYPE_USER + state;
++  tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
++                  TUDOR_DECODE_CMD_ANY_STATUS, clean_db_done);
++}
++
++/* Starts the cleanup as a sub machine of the caller */
++static void
++tudor_start_db_cleanup (FpiSsm *parent)
++{
++  fpi_ssm_start_subsm (parent, fpi_ssm_new (fpi_ssm_get_device (parent), clean_db_run_state,
++                                            CLEAN_DB_NUM_STATES));
++}
++
++/* List */
+ 
+ enum {
+   LIST_DB_INFO,
+   LIST_TEMPLATES,
+   LIST_PAYLOADS,
++  LIST_PAYLOAD_INFO,
++  LIST_PAYLOAD_DATA,
+   LIST_NUM_STATES,
+ };
+ 
+-static void list_run_state (FpiSsm *ssm,
+-                            FpDevice *device);
++/* Reply is a count and then that many ids */
++static gboolean
++parse_id_list (FpiDeviceSynapticsTudor  *self,
++               GPtrArray                *out,
++               GError                  **error)
++{
++  guint count;
++
++  if (self->reply->len < 2)
++    goto bad;
++  count = tudor_get_u16le (self->reply->data);
++  if (self->reply->len < 2 + count * TUDOR_DB2_ID_SIZE)
++    goto bad;
++
++  for (guint i = 0; i < count; i++)
++    g_ptr_array_add (out, g_bytes_new (self->reply->data + 2 + i * TUDOR_DB2_ID_SIZE,
++                                       TUDOR_DB2_ID_SIZE));
++  return TRUE;
++
++bad:
++  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                       "Malformed object list");
++  return FALSE;
++}
++
++static void
++list_templates_done (FpiDeviceSynapticsTudor *self,
++                     FpiSsm                  *ssm)
++{
++  GError *error = NULL;
++
++  if (!parse_id_list (self, self->template_ids, &error))
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++  fp_dbg ("%u templates on the sensor", self->template_ids->len);
++  self->list_idx = 0;
++  fpi_ssm_next_state (ssm);
++}
++
++/* Prints made from the template id alone are what verify and identify
++ * compare against, the payload only adds what the user sees */
++static void
++list_add_print (FpiDeviceSynapticsTudor *self,
++                const TudorPayloadInfo  *info)
++{
++  GBytes *id = g_ptr_array_index (self->template_ids, self->list_idx);
++  FpPrint *print = fp_print_new (FP_DEVICE (self));
++  g_autofree gchar *name = NULL;
++  GVariant *data;
++  gsize size;
++  const guint8 *raw = g_bytes_get_data (id, &size);
++
++  data = g_variant_new ("(@ay)",
++                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, raw, size, 1));
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", data, NULL);
++
++  if (info && info->user_id && fpi_print_fill_from_user_id (print, info->user_id))
++    {
++      name = g_strdup (info->user_id);
++    }
++  else
++    {
++      name = g_strdup_printf ("tudor-template-%02x%02x%02x%02x", raw[0], raw[1], raw[2], raw[3]);
++      if (info && info->finger != FP_FINGER_UNKNOWN)
++        fp_print_set_finger (print, info->finger);
++    }
++  fp_print_set_description (print, name);
++  g_ptr_array_add (self->prints, g_object_ref_sink (print));
++}
++
++static void
++list_next_template (FpiDeviceSynapticsTudor *self,
++                    FpiSsm                  *ssm)
++{
++  if (++self->list_idx < self->template_ids->len)
++    fpi_ssm_jump_to_state (ssm, LIST_PAYLOADS);
++  else
++    fpi_ssm_mark_completed (ssm);
++}
++
++static void
++list_payloads_done (FpiDeviceSynapticsTudor *self,
++                    FpiSsm                  *ssm)
++{
++  g_autoptr(GPtrArray) payloads = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  GError *error = NULL;
++
++  if (!parse_id_list (self, payloads, &error))
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++  fp_dbg ("template %u has %u payloads", self->list_idx, payloads->len);
++
++  g_clear_pointer (&self->payload_id, g_bytes_unref);
++  if (self->list_full && payloads->len > 0)
++    {
++      self->payload_id = g_bytes_ref (g_ptr_array_index (payloads, 0));
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  /* Open does not need the metadata */
++  if (self->list_full)
++    list_add_print (self, NULL);
++  list_next_template (self, ssm);
++}
++
++static void
++list_payload_data_done (FpiDeviceSynapticsTudor *self,
++                        FpiSsm                  *ssm)
++{
++  TudorPayloadInfo info = { 0 };
++
++  if (tudor_parse_payload (self->reply->data, self->reply->len, &info))
++    {
++      list_add_print (self, &info);
++    }
++  else
++    {
++      fp_warn ("could not read the payload of template %u", self->list_idx);
++      list_add_print (self, NULL);
++    }
++  tudor_payload_info_clear (&info);
++  list_next_template (self, ssm);
++}
++
++static void
++list_run_state (FpiSsm   *ssm,
++                FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case LIST_DB_INFO:
++      tudor_send_db_info (self, ssm, db_info_done);
++      break;
++
++    case LIST_TEMPLATES:
++      {
++        guint8 cmd[21] = { TUDOR_CMD_DB2_OBJ_LIST, TUDOR_DB2_TYPE_TEMPLATE };
++
++        /* Last 16 bytes are the parent filter, all ones means any */
++        memset (cmd + 5, 0xff, TUDOR_DB2_ID_SIZE);
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
++                        TUDOR_DECODE_CMD, list_templates_done);
++      }
++      break;
++
++    case LIST_PAYLOADS:
++      {
++        guint8 cmd[21] = { TUDOR_CMD_DB2_OBJ_LIST, TUDOR_DB2_TYPE_PAYLOAD };
++        GBytes *id;
++
++        if (self->template_ids->len == 0)
++          {
++            fpi_ssm_mark_completed (ssm);
++            return;
++          }
++        id = g_ptr_array_index (self->template_ids, self->list_idx);
++        memcpy (cmd + 5, g_bytes_get_data (id, NULL), TUDOR_DB2_ID_SIZE);
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
++                        TUDOR_DECODE_CMD, list_payloads_done);
++      }
++      break;
++
++    case LIST_PAYLOAD_INFO:
++    case LIST_PAYLOAD_DATA:
++      {
++        guint8 cmd[21] = { 0, TUDOR_DB2_TYPE_PAYLOAD };
++        gboolean data = fpi_ssm_get_cur_state (ssm) == LIST_PAYLOAD_DATA;
++
++        /* The vendor driver asks for the info before the data */
++        cmd[0] = data ? TUDOR_CMD_DB2_OBJ_DATA : TUDOR_CMD_DB2_OBJ_INFO;
++        memcpy (cmd + 5, g_bytes_get_data (self->payload_id, NULL), TUDOR_DB2_ID_SIZE);
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
++                        TUDOR_DECODE_CMD, data ? list_payload_data_done : NULL);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++list_done (FpiSsm   *ssm,
++           FpDevice *device,
++           GError   *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  GPtrArray *prints = g_steal_pointer (&self->prints);
++
++  g_clear_pointer (&self->template_ids, g_ptr_array_unref);
++  g_clear_pointer (&self->payload_id, g_bytes_unref);
++  if (error)
++    {
++      g_clear_pointer (&prints, g_ptr_array_unref);
++      fpi_device_list_complete (device, NULL, error);
++      return;
++    }
++  fpi_device_list_complete (device, prints, NULL);
++}
++
++static void
++tudor_list (FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  self->prints = g_ptr_array_new_with_free_func (g_object_unref);
++  self->template_ids = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  self->list_full = TRUE;
++  fpi_ssm_start (fpi_ssm_new (device, list_run_state, LIST_NUM_STATES), list_done);
++}
++
++/* Prints */
++
++static FpPrint *
++tudor_print_new (FpPrint      *print,
++                 const guint8 *id)
++{
++  GVariant *data = g_variant_new ("(@ay)",
++                                  g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                             id, TUDOR_DB2_ID_SIZE, 1));
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", data, NULL);
++  return print;
++}
++
++static gboolean
++tudor_print_get_id (FpPrint *print,
++                    guint8   id[TUDOR_DB2_ID_SIZE])
++{
++  g_autoptr(GVariant) data = NULL;
++  g_autoptr(GVariant) bytes = NULL;
++  gsize n = 0;
++  gconstpointer p;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(ay)")))
++    return FALSE;
++
++  bytes = g_variant_get_child_value (data, 0);
++  p = g_variant_get_fixed_array (bytes, &n, 1);
++  if (n != TUDOR_DB2_ID_SIZE)
++    return FALSE;
++  memcpy (id, p, n);
++  return TRUE;
++}
++
++/* Open */
+ 
+ enum {
+   OPEN_PROBE_OUT,
+@@ -609,7 +1108,8 @@ static const TudorProbeStep probe_steps[] = {
+ };
+ 
+ static void
+-open_step_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_step_done (FpiDeviceSynapticsTudor *self,
++                FpiSsm                  *ssm)
+ {
+   /* Offsets are into the reply with the status bytes taken off */
+   const guint8 *v = self->reply->data;
+@@ -644,7 +1144,7 @@ open_step_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+       return;
+     }
+ 
+-  ver->build = get_u32le (v + 4);
++  ver->build = tudor_get_u32le (v + 4);
+   ver->fw_major = v[8];
+   ver->fw_minor = v[9];
+   ver->product_id = v[11];
+@@ -660,7 +1160,8 @@ open_step_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-open_pair_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_pair_done (FpiDeviceSynapticsTudor *self,
++                FpiSsm                  *ssm)
+ {
+   g_autoptr(EVP_PKEY) sensor_key = NULL;
+   GError *error = NULL;
+@@ -693,6 +1194,12 @@ open_pair_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ 
+   g_clear_pointer (&self->tls, tudor_tls_free);
+   self->tls = tudor_tls_new (self->host_key, self->host_cert, sensor_key);
++  if (!self->tls)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                          "Could not set up the TLS session"));
++      return;
++    }
+   fp_dbg ("paired");
+   self->probe_pass = 2;
+   self->probe_idx = 0;
+@@ -702,18 +1209,27 @@ open_pair_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ /* With a stored pairing the sensor is not paired again, the session is
+  * set up with the old keys */
+ static void
+-open_use_pairing (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_use_pairing (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm)
+ {
+   g_autoptr(EVP_PKEY) sensor_key = NULL;
+ 
+   self->pairing_from_file = FALSE;
+-  if (tudor_pairing_load (self) &&
++  /* Emulated devices pair from the recording */
++  if (!fpi_device_emulation_mode_enabled (FP_DEVICE (self)) &&
++      tudor_pairing_load (self) &&
+       tudor_cert_verify_sensor (self->dev_cert, self->version.fw_major, self->version.fw_minor,
+                                 (self->version.flags2 & 0x20) != 0, NULL) &&
+       (sensor_key = tudor_cert_get_pubkey (self->dev_cert, NULL)))
+     {
+       g_clear_pointer (&self->tls, tudor_tls_free);
+       self->tls = tudor_tls_new (self->host_key, self->host_cert, sensor_key);
++      if (!self->tls)
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                              "Could not set up the TLS session"));
++          return;
++        }
+       self->pairing_from_file = TRUE;
+       fp_dbg ("using stored pairing");
+       fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
+@@ -723,7 +1239,8 @@ open_use_pairing (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-open_hello_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_hello_done (FpiDeviceSynapticsTudor *self,
++                 FpiSsm                  *ssm)
+ {
+   GError *error = NULL;
+ 
+@@ -739,19 +1256,24 @@ open_hello_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-open_flight_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_flight_done (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm)
+ {
+   GError *error = NULL;
++  gboolean rejected = FALSE;
+ 
+   if (!tudor_tls_handle_server_finished (self->tls, self->reply->data,
+-                                         self->reply->len, &error))
++                                         self->reply->len, &rejected, &error))
+     {
+-      /* The sensor does not know the stored pairing any more, pair again */
+-      if (self->pairing_from_file)
++      /* Only a clear no from the sensor means the pairing is gone. Anything
++       * else could be a glitch and the pairing is the only way to the
++       * templates, so it stays where it is. */
++      if (self->pairing_from_file && rejected)
+         {
+-          fp_dbg ("stored pairing rejected: %s", error->message);
++          fp_warn ("sensor rejected the stored pairing (%s), pairing again, "
++                   "templates enrolled before will not match", error->message);
+           g_clear_error (&error);
+-          tudor_pairing_forget (self);
++          tudor_pairing_retire (self);
+           self->pairing_from_file = FALSE;
+           g_clear_pointer (&self->tls, tudor_tls_free);
+           self->version_tries = 0;
+@@ -766,7 +1288,8 @@ open_flight_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-open_run_state (FpiSsm *ssm, FpDevice *device)
++open_run_state (FpiSsm   *ssm,
++                FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -808,8 +1331,17 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+         guint8 cmd[1 + TUDOR_CERT_SIZE] = { TUDOR_CMD_PAIR };
+         guint8 cert[TUDOR_CERT_SIZE];
+ 
+-        /* A new host key for every open, the sensor takes whatever was
+-         * paired last */
++        /* Pairing replaces the host key the sensor knows, so the new one
++         * has to be storable first */
++        if (!fpi_device_emulation_mode_enabled (device) &&
++            !tudor_pairing_check_storage (self, &error))
++          {
++            fpi_ssm_mark_failed (ssm, error);
++            return;
++          }
++
++        fp_warn ("pairing the sensor with a new host key, templates enrolled "
++                 "under an earlier pairing will not match any more");
+         g_clear_pointer (&self->host_key, EVP_PKEY_free);
+         self->host_key = tudor_cert_new_host_key (&error);
+         if (!self->host_key || !tudor_cert_make_host (self->host_key, cert, &error))
+@@ -830,6 +1362,7 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+     case OPEN_TLS_HELLO:
+       {
+         g_autoptr(GByteArray) hello = NULL;
++        GError *error = NULL;
+ 
+         if (self->raw->len < 1 || self->raw->data[0] != 0)
+           {
+@@ -837,13 +1370,18 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+                                                                 "Sensor already has a session"));
+             return;
+           }
+-        hello = tudor_tls_client_hello (self->tls);
+-        tudor_send_tls_data (self, ssm, hello, open_hello_done);
++        hello = tudor_tls_client_hello (self->tls, &error);
++        if (!hello)
++          {
++            fpi_ssm_mark_failed (ssm, error);
++            return;
++          }
++        tudor_send_tls_data (ssm, hello, open_hello_done);
+       }
+       break;
+ 
+     case OPEN_TLS_FLIGHT:
+-      tudor_send_tls_data (self, ssm, self->flight, open_flight_done);
++      tudor_send_tls_data (ssm, self->flight, open_flight_done);
+       break;
+ 
+     case OPEN_TLS_CHECK:
+@@ -860,9 +1398,16 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+                                                                 "Sensor does not report a session"));
+             return;
+           }
+-        if (!self->pairing_from_file)
++        if (!self->pairing_from_file && !fpi_device_emulation_mode_enabled (device))
+           {
+-            tudor_pairing_save (self);
++            GError *error = NULL;
++
++            if (!tudor_pairing_save (self, &error))
++              {
++                g_prefix_error (&error, "Cannot keep the new pairing: ");
++                fpi_ssm_mark_failed (ssm, error);
++                return;
++              }
+             self->pairing_from_file = TRUE;
+           }
+         tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
+@@ -874,6 +1419,7 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+        * does the same */
+       self->prints = g_ptr_array_new_with_free_func (g_object_unref);
+       self->template_ids = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++      self->list_full = FALSE;
+       fpi_ssm_start_subsm (ssm, fpi_ssm_new (device, list_run_state, LIST_NUM_STATES));
+       break;
+ 
+@@ -889,287 +1435,131 @@ open_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-open_done (FpiSsm *ssm, FpDevice *device, GError *error)
+-{
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+-
+-  if (error)
+-    {
+-      g_autoptr(GError) release_error = NULL;
+-
+-      g_clear_pointer (&self->tls, tudor_tls_free);
+-      g_clear_pointer (&self->host_key, EVP_PKEY_free);
+-      g_clear_pointer (&self->raw, g_byte_array_unref);
+-      g_clear_pointer (&self->reply, g_byte_array_unref);
+-      g_clear_pointer (&self->flight, g_byte_array_unref);
+-      g_usb_device_release_interface (fpi_device_get_usb_device (device),
+-                                      TUDOR_INTERFACE, 0, &release_error);
+-    }
+-
+-  fpi_device_open_complete (device, error);
+-}
+-
+-static void
+-tudor_open (FpDevice *device)
++tudor_free_state (FpiDeviceSynapticsTudor *self)
+ {
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+-  GError *error = NULL;
+-  FpiSsm *ssm;
+-
+-  self->raw = g_byte_array_new ();
+-  self->reply = g_byte_array_new ();
+-  self->version_tries = 0;
+-  self->probe_idx = 0;
+-  self->probe_pass = 0;
+-  self->pairing_from_file = FALSE;
+-
+-  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device),
+-                                     TUDOR_INTERFACE, 0, &error))
+-    {
+-      fpi_device_open_complete (device, error);
+-      return;
+-    }
+-
+-  ssm = fpi_ssm_new (device, open_run_state, OPEN_NUM_STATES);
+-  fpi_ssm_start (ssm, open_done);
+-}
+-
+-/* Close */
+-
+-enum {
+-  CLOSE_SESSION_END,
+-  CLOSE_TLS_STATE,
+-  CLOSE_NOTIFY,
+-  CLOSE_NUM_STATES,
+-};
+-
+-static void
+-close_run_state (FpiSsm *ssm, FpDevice *device)
+-{
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+-
+-  switch (fpi_ssm_get_cur_state (ssm))
+-    {
+-    case CLOSE_SESSION_END:
+-      tudor_control (ssm, FALSE, TUDOR_REQ_SESSION_END, 0, 0);
+-      break;
+-
+-    case CLOSE_TLS_STATE:
+-      tudor_control (ssm, TRUE, TUDOR_REQ_TLS_STATE, 0, 2);
+-      break;
+-
+-    case CLOSE_NOTIFY:
+-      {
+-        g_autoptr(GByteArray) alert = tudor_tls_close_notify (self->tls);
+-
+-        if (!alert)
+-          {
+-            fpi_ssm_mark_completed (ssm);
+-            return;
+-          }
+-        tudor_exchange (ssm, alert->data, alert->len, 64, TUDOR_DECODE_RAW, NULL);
+-      }
+-      break;
+-
+-    default:
+-      g_assert_not_reached ();
+-    }
+-}
+-
+-static void
+-close_done (FpiSsm *ssm, FpDevice *device, GError *error)
+-{
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+-  g_autoptr(GError) release_error = NULL;
+-
+-  /* The session is gone either way, so a failed goodbye is not worth reporting */
+-  if (error)
+-    fp_dbg ("closing the session failed: %s", error->message);
+-  g_clear_error (&error);
+-
+   g_clear_pointer (&self->tls, tudor_tls_free);
+   g_clear_pointer (&self->host_key, EVP_PKEY_free);
+   g_clear_pointer (&self->raw, g_byte_array_unref);
+   g_clear_pointer (&self->reply, g_byte_array_unref);
+   g_clear_pointer (&self->flight, g_byte_array_unref);
+-
+-  g_usb_device_release_interface (fpi_device_get_usb_device (device),
+-                                  TUDOR_INTERFACE, 0, &release_error);
+-  fpi_device_close_complete (device, g_steal_pointer (&release_error));
++  g_clear_pointer (&self->prints, g_ptr_array_unref);
++  g_clear_pointer (&self->template_ids, g_ptr_array_unref);
++  g_clear_pointer (&self->payload_id, g_bytes_unref);
++  g_clear_error (&self->op_error);
+ }
+ 
++/* Gives the interface back and ends open or close. The error of a failed
++ * open waits here while the session is closed. */
+ static void
+-tudor_close (FpDevice *device)
++tudor_finish_close (FpiDeviceSynapticsTudor *self)
+ {
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++  FpDevice *device = FP_DEVICE (self);
++  g_autoptr(GError) release_error = NULL;
++  GError *open_error = g_steal_pointer (&self->open_error);
+ 
+-  if (self->tls && tudor_tls_is_established (self->tls))
+-    {
+-      fpi_ssm_start (fpi_ssm_new (device, close_run_state, CLOSE_NUM_STATES), close_done);
+-      return;
+-    }
+-  close_done (NULL, device, NULL);
++  tudor_free_state (self);
++  g_usb_device_release_interface (fpi_device_get_usb_device (device),
++                                  TUDOR_INTERFACE, 0, &release_error);
++  if (open_error)
++    fpi_device_open_complete (device, open_error);
++  else
++    fpi_device_close_complete (device, g_steal_pointer (&release_error));
+ }
+ 
+-/* List */
++static void
++tudor_start_close (FpiDeviceSynapticsTudor *self);
+ 
+ static void
+-list_db_info_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++open_done (FpiSsm   *ssm,
++           FpDevice *device,
++           GError   *error)
+ {
+-  const guint8 *r = self->reply->data;
+-  TudorDbInfo *i = &self->db_info;
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+-  /* Dummy word, versions, then the counters */
+-  if (self->reply->len < 38)
++  if (!error)
+     {
+-      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+-                                                          "Database info reply too short"));
++      fpi_device_open_complete (device, NULL);
+       return;
+     }
+ 
+-  i->version_major = get_u16le (r + 2);
+-  i->version_minor = get_u16le (r + 4);
+-  i->pversion = get_u32le (r + 6);
+-  i->uop_len = get_u16le (r + 10);
+-  i->top_len = get_u16le (r + 12);
+-  i->pop_len = get_u16le (r + 14);
+-  i->template_slot_size = get_u16le (r + 16);
+-  i->payload_slot_size = get_u16le (r + 18);
+-  i->users_current = get_u16le (r + 20);
+-  i->users_deleted = get_u16le (r + 22);
+-  i->users_available = get_u16le (r + 24);
+-  i->templates_current = get_u16le (r + 26);
+-  i->templates_deleted = get_u16le (r + 28);
+-  i->templates_available = get_u16le (r + 30);
+-  i->payloads_current = get_u16le (r + 32);
+-  i->payloads_deleted = get_u16le (r + 34);
+-  i->payloads_available = get_u16le (r + 36);
+-
+-  fp_info ("database v%u.%u pversion %u: users %u (+%u deleted, %u free), "
+-           "templates %u (+%u deleted, %u free), payloads %u (+%u deleted, %u free)",
+-           i->version_major, i->version_minor, i->pversion,
+-           i->users_current, i->users_deleted, i->users_available,
+-           i->templates_current, i->templates_deleted, i->templates_available,
+-           i->payloads_current, i->payloads_deleted, i->payloads_available);
+-  fpi_ssm_next_state (ssm);
+-}
+-
+-/* Reply is a count and then that many ids */
+-static gboolean
+-parse_id_list (FpiDeviceSynapticsTudor *self, GPtrArray *out, GError **error)
+-{
+-  guint count;
+-
+-  if (self->reply->len < 2)
+-    goto bad;
+-  count = get_u16le (self->reply->data);
+-  if (self->reply->len < 2 + count * TUDOR_DB2_ID_SIZE)
+-    goto bad;
+-
+-  for (guint i = 0; i < count; i++)
+-    g_ptr_array_add (out, g_bytes_new (self->reply->data + 2 + i * TUDOR_DB2_ID_SIZE,
+-                                       TUDOR_DB2_ID_SIZE));
+-  return TRUE;
+-
+-bad:
+-  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                       "Malformed object list");
+-  return FALSE;
++  /* A session that is up would make the next open fail, so it is ended
++   * before the error goes out */
++  self->open_error = error;
++  tudor_start_close (self);
+ }
+ 
+ static void
+-list_templates_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++tudor_open (FpDevice *device)
+ {
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+   GError *error = NULL;
++  FpiSsm *ssm;
+ 
+-  if (!parse_id_list (self, self->template_ids, &error))
++  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device),
++                                     TUDOR_INTERFACE, 0, &error))
+     {
+-      fpi_ssm_mark_failed (ssm, error);
++      fpi_device_open_complete (device, error);
+       return;
+     }
+-  fp_info ("%u templates on the sensor", self->template_ids->len);
+-  self->list_idx = 0;
+-  fpi_ssm_next_state (ssm);
+-}
+ 
+-static void
+-list_payloads_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+-{
+-  GBytes *id = g_ptr_array_index (self->template_ids, self->list_idx);
+-  g_autoptr(GPtrArray) payloads = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+-  GError *error = NULL;
++  /* Recordings replay byte for byte only when nothing is random */
++  if (fpi_device_emulation_mode_enabled (device))
++    tudor_tls_set_seed ((const guint8 *) "tudor emulation seed, not secret");
+ 
+-  if (!parse_id_list (self, payloads, &error))
+-    {
+-      fpi_ssm_mark_failed (ssm, error);
+-      return;
+-    }
+-  fp_info ("template %u has %u payloads", self->list_idx, payloads->len);
+-
+-  {
+-    FpPrint *print = fp_print_new (FP_DEVICE (self));
+-    g_autofree gchar *name = NULL;
+-    GVariant *data;
+-    gsize size;
+-    const guint8 *raw = g_bytes_get_data (id, &size);
+-
+-    /* Provisional: what the template objects mean to the user is not known yet */
+-    data = g_variant_new ("(@ay)",
+-                          g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, raw, size, 1));
+-    name = g_strdup_printf ("tudor-template-%02x%02x%02x%02x", raw[0], raw[1], raw[2], raw[3]);
+-    fpi_print_set_type (print, FPI_PRINT_RAW);
+-    fpi_print_set_device_stored (print, TRUE);
+-    g_object_set (print, "fpi-data", data, "description", name, NULL);
+-    g_ptr_array_add (self->prints, g_object_ref_sink (print));
+-  }
++  self->raw = g_byte_array_new ();
++  self->reply = g_byte_array_new ();
++  self->version_tries = 0;
++  self->probe_idx = 0;
++  self->probe_pass = 0;
++  self->pairing_from_file = FALSE;
++  self->session_dead = FALSE;
++  self->session_end_tried = FALSE;
+ 
+-  if (++self->list_idx < self->template_ids->len)
+-    fpi_ssm_jump_to_state (ssm, LIST_PAYLOADS);
+-  else
+-    fpi_ssm_mark_completed (ssm);
++  ssm = fpi_ssm_new (device, open_run_state, OPEN_NUM_STATES);
++  fpi_ssm_start (ssm, open_done);
+ }
+ 
++/* Close */
++
++enum {
++  CLOSE_SESSION_END,
++  CLOSE_TLS_STATE,
++  CLOSE_NOTIFY,
++  CLOSE_NUM_STATES,
++};
++
+ static void
+-list_run_state (FpiSsm *ssm, FpDevice *device)
++close_run_state (FpiSsm   *ssm,
++                 FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+-    case LIST_DB_INFO:
+-      {
+-        static const guint8 cmd[] = { TUDOR_CMD_DB2_GET_DB_INFO, 0x01 };
+-
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
+-                        TUDOR_DECODE_CMD, list_db_info_done);
+-      }
++    case CLOSE_SESSION_END:
++      tudor_control (ssm, FALSE, TUDOR_REQ_SESSION_END, 0, 0);
+       break;
+ 
+-    case LIST_TEMPLATES:
+-      {
+-        guint8 cmd[21] = { TUDOR_CMD_DB2_OBJ_LIST, TUDOR_DB2_TYPE_TEMPLATE };
+-
+-        /* Last 16 bytes are the parent filter, all ones means any */
+-        memset (cmd + 5, 0xff, TUDOR_DB2_ID_SIZE);
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
+-                        TUDOR_DECODE_CMD, list_templates_done);
+-      }
++    case CLOSE_TLS_STATE:
++      /* The goodbye does not fit a session that is out of step */
++      if (self->session_dead)
++        {
++          fpi_ssm_mark_completed (ssm);
++          return;
++        }
++      tudor_control (ssm, TRUE, TUDOR_REQ_TLS_STATE, 0, 2);
+       break;
+ 
+-    case LIST_PAYLOADS:
++    case CLOSE_NOTIFY:
+       {
+-        guint8 cmd[21] = { TUDOR_CMD_DB2_OBJ_LIST, TUDOR_DB2_TYPE_PAYLOAD };
+-        GBytes *id;
++        g_autoptr(GByteArray) alert = tudor_tls_close_notify (self->tls);
+ 
+-        if (self->template_ids->len == 0)
++        if (!alert)
+           {
+             fpi_ssm_mark_completed (ssm);
+             return;
+           }
+-        id = g_ptr_array_index (self->template_ids, self->list_idx);
+-        memcpy (cmd + 5, g_bytes_get_data (id, NULL), TUDOR_DB2_ID_SIZE);
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
+-                        TUDOR_DECODE_CMD, list_payloads_done);
++        tudor_exchange (ssm, alert->data, alert->len, 64, TUDOR_DECODE_RAW, NULL);
+       }
+       break;
+ 
+@@ -1179,82 +1569,44 @@ list_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-list_done (FpiSsm *ssm, FpDevice *device, GError *error)
++close_done (FpiSsm   *ssm,
++            FpDevice *device,
++            GError   *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+-  GPtrArray *prints = g_steal_pointer (&self->prints);
+ 
+-  g_clear_pointer (&self->template_ids, g_ptr_array_unref);
++  /* The session is gone either way, so a failed goodbye is not worth reporting */
+   if (error)
+-    {
+-      g_clear_pointer (&prints, g_ptr_array_unref);
+-      fpi_device_list_complete (device, NULL, error);
+-      return;
+-    }
+-  fpi_device_list_complete (device, prints, NULL);
+-}
+-
+-static void
+-tudor_list (FpDevice *device)
+-{
+-  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++    fp_dbg ("closing the session failed: %s", error->message);
++  g_clear_error (&error);
+ 
+-  self->prints = g_ptr_array_new_with_free_func (g_object_unref);
+-  self->template_ids = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+-  fpi_ssm_start (fpi_ssm_new (device, list_run_state, LIST_NUM_STATES), list_done);
++  tudor_finish_close (self);
+ }
+ 
+-/* Prints */
+-
+-static FpPrint *
+-tudor_print_new (FpiDeviceSynapticsTudor *self, FpPrint *print, const guint8 *id)
++static void
++tudor_start_close (FpiDeviceSynapticsTudor *self)
+ {
+-  GVariant *data = g_variant_new ("(@ay)",
+-                                  g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+-                                                             id, TUDOR_DB2_ID_SIZE, 1));
+-
+-  if (!print)
+-    print = fp_print_new (FP_DEVICE (self));
++  FpDevice *device = FP_DEVICE (self);
+ 
+-  fpi_print_set_type (print, FPI_PRINT_RAW);
+-  fpi_print_set_device_stored (print, TRUE);
+-  g_object_set (print, "fpi-data", data, NULL);
+-  return print;
++  if (self->tls && tudor_tls_is_established (self->tls))
++    {
++      fpi_ssm_start (fpi_ssm_new (device, close_run_state, CLOSE_NUM_STATES), close_done);
++      return;
++    }
++  tudor_finish_close (self);
+ }
+ 
+-static gboolean
+-tudor_print_get_id (FpPrint *print, guint8 id[TUDOR_DB2_ID_SIZE])
++static void
++tudor_close (FpDevice *device)
+ {
+-  g_autoptr(GVariant) data = NULL;
+-  g_autoptr(GVariant) bytes = NULL;
+-  gsize n = 0;
+-  gconstpointer p;
+-
+-  g_object_get (print, "fpi-data", &data, NULL);
+-  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(ay)")))
+-    return FALSE;
+-
+-  bytes = g_variant_get_child_value (data, 0);
+-  p = g_variant_get_fixed_array (bytes, &n, 1);
+-  if (n != TUDOR_DB2_ID_SIZE)
+-    return FALSE;
+-  memcpy (id, p, n);
+-  return TRUE;
++  tudor_start_close (FPI_DEVICE_SYNAPTICS_TUDOR (device));
+ }
+ 
+ /* Events */
+ 
+ static void
+-put_u32le (guint8 *p, guint32 v)
+-{
+-  p[0] = v & 0xff;
+-  p[1] = (v >> 8) & 0xff;
+-  p[2] = (v >> 16) & 0xff;
+-  p[3] = v >> 24;
+-}
+-
+-static void
+-tudor_continue (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++tudor_continue (FpiDeviceSynapticsTudor *self,
++                FpiSsm                  *ssm)
+ {
+   TudorDoneFunc after = self->after;
+ 
+@@ -1266,11 +1618,12 @@ tudor_continue (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-event_config_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++event_config_done (FpiDeviceSynapticsTudor *self,
++                   FpiSsm                  *ssm)
+ {
+   /* The last word of the reply is the number of the next event */
+   if (self->reply->len >= 64)
+-    self->event_seq = get_u16le (self->reply->data + 62);
++    self->event_seq = tudor_get_u16le (self->reply->data + 62);
+   tudor_continue (self, ssm);
+ }
+ 
+@@ -1284,31 +1637,32 @@ tudor_event_config (FpiDeviceSynapticsTudor *self,
+ {
+   guint8 cmd[37] = { TUDOR_CMD_EVENT_CONFIG };
+ 
+-  put_u32le (cmd + 1, mask);
+-  put_u32le (cmd + 17, mask);
+-  put_u32le (cmd + 33, flag);
++  tudor_put_u32le (cmd + 1, mask);
++  tudor_put_u32le (cmd + 17, mask);
++  tudor_put_u32le (cmd + 33, flag);
+   self->after = after;
+   tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, event_config_done);
+ }
+ 
+ static void
+-event_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++event_read_done (FpiDeviceSynapticsTudor *self,
++                 FpiSsm                  *ssm)
+ {
+   const guint8 *r = self->reply->data;
+   gsize len = self->reply->len;
+-  guint count = len >= 4 ? get_u32le (r) : 0;
++  guint count = len >= 4 ? tudor_get_u32le (r) : 0;
+ 
+   /* Each event is a type, a number, a timestamp and flags */
+   for (guint i = 0; i < count && 4 + (i + 1) * TUDOR_EVENT_SIZE <= len; i++)
+     {
+       const guint8 *ev = r + 4 + i * TUDOR_EVENT_SIZE;
+-      guint type = get_u16le (ev);
++      guint type = tudor_get_u16le (ev);
+ 
+-      fp_dbg ("event type %u number %u flags 0x%08x", type, get_u16le (ev + 2),
+-              get_u32le (ev + 8));
++      fp_dbg ("event type %u number %u flags 0x%08x", type, tudor_get_u16le (ev + 2),
++              tudor_get_u32le (ev + 8));
+       if (type < 32)
+         self->event_seen |= 1u << type;
+-      if (type == TUDOR_EVENT_FRAME && (get_u32le (ev + 8) & TUDOR_EVENT_REJECT))
++      if (type == TUDOR_EVENT_FRAME && (tudor_get_u32le (ev + 8) & TUDOR_EVENT_REJECT))
+         self->event_reject = TRUE;
+     }
+   tudor_continue (self, ssm);
+@@ -1331,7 +1685,7 @@ tudor_event_read (FpiDeviceSynapticsTudor *self,
+ static void
+ tudor_pin_cb (FpiUsbTransfer *transfer,
+               FpDevice       *device,
+-              gpointer        user_data,
++              gpointer        user_data G_GNUC_UNUSED,
+               GError         *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+@@ -1370,11 +1724,14 @@ tudor_wait_event (FpiDeviceSynapticsTudor *self,
+   fpi_usb_transfer_fill_interrupt (transfer, TUDOR_EP_EVENT, 8);
+   transfer->ssm = ssm;
+   fpi_usb_transfer_submit (transfer, short_wait ? TUDOR_PIN_SHORT_MS : 0,
+-                           tudor_cancellable (self), tudor_pin_cb, NULL);
++                           fpi_device_get_cancellable (FP_DEVICE (self)),
++                           tudor_pin_cb, NULL);
+ }
+ 
+ static void
+-tudor_led (FpiDeviceSynapticsTudor *self, FpiSsm *ssm, const guint8 *pattern)
++tudor_led (FpiDeviceSynapticsTudor *self,
++           FpiSsm                  *ssm,
++           const guint8            *pattern)
+ {
+   tudor_send_cmd (self, ssm, pattern, 125, 4096, TUDOR_DECODE_CMD, NULL);
+ }
+@@ -1402,7 +1759,16 @@ enum {
+ };
+ 
+ static void
+-cap_pre_wait_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++tudor_finger_status (FpiDeviceSynapticsTudor *self,
++                     FpFingerStatusFlags      add,
++                     FpFingerStatusFlags      remove)
++{
++  fpi_device_report_finger_status_changes (FP_DEVICE (self), add, remove);
++}
++
++static void
++cap_pre_wait_done (FpiDeviceSynapticsTudor *self,
++                   FpiSsm                  *ssm)
+ {
+   /* Nothing pending means the finger is not down */
+   if (self->pin_timed_out)
+@@ -1412,7 +1778,8 @@ cap_pre_wait_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-cap_pre_off_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++cap_pre_off_done (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm)
+ {
+   gboolean down = self->event_seen & (1u << TUDOR_EVENT_FINGER_DOWN);
+   gboolean up = self->event_seen & (1u << TUDOR_EVENT_FINGER_UP);
+@@ -1425,16 +1792,23 @@ cap_pre_off_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-cap_up_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++cap_up_read_done (FpiDeviceSynapticsTudor *self,
++                  FpiSsm                  *ssm)
+ {
+   if (self->event_seen & (1u << TUDOR_EVENT_FINGER_UP))
+-    fpi_ssm_next_state (ssm);
++    {
++      tudor_finger_status (self, FP_FINGER_STATUS_NONE, FP_FINGER_STATUS_PRESENT);
++      fpi_ssm_next_state (ssm);
++    }
+   else
+-    fpi_ssm_jump_to_state (ssm, CAP_UP_WAIT);
++    {
++      fpi_ssm_jump_to_state (ssm, CAP_UP_WAIT);
++    }
+ }
+ 
+ static void
+-cap_acq_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++cap_acq_read_done (FpiDeviceSynapticsTudor *self,
++                   FpiSsm                  *ssm)
+ {
+   if (!(self->event_seen & (1u << TUDOR_EVENT_FRAME)))
+     {
+@@ -1442,11 +1816,13 @@ cap_acq_read_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+       return;
+     }
+   self->cap_rejected = self->event_reject;
++  tudor_finger_status (self, FP_FINGER_STATUS_PRESENT, FP_FINGER_STATUS_NEEDED);
+   fpi_ssm_next_state (ssm);
+ }
+ 
+ static void
+-cap_run_state (FpiSsm *ssm, FpDevice *device)
++cap_run_state (FpiSsm   *ssm,
++               FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -1472,6 +1848,8 @@ cap_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case CAP_UP_CONFIG:
++      /* The finger from the last capture is still down */
++      tudor_finger_status (self, FP_FINGER_STATUS_PRESENT, FP_FINGER_STATUS_NONE);
+       tudor_event_config (self, ssm, 1u << TUDOR_EVENT_FINGER_UP, 0, NULL);
+       break;
+ 
+@@ -1488,6 +1866,7 @@ cap_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case CAP_LED_WAIT:
++      tudor_finger_status (self, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_NONE);
+       tudor_led (self, ssm, led_wait);
+       break;
+ 
+@@ -1535,7 +1914,9 @@ cap_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-tudor_start_capture (FpiDeviceSynapticsTudor *self, FpiSsm *parent, guint8 acq_arg)
++tudor_start_capture (FpiDeviceSynapticsTudor *self,
++                     FpiSsm                  *parent,
++                     guint8                   acq_arg)
+ {
+   self->acq_arg = acq_arg;
+   fpi_ssm_start_subsm (parent, fpi_ssm_new (FP_DEVICE (self), cap_run_state, CAP_NUM_STATES));
+@@ -1552,7 +1933,8 @@ enum {
+ };
+ 
+ static void
+-clean_run_state (FpiSsm *ssm, FpDevice *device)
++clean_run_state (FpiSsm   *ssm,
++                 FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -1594,7 +1976,9 @@ clean_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-clean_done (FpiSsm *ssm, FpDevice *device, GError *error)
++clean_done (FpiSsm   *ssm,
++            FpDevice *device,
++            GError   *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+   GError *op_error = g_steal_pointer (&self->op_error);
+@@ -1608,10 +1992,14 @@ clean_done (FpiSsm *ssm, FpDevice *device, GError *error)
+ 
+ /* Passes the error on to finish once the sensor is back in a sane state */
+ static void
+-tudor_finish_op (FpiDeviceSynapticsTudor *self, GError *error, TudorFinishFunc finish)
++tudor_finish_op (FpiDeviceSynapticsTudor *self,
++                 GError                  *error,
++                 TudorFinishFunc          finish)
+ {
+-  /* A retry is not an error, the capture has already put things away */
+-  if ((!error && !self->enroll_begun) || (error && error->domain == FP_DEVICE_RETRY))
++  /* A retry is not an error, the capture has already put things away. A
++   * broken session cannot be cleaned up in. */
++  if ((!error && !self->enroll_begun) || (error && error->domain == FP_DEVICE_RETRY) ||
++      self->session_dead)
+     {
+       finish (self, error);
+       return;
+@@ -1626,6 +2014,9 @@ tudor_finish_op (FpiDeviceSynapticsTudor *self, GError *error, TudorFinishFunc f
+ /* Enroll */
+ 
+ enum {
++  EN_SLOTS,
++  EN_RECLAIM,
++  EN_SLOTS_AGAIN,
+   EN_BEGIN,
+   EN_CAPTURE,
+   EN_PROCESS,
+@@ -1636,65 +2027,112 @@ enum {
+   EN_NUM_STATES,
+ };
+ 
+-static guint8
+-tudor_subfactor (FpFinger finger)
+-{
+-  /* Left hand 6 to 10 and right hand 1 to 5 in Windows, the other way here */
+-  if (finger >= FP_FINGER_LEFT_THUMB && finger <= FP_FINGER_LEFT_LITTLE)
+-    return finger + 5;
+-  if (finger >= FP_FINGER_RIGHT_THUMB && finger <= FP_FINGER_RIGHT_LITTLE)
+-    return finger - 5;
+-  return 0;
+-}
+-
+ static void
+-put_tlv (GByteArray *out, guint16 type, const guint8 *data, guint32 len)
++put_tlv (GByteArray   *out,
++         guint16       type,
++         const guint8 *data,
++         guint32       len)
+ {
+-  guint8 head[6] = { type & 0xff, type >> 8 };
++  guint8 head[6];
+ 
+-  put_u32le (head + 2, len);
++  tudor_put_u16le (head, type);
++  tudor_put_u32le (head + 2, len);
+   g_byte_array_append (out, head, sizeof (head));
+   g_byte_array_append (out, data, len);
+ }
+ 
+ /* The command that stores the enrollment: a list of type, length, data
+- * with the template id, an identity (type 2 is a guid, a new one for each
+- * print so every print is a user of its own), the finger and a payload
+- * that is the guid and the finger like the vendor driver does. */
++ * with the template id, an identity (a new guid for each print so every
++ * print is a user of its own, with the libfprint user id behind it), the
++ * finger and a payload that is the guid and the finger like the vendor
++ * driver does. */
+ static GByteArray *
+-tudor_build_commit (FpiDeviceSynapticsTudor *self, FpPrint *print)
++tudor_build_commit (FpiDeviceSynapticsTudor *self,
++                    FpPrint                 *print)
+ {
+   g_autoptr(GByteArray) blob = g_byte_array_new ();
++  g_autofree gchar *user_id = fpi_print_generate_user_id (print);
+   GByteArray *cmd = g_byte_array_new ();
+-  guint8 identity[76] = { 2 };
++  guint8 identity[TUDOR_IDENTITY_SIZE] = { TUDOR_IDENTITY_GUID };
+   guint8 payload[17];
+   guint8 subfactor = tudor_subfactor (fp_print_get_finger (print));
+   guint8 head[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_COMMIT };
+ 
+-  for (guint i = 0; i < 16; i++)
+-    identity[4 + i] = g_random_int_range (0, 256);
++  /* Emulated devices need the same bytes every time */
++  if (!fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
++    {
++      for (guint i = 0; i < 16; i++)
++        identity[4 + i] = g_random_int_range (0, 256);
++    }
++  g_strlcpy ((gchar *) identity + TUDOR_IDENTITY_TEXT, user_id, TUDOR_IDENTITY_TEXT_MAX);
+ 
+-  put_tlv (blob, 0, self->template_id, TUDOR_DB2_ID_SIZE);
+-  put_tlv (blob, 1, identity, sizeof (identity));
+-  put_tlv (blob, 2, &subfactor, 1);
++  put_tlv (blob, TUDOR_TLV_TEMPLATE, self->template_id, TUDOR_DB2_ID_SIZE);
++  put_tlv (blob, TUDOR_TLV_IDENTITY, identity, sizeof (identity));
++  put_tlv (blob, TUDOR_TLV_SUBFACTOR, &subfactor, 1);
+   /* Same layout as the vendor driver: the guid and the finger */
+   memcpy (payload, identity + 4, 16);
+   payload[16] = subfactor;
+-  put_tlv (blob, 3, payload, sizeof (payload));
++  put_tlv (blob, TUDOR_TLV_PAYLOAD, payload, sizeof (payload));
+ 
+   /* Seven zero bytes, then the length of the list */
+-  put_u32le (head + 9, blob->len);
++  tudor_put_u32le (head + 9, blob->len);
+   g_byte_array_append (cmd, head, sizeof (head));
+   g_byte_array_append (cmd, blob->data, blob->len);
+   return cmd;
+ }
+ 
++static gboolean
++tudor_db_full (const TudorDbInfo *info)
++{
++  return info->users_available == 0 || info->templates_available == 0 ||
++         info->payloads_available == 0;
++}
++
++static void
++en_slots_done (FpiDeviceSynapticsTudor *self,
++               FpiSsm                  *ssm)
++{
++  GError *error = NULL;
++
++  tudor_parse_db_info (self, &error);
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (!tudor_db_full (&self->db_info))
++    fpi_ssm_jump_to_state (ssm, EN_BEGIN);
++  else if (self->db_info.users_deleted + self->db_info.templates_deleted +
++           self->db_info.payloads_deleted > 0)
++    fpi_ssm_next_state (ssm);
++  else
++    fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
++}
++
++static void
++en_slots_again_done (FpiDeviceSynapticsTudor *self,
++                     FpiSsm                  *ssm)
++{
++  GError *error = NULL;
++
++  tudor_parse_db_info (self, &error);
++  if (!error && tudor_db_full (&self->db_info))
++    error = fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL);
++  if (error)
++    fpi_ssm_mark_failed (ssm, error);
++  else
++    fpi_ssm_next_state (ssm);
++}
++
+ static void
+-en_add_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++en_add_done (FpiDeviceSynapticsTudor *self,
++             FpiSsm                  *ssm)
+ {
+   const guint8 *r = self->reply->data;
+   FpDevice *device = FP_DEVICE (self);
+-  guint stages;
++  guint16 mask;
++  guint stages = 0;
+   gboolean done = FALSE;
+ 
+   if (self->reply->len < 24)
+@@ -1707,8 +2145,9 @@ en_add_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+   /* Template id once done, then a mask of the captures taken and percent done */
+   for (guint i = 0; i < TUDOR_DB2_ID_SIZE; i++)
+     done |= r[i] != 0;
+-  stages = __builtin_popcount (get_u16le (r + 20));
+-  fp_dbg ("enroll %u captures, %u percent%s", stages, get_u16le (r + 22), done ? ", done" : "");
++  for (mask = tudor_get_u16le (r + 20); mask; mask >>= 1)
++    stages += mask & 1;
++  fp_dbg ("enroll %u captures, %u percent%s", stages, tudor_get_u16le (r + 22), done ? ", done" : "");
+ 
+   self->enroll_stages = stages;
+   fpi_device_enroll_progress (device, MIN (stages, TUDOR_ENROLL_STAGES), NULL, NULL);
+@@ -1717,20 +2156,41 @@ en_add_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+     {
+       memcpy (self->template_id, r, TUDOR_DB2_ID_SIZE);
+       fpi_ssm_next_state (ssm);
++      return;
+     }
+-  else
++
++  /* The sensor should be done after TUDOR_ENROLL_STAGES, but not forever */
++  if (++self->enroll_captures >= 3 * TUDOR_ENROLL_STAGES)
+     {
+-      fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                          "The sensor never finished the enrollment"));
++      return;
+     }
++  fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
+ }
+ 
+ static void
+-en_run_state (FpiSsm *ssm, FpDevice *device)
++en_run_state (FpiSsm   *ssm,
++              FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
++    case EN_SLOTS:
++      /* Better to know now than after seven touches */
++      tudor_send_db_info (self, ssm, en_slots_done);
++      break;
++
++    case EN_RECLAIM:
++      fp_info ("no free slots on the sensor, reclaiming deleted ones");
++      tudor_start_db_cleanup (ssm);
++      break;
++
++    case EN_SLOTS_AGAIN:
++      tudor_send_db_info (self, ssm, en_slots_again_done);
++      break;
++
+     case EN_BEGIN:
+       {
+         static const guint8 cmd[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_BEGIN };
+@@ -1775,11 +2235,7 @@ en_run_state (FpiSsm *ssm, FpDevice *device)
+       break;
+ 
+     case EN_DB_INFO:
+-      {
+-        static const guint8 cmd[] = { TUDOR_CMD_DB2_GET_DB_INFO, 0x01 };
+-
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
+-      }
++      tudor_send_db_info (self, ssm, NULL);
+       break;
+ 
+     case EN_END:
+@@ -1797,10 +2253,12 @@ en_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-enroll_finish (FpiDeviceSynapticsTudor *self, GError *error)
++enroll_finish (FpiDeviceSynapticsTudor *self,
++               GError                  *error)
+ {
+   FpDevice *device = FP_DEVICE (self);
+   FpPrint *print = NULL;
++  g_autofree gchar *user_id = NULL;
+ 
+   if (error)
+     {
+@@ -1809,12 +2267,16 @@ enroll_finish (FpiDeviceSynapticsTudor *self, GError *error)
+     }
+ 
+   fpi_device_get_enroll_data (device, &print);
+-  fpi_device_enroll_complete (device, g_object_ref (tudor_print_new (self, print, self->template_id)),
+-                              NULL);
++  user_id = fpi_print_generate_user_id (print);
++  fp_print_set_description (print, user_id);
++  fpi_device_enroll_complete (device, g_object_ref (tudor_print_new (print, self->template_id)),
++                             NULL);
+ }
+ 
+ static void
+-en_done (FpiSsm *ssm, FpDevice *device, GError *error)
++en_done (FpiSsm   *ssm,
++         FpDevice *device,
++         GError   *error)
+ {
+   tudor_finish_op (FPI_DEVICE_SYNAPTICS_TUDOR (device), error, enroll_finish);
+ }
+@@ -1825,6 +2287,7 @@ tudor_enroll (FpDevice *device)
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+   self->enroll_stages = 0;
++  self->enroll_captures = 0;
+   self->enroll_begun = FALSE;
+   fpi_ssm_start (fpi_ssm_new (device, en_run_state, EN_NUM_STATES), en_done);
+ }
+@@ -1839,7 +2302,8 @@ enum {
+ };
+ 
+ static void
+-id_done_cmd (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++id_done_cmd (FpiDeviceSynapticsTudor *self,
++             FpiSsm                  *ssm)
+ {
+   if (self->status == TUDOR_STATUS_OK && self->reply->len >= TUDOR_DB2_ID_SIZE)
+     {
+@@ -1861,7 +2325,8 @@ id_done_cmd (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-id_run_state (FpiSsm *ssm, FpDevice *device)
++id_run_state (FpiSsm   *ssm,
++              FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -1897,7 +2362,8 @@ id_run_state (FpiSsm *ssm, FpDevice *device)
+ }
+ 
+ static void
+-verify_finish (FpiDeviceSynapticsTudor *self, GError *error)
++verify_finish (FpiDeviceSynapticsTudor *self,
++               GError                  *error)
+ {
+   FpDevice *device = FP_DEVICE (self);
+   FpPrint *print = NULL;
+@@ -1925,7 +2391,8 @@ verify_finish (FpiDeviceSynapticsTudor *self, GError *error)
+ }
+ 
+ static void
+-identify_finish (FpiDeviceSynapticsTudor *self, GError *error)
++identify_finish (FpiDeviceSynapticsTudor *self,
++                 GError                  *error)
+ {
+   FpDevice *device = FP_DEVICE (self);
+   GPtrArray *gallery = NULL;
+@@ -1962,7 +2429,9 @@ identify_finish (FpiDeviceSynapticsTudor *self, GError *error)
+ }
+ 
+ static void
+-verify_done (FpiSsm *ssm, FpDevice *device, GError *error)
++verify_done (FpiSsm   *ssm,
++             FpDevice *device,
++             GError   *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -1972,7 +2441,9 @@ verify_done (FpiSsm *ssm, FpDevice *device, GError *error)
+ }
+ 
+ static void
+-identify_done (FpiSsm *ssm, FpDevice *device, GError *error)
++identify_done (FpiSsm   *ssm,
++               FpDevice *device,
++               GError   *error)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+ 
+@@ -1984,12 +2455,38 @@ identify_done (FpiSsm *ssm, FpDevice *device, GError *error)
+ static void
+ tudor_verify (FpDevice *device)
+ {
++  FpPrint *print = NULL;
++  guint8 id[TUDOR_DB2_ID_SIZE];
++
++  fpi_device_get_verify_data (device, &print);
++  if (!tudor_print_get_id (print, id))
++    {
++      fpi_device_verify_complete (device, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                                    "Print has no template id"));
++      return;
++    }
+   fpi_ssm_start (fpi_ssm_new (device, id_run_state, ID_NUM_STATES), verify_done);
+ }
+ 
+ static void
+ tudor_identify (FpDevice *device)
+ {
++  GPtrArray *gallery = NULL;
++  gboolean valid = FALSE;
++
++  fpi_device_get_identify_data (device, &gallery);
++  for (guint i = 0; i < gallery->len && !valid; i++)
++    {
++      guint8 id[TUDOR_DB2_ID_SIZE];
++
++      valid = tudor_print_get_id (g_ptr_array_index (gallery, i), id);
++    }
++  if (!valid)
++    {
++      fpi_device_identify_complete (device, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                                                      "No print in the gallery has a template id"));
++      return;
++    }
+   fpi_ssm_start (fpi_ssm_new (device, id_run_state, ID_NUM_STATES), identify_done);
+ }
+ 
+@@ -1999,16 +2496,35 @@ enum {
+   DEL_INFO,
+   DEL_CHECK,
+   DEL_DELETE,
++  DEL_CLEANUP,
+   DEL_NUM_STATES,
+ };
+ 
+ static void
+-del_info_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++del_info_done (FpiDeviceSynapticsTudor *self,
++               FpiSsm                  *ssm)
+ {
+   static const guint8 ones[TUDOR_DB2_ID_SIZE] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                                   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+   static const guint8 zeros[TUDOR_DB2_ID_SIZE] = { 0 };
+ 
++  if (self->status == TUDOR_STATUS_NOT_FOUND)
++    {
++      if (self->clearing)
++        fpi_ssm_mark_completed (ssm);
++      else
++        fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
++                                                            "Template not found"));
++      return;
++    }
++  if (self->status != TUDOR_STATUS_OK)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Object info failed with status 0x%04x",
++                                                          self->status));
++      return;
++    }
++
+   /* The user the template belongs to comes after a few bytes of header */
+   if (self->reply->len < 18 + TUDOR_DB2_ID_SIZE)
+     {
+@@ -2018,25 +2534,30 @@ del_info_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+     }
+ 
+   memcpy (self->user_id, self->reply->data + 18, TUDOR_DB2_ID_SIZE);
+-  fp_dbg ("template belongs to a user");
+   if (memcmp (self->user_id, ones, sizeof (ones)) == 0 ||
+       memcmp (self->user_id, zeros, sizeof (zeros)) == 0)
+     {
+-      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
+-                                                          "Template not found"));
++      if (self->clearing)
++        fpi_ssm_mark_completed (ssm);
++      else
++        fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
++                                                            "Template not found"));
+       return;
+     }
+-  fpi_ssm_next_state (ssm);
++  /* Clearing takes the whole user, a single delete first makes sure
++   * nothing else goes with it */
++  fpi_ssm_jump_to_state (ssm, self->clearing ? DEL_DELETE : DEL_CHECK);
+ }
+ 
+ /* Before deleting make sure the user has this one template and nothing
+  * else, since the delete takes everything below the user with it */
+ static void
+-del_check_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++del_check_done (FpiDeviceSynapticsTudor *self,
++                FpiSsm                  *ssm)
+ {
+   const guint8 *r = self->reply->data;
+ 
+-  if (self->reply->len < 2 + TUDOR_DB2_ID_SIZE || get_u16le (r) != 1 ||
++  if (self->reply->len < 2 + TUDOR_DB2_ID_SIZE || tudor_get_u16le (r) != 1 ||
+       memcmp (r + 2, self->template_id, TUDOR_DB2_ID_SIZE) != 0)
+     {
+       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+@@ -2048,14 +2569,16 @@ del_check_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
+ }
+ 
+ static void
+-del_delete_done (FpiDeviceSynapticsTudor *self, FpiSsm *ssm)
++del_delete_done (FpiDeviceSynapticsTudor *self,
++                 FpiSsm                  *ssm)
+ {
+-  fp_info ("deleted %u objects", self->reply->len >= 2 ? get_u16le (self->reply->data) : 0);
++  fp_dbg ("deleted %u objects", self->reply->len >= 2 ? tudor_get_u16le (self->reply->data) : 0);
+   fpi_ssm_next_state (ssm);
+ }
+ 
+ static void
+-del_run_state (FpiSsm *ssm, FpDevice *device)
++del_run_state (FpiSsm   *ssm,
++               FpDevice *device)
+ {
+   FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
+   guint8 cmd[5 + TUDOR_DB2_ID_SIZE] = { 0 };
+@@ -2066,7 +2589,8 @@ del_run_state (FpiSsm *ssm, FpDevice *device)
+       cmd[0] = TUDOR_CMD_DB2_OBJ_INFO;
+       cmd[1] = TUDOR_DB2_TYPE_TEMPLATE;
+       memcpy (cmd + 5, self->template_id, TUDOR_DB2_ID_SIZE);
+-      tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, del_info_done);
++      tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD_ANY_STATUS,
++                      del_info_done);
+       break;
+ 
+     case DEL_CHECK:
+@@ -2083,13 +2607,23 @@ del_run_state (FpiSsm *ssm, FpDevice *device)
+       tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, del_delete_done);
+       break;
+ 
++    case DEL_CLEANUP:
++      /* Clearing does one cleanup at the end */
++      if (self->clearing)
++        fpi_ssm_mark_completed (ssm);
++      else
++        tudor_start_db_cleanup (ssm);
++      break;
++
+     default:
+       g_assert_not_reached ();
+     }
+ }
+ 
+ static void
+-del_done (FpiSsm *ssm, FpDevice *device, GError *error)
++del_done (FpiSsm   *ssm,
++          FpDevice *device,
++          GError   *error)
+ {
+   fpi_device_delete_complete (device, error);
+ }
+@@ -2107,9 +2641,92 @@ tudor_delete (FpDevice *device)
+                                                                     "Print has no template id"));
+       return;
+     }
++  self->clearing = FALSE;
+   fpi_ssm_start (fpi_ssm_new (device, del_run_state, DEL_NUM_STATES), del_done);
+ }
+ 
++/* Clear storage: delete every template with the delete above */
++
++enum {
++  CLR_LIST,
++  CLR_NEXT,
++  CLR_DELETE,
++  CLR_CLEANUP,
++  CLR_NUM_STATES,
++};
++
++static void
++clr_run_state (FpiSsm   *ssm,
++               FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CLR_LIST:
++      {
++        guint8 cmd[21] = { TUDOR_CMD_DB2_OBJ_LIST, TUDOR_DB2_TYPE_TEMPLATE };
++
++        memset (cmd + 5, 0xff, TUDOR_DB2_ID_SIZE);
++        self->list_idx = 0;
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096,
++                        TUDOR_DECODE_CMD, list_templates_done);
++      }
++      break;
++
++    case CLR_NEXT:
++      if (self->list_idx >= self->template_ids->len)
++        {
++          fpi_ssm_jump_to_state (ssm, CLR_CLEANUP);
++          return;
++        }
++      memcpy (self->template_id,
++              g_bytes_get_data (g_ptr_array_index (self->template_ids, self->list_idx++), NULL),
++              TUDOR_DB2_ID_SIZE);
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case CLR_DELETE:
++      self->clearing = TRUE;
++      fpi_ssm_start_subsm (ssm, fpi_ssm_new (device, del_run_state, DEL_NUM_STATES));
++      break;
++
++    case CLR_CLEANUP:
++      /* DELETE came back around: next template, or the end */
++      if (self->list_idx < self->template_ids->len)
++        {
++          fpi_ssm_jump_to_state (ssm, CLR_NEXT);
++          return;
++        }
++      tudor_start_db_cleanup (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++clr_done (FpiSsm   *ssm,
++          FpDevice *device,
++          GError   *error)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  self->clearing = FALSE;
++  g_clear_pointer (&self->template_ids, g_ptr_array_unref);
++  fpi_device_clear_storage_complete (device, error);
++}
++
++static void
++tudor_clear_storage (FpDevice *device)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (device);
++
++  self->template_ids = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  fpi_ssm_start (fpi_ssm_new (device, clr_run_state, CLR_NUM_STATES), clr_done);
++}
++
+ /* Class */
+ 
+ static void
+@@ -2117,6 +2734,16 @@ fpi_device_synaptics_tudor_init (FpiDeviceSynapticsTudor *self)
+ {
+ }
+ 
++static void
++fpi_device_synaptics_tudor_finalize (GObject *object)
++{
++  FpiDeviceSynapticsTudor *self = FPI_DEVICE_SYNAPTICS_TUDOR (object);
++
++  g_clear_error (&self->open_error);
++  tudor_free_state (self);
++  G_OBJECT_CLASS (fpi_device_synaptics_tudor_parent_class)->finalize (object);
++}
++
+ static const FpIdEntry id_table[] = {
+   { .vid = 0x047d, .pid = 0x00f2, },   /* Kensington VeriMark DT */
+   { .vid = 0, .pid = 0, .driver_data = 0 },
+@@ -2125,8 +2752,11 @@ static const FpIdEntry id_table[] = {
+ static void
+ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+ {
++  GObjectClass *obj_class = G_OBJECT_CLASS (klass);
+   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+ 
++  obj_class->finalize = fpi_device_synaptics_tudor_finalize;
++
+   dev_class->id = "synaptics_tudor";
+   dev_class->full_name = "Synaptics Tudor Fingerprint Sensor";
+   dev_class->type = FP_DEVICE_TYPE_USB;
+@@ -2142,6 +2772,7 @@ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+   dev_class->verify = tudor_verify;
+   dev_class->identify = tudor_identify;
+   dev_class->delete = tudor_delete;
++  dev_class->clear_storage = tudor_clear_storage;
+ 
+   fpi_device_class_auto_initialize_features (dev_class);
+ }
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.h b/libfprint/drivers/synaptics_tudor/tudor.h
+index 056e23b2..0c19a5fc 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.h
++++ b/libfprint/drivers/synaptics_tudor/tudor.h
+@@ -1,5 +1,6 @@
+ /*
+  * Synaptics Tudor match-on-chip driver for libfprint
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -18,6 +19,7 @@
+ 
+ #pragma once
+ 
++#include <string.h>
+ #include <glib.h>
+ 
+ /* Vendor control requests (bmRequestType 0x40 out, 0xc0 in, wIndex 0) */
+@@ -28,7 +30,7 @@
+ #define TUDOR_REQ_TLS_STATE   0x14  /* in, two bytes, first one is 1 in a session */
+ #define TUDOR_REQ_SESSION_END 0x1b  /* out, no data, sent before the closing alert */
+ 
+-/* Commands the driver is allowed to send, see tudor_cmd_allowed() */
++/* Commands the driver is allowed to send, see tudor_cmd_allowed() in tudor.c */
+ #define TUDOR_CMD_GET_VERSION     0x01
+ #define TUDOR_CMD_GET_STARTINFO   0x19
+ #define TUDOR_CMD_LED_EX2         0x39
+@@ -46,7 +48,9 @@
+ #define TUDOR_CMD_IDENTIFY        0x99
+ #define TUDOR_CMD_DB2_OBJ_LIST    0x9f
+ #define TUDOR_CMD_DB2_OBJ_INFO    0xa0
++#define TUDOR_CMD_DB2_OBJ_DATA    0xa1
+ #define TUDOR_CMD_DB2_OBJ_DELETE  0xa3
++#define TUDOR_CMD_DB2_CLEANUP     0xa4
+ 
+ /* Sub commands of TUDOR_CMD_ENROLL */
+ #define TUDOR_ENROLL_BEGIN        0x01
+@@ -66,11 +70,12 @@
+ 
+ #define TUDOR_DB2_ID_SIZE         16
+ 
+-/* Status words (first two bytes of every response) that mean success */
++/* Status words, the first two bytes of every response. Nothing else was
++ * ever seen from firmware 10.1, the prototype for older firmware also took
++ * 0x0412 and 0x05cc as success. */
+ #define TUDOR_STATUS_OK           0x0000
+-#define TUDOR_STATUS_OK_412       0x0412
+-#define TUDOR_STATUS_OK_5CC       0x05cc
+ #define TUDOR_STATUS_NO_MATCH     0x0509
++#define TUDOR_STATUS_NOT_FOUND    0x0683  /* object info of an unknown id */
+ 
+ /* Certificate in the Synaptics format, 400 bytes */
+ #define TUDOR_CERT_SIZE           400
+@@ -109,5 +114,36 @@ typedef struct
+   guint16 payloads_available;
+ } TudorDbInfo;
+ 
+-gboolean tudor_cmd_allowed (const guint8 *cmd,
+-                            gsize         len);
++static inline guint16
++tudor_get_u16le (const guint8 *p)
++{
++  guint16 v;
++
++  memcpy (&v, p, sizeof (v));
++  return GUINT16_FROM_LE (v);
++}
++
++static inline guint32
++tudor_get_u32le (const guint8 *p)
++{
++  guint32 v;
++
++  memcpy (&v, p, sizeof (v));
++  return GUINT32_FROM_LE (v);
++}
++
++static inline void
++tudor_put_u16le (guint8  *p,
++                 guint16  v)
++{
++  v = GUINT16_TO_LE (v);
++  memcpy (p, &v, sizeof (v));
++}
++
++static inline void
++tudor_put_u32le (guint8  *p,
++                 guint32  v)
++{
++  v = GUINT32_TO_LE (v);
++  memcpy (p, &v, sizeof (v));
++}
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_led.h b/libfprint/drivers/synaptics_tudor/tudor_led.h
+index 061eaafd..c0fe289f 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor_led.h
++++ b/libfprint/drivers/synaptics_tudor/tudor_led.h
+@@ -1,5 +1,6 @@
+ /*
+  * Synaptics Tudor match-on-chip driver for libfprint
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
+  * LED patterns as sent by the vendor driver, 125 bytes each
+  *
+  * This library is free software; you can redistribute it and/or
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.c b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+index 6e5b27e3..3cb6c2e6 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor_tls.c
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.c
+@@ -1,5 +1,6 @@
+ /*
+  * Synaptics Tudor match-on-chip driver for libfprint
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
+  * TLS 1.2 client as spoken by the sensor (not standard compliant)
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -15,6 +16,12 @@
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ * This is a small TLS 1.2 client written by hand because libssl cannot talk
++ * to the sensor. Its hello has no compression field and no extension
++ * length, certificates are not X.509, signatures must be exactly 70 bytes
++ * and the key block uses the random values in a non-standard order. Only
++ * OpenSSL primitives are used.
+  */
+ 
+ #define FP_COMPONENT "synaptics_tudor"
+@@ -132,33 +139,113 @@ struct _TudorTls
+   gboolean     established;
+ };
+ 
+-static void
+-set_ssl_error (GError **error, const char *what)
++static void set_ssl_error (GError    **error,
++                           const char *what);
++
++/* Emulation and unit tests: with a seed every random value, key and
++ * signature nonce comes out the same each time. Block n of the stream is
++ * SHA-256 (seed, n as 8 bytes big endian). */
++static gboolean det_on;
++static guint8 det_seed[32];
++static guint64 det_counter;
++
++void
++tudor_tls_set_seed (const guint8 seed[32])
+ {
+-  gulong code = ERR_get_error ();
+-  char buf[128] = "no details";
++  det_on = seed != NULL;
++  det_counter = 0;
++  if (seed)
++    memcpy (det_seed, seed, sizeof (det_seed));
++}
+ 
+-  if (code)
+-    ERR_error_string_n (code, buf, sizeof (buf));
+-  ERR_clear_error ();
+-  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "%s: %s", what, buf);
++static gboolean
++tls_random (guint8 *buf,
++            gsize   len)
++{
++  if (!det_on)
++    return RAND_bytes (buf, len) == 1;
++
++  while (len > 0)
++    {
++      guint8 in[sizeof (det_seed) + 8];
++      guint8 block[32];
++      gsize n = MIN (len, sizeof (block));
++
++      memcpy (in, det_seed, sizeof (det_seed));
++      for (int i = 0; i < 8; i++)
++        in[sizeof (det_seed) + i] = det_counter >> (56 - 8 * i);
++      det_counter++;
++      if (EVP_Digest (in, sizeof (in), block, NULL, EVP_sha256 (), NULL) != 1)
++        return FALSE;
++      memcpy (buf, block, n);
++      buf += n;
++      len -= n;
++    }
++  return TRUE;
++}
++
++static EVP_PKEY *
++tls_new_ec_key (GError **error)
++{
++  EVP_PKEY *key;
++
++  if (det_on)
++    {
++      guint8 secret[32];
++
++      if (!tls_random (secret, sizeof (secret)))
++        {
++          set_ssl_error (error, "Could not get random bytes");
++          return NULL;
++        }
++      key = tudor_key_import (secret, error);
++      OPENSSL_cleanse (secret, sizeof (secret));
++      return key;
++    }
++
++  key = EVP_PKEY_Q_keygen (NULL, NULL, "EC", "P-256");
++  if (!key)
++    set_ssl_error (error, "Could not generate key");
++  return key;
+ }
+ 
++/* RFC 6979 nonces when seeded, ECDSA is random otherwise */
+ static void
+-put_u16le (guint8 *p, guint16 v)
++tls_set_sign_params (EVP_PKEY_CTX *pctx,
++                     gboolean      set_digest)
+ {
+-  p[0] = v & 0xff;
+-  p[1] = v >> 8;
++  unsigned int nonce_type = 1;
++  char md_name[] = "SHA256";
++  OSSL_PARAM params[3];
++  int n = 0;
++
++  if (!det_on)
++    return;
++
++  /* A prehashed sign has no digest set, the nonce still needs one */
++  if (set_digest)
++    params[n++] = OSSL_PARAM_construct_utf8_string (OSSL_SIGNATURE_PARAM_DIGEST, md_name, 0);
++  params[n++] = OSSL_PARAM_construct_uint (OSSL_SIGNATURE_PARAM_NONCE_TYPE, &nonce_type);
++  params[n] = OSSL_PARAM_construct_end ();
++  EVP_PKEY_CTX_set_params (pctx, params);
+ }
+ 
+-static guint16
+-get_u16le (const guint8 *p)
++static void
++set_ssl_error (GError    **error,
++               const char *what)
+ {
+-  return p[0] | (p[1] << 8);
++  gulong code = ERR_get_error ();
++  char buf[128] = "no details";
++
++  if (code)
++    ERR_error_string_n (code, buf, sizeof (buf));
++  ERR_clear_error ();
++  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "%s: %s", what, buf);
+ }
+ 
+ static void
+-put_u24be (guint8 *p, gsize v)
++put_u24be (guint8 *p,
++           gsize   v)
+ {
+   p[0] = (v >> 16) & 0xff;
+   p[1] = (v >> 8) & 0xff;
+@@ -166,21 +253,25 @@ put_u24be (guint8 *p, gsize v)
+ }
+ 
+ static void
+-put_u16be (guint8 *p, guint16 v)
++put_u16be (guint8  *p,
++           guint16  v)
+ {
+   p[0] = v >> 8;
+   p[1] = v & 0xff;
+ }
+ 
+ static void
+-put_u64be (guint8 *p, guint64 v)
++put_u64be (guint8  *p,
++           guint64  v)
+ {
+   for (int i = 7; i >= 0; i--, v >>= 8)
+     p[i] = v & 0xff;
+ }
+ 
+ static void
+-reverse_copy (guint8 *dst, const guint8 *src, gsize len)
++reverse_copy (guint8       *dst,
++              const guint8 *src,
++              gsize         len)
+ {
+   for (gsize i = 0; i < len; i++)
+     dst[i] = src[len - 1 - i];
+@@ -229,13 +320,16 @@ tls_prf (const EVP_MD *md,
+           memcpy (a, next, a_len);
+         }
+     }
++  OPENSSL_cleanse (a, sizeof (a));
++  OPENSSL_cleanse (block, sizeof (block));
+   return TRUE;
+ }
+ 
+ /* Pairing certs */
+ 
+ static EVP_PKEY *
+-pubkey_from_point (const guint8 *point, GError **error)
++pubkey_from_point (const guint8 *point,
++                   GError      **error)
+ {
+   g_autoptr(EVP_PKEY_CTX) ctx = NULL;
+   EVP_PKEY *pkey = NULL;
+@@ -260,11 +354,12 @@ pubkey_from_point (const guint8 *point, GError **error)
+ }
+ 
+ EVP_PKEY *
+-tudor_cert_get_pubkey (const guint8 cert[TUDOR_CERT_SIZE], GError **error)
++tudor_cert_get_pubkey (const guint8  cert[TUDOR_CERT_SIZE],
++                       GError      **error)
+ {
+   guint8 point[65];
+ 
+-  if (get_u16le (cert) != CERT_MAGIC || get_u16le (cert + 2) != CERT_CURVE_P256)
++  if (tudor_get_u16le (cert) != CERT_MAGIC || tudor_get_u16le (cert + 2) != CERT_CURVE_P256)
+     {
+       g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                            "Unexpected certificate format");
+@@ -280,17 +375,14 @@ tudor_cert_get_pubkey (const guint8 cert[TUDOR_CERT_SIZE], GError **error)
+ EVP_PKEY *
+ tudor_cert_new_host_key (GError **error)
+ {
+-  EVP_PKEY *key = EVP_PKEY_Q_keygen (NULL, NULL, "EC", "P-256");
+-
+-  if (!key)
+-    set_ssl_error (error, "Could not generate host key");
+-  return key;
++  return tls_new_ec_key (error);
+ }
+ 
+ /* Private key from its 32 byte big endian number, wrapped in a bare SEC1
+  * structure so openssl works out the public point on its own */
+ EVP_PKEY *
+-tudor_key_import (const guint8 secret[32], GError **error)
++tudor_key_import (const guint8  secret[32],
++                  GError      **error)
+ {
+   static const guint8 sec1_head[] = { 0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20 };
+   static const guint8 sec1_tail[] = {
+@@ -306,13 +398,24 @@ tudor_key_import (const guint8 secret[32], GError **error)
+ 
+   key = d2i_PrivateKey (EVP_PKEY_EC, NULL, &p, sizeof (der));
+   OPENSSL_cleanse (der, sizeof (der));
++
++  /* Zero and numbers past the group order are not keys */
++  if (key)
++    {
++      g_autoptr(EVP_PKEY_CTX) check = EVP_PKEY_CTX_new (key, NULL);
++
++      if (!check || EVP_PKEY_private_check (check) != 1)
++        g_clear_pointer (&key, EVP_PKEY_free);
++    }
+   if (!key)
+     set_ssl_error (error, "Could not load private key");
+   return key;
+ }
+ 
+ gboolean
+-tudor_key_export (EVP_PKEY *key, guint8 secret[32], GError **error)
++tudor_key_export (EVP_PKEY *key,
++                  guint8    secret[32],
++                  GError  **error)
+ {
+   BIGNUM *d = NULL;
+   gboolean ok = EVP_PKEY_get_bn_param (key, OSSL_PKEY_PARAM_PRIV_KEY, &d) &&
+@@ -342,14 +445,18 @@ hs_key_new (GError **error)
+   reverse_copy (secret, prf, 32);
+   key = tudor_key_import (secret, error);
+   OPENSSL_cleanse (secret, sizeof (secret));
++  OPENSSL_cleanse (prf, sizeof (prf));
+   return key;
+ }
+ 
+ gboolean
+-tudor_cert_make_host (EVP_PKEY *host_key, guint8 cert[TUDOR_CERT_SIZE], GError **error)
++tudor_cert_make_host (EVP_PKEY *host_key,
++                      guint8    cert[TUDOR_CERT_SIZE],
++                      GError  **error)
+ {
+   g_autoptr(EVP_PKEY) hs_key = NULL;
+   g_autoptr(EVP_MD_CTX) md = NULL;
++  EVP_PKEY_CTX *pctx = NULL;
+   guint8 point[65];
+   gsize point_len = 0;
+   guint8 sig[CERT_SIG_MAX];
+@@ -364,8 +471,8 @@ tudor_cert_make_host (EVP_PKEY *host_key, guint8 cert[TUDOR_CERT_SIZE], GError *
+     }
+ 
+   memset (cert, 0, TUDOR_CERT_SIZE);
+-  put_u16le (cert, CERT_MAGIC);
+-  put_u16le (cert + 2, CERT_CURVE_P256);
++  tudor_put_u16le (cert, CERT_MAGIC);
++  tudor_put_u16le (cert + 2, CERT_CURVE_P256);
+   reverse_copy (cert + CERT_OFF_X, point + 1, 32);
+   reverse_copy (cert + CERT_OFF_Y, point + 33, 32);
+ 
+@@ -375,18 +482,64 @@ tudor_cert_make_host (EVP_PKEY *host_key, guint8 cert[TUDOR_CERT_SIZE], GError *
+ 
+   md = EVP_MD_CTX_new ();
+   if (!md ||
+-      EVP_DigestSignInit (md, NULL, EVP_sha256 (), NULL, hs_key) <= 0 ||
++      EVP_DigestSignInit (md, &pctx, EVP_sha256 (), NULL, hs_key) <= 0 ||
++      (tls_set_sign_params (pctx, FALSE), FALSE) ||
+       EVP_DigestSign (md, sig, &sig_len, cert, CERT_SIGNED_SIZE) <= 0)
+     {
+       set_ssl_error (error, "Could not sign host certificate");
+       return FALSE;
+     }
+ 
+-  put_u16le (cert + CERT_OFF_SIGLEN, sig_len);
++  tudor_put_u16le (cert + CERT_OFF_SIGLEN, sig_len);
+   memcpy (cert + CERT_OFF_SIG, sig, sig_len);
+   return TRUE;
+ }
+ 
++gboolean
++tudor_pairing_encode (EVP_PKEY     *host_key,
++                      const guint8  host_cert[TUDOR_CERT_SIZE],
++                      const guint8  dev_cert[TUDOR_CERT_SIZE],
++                      guint8        out[TUDOR_PAIRING_SIZE],
++                      GError      **error)
++{
++  gsize magic = sizeof (TUDOR_PAIRING_MAGIC) - 1;
++
++  memcpy (out, TUDOR_PAIRING_MAGIC, magic);
++  if (!tudor_key_export (host_key, out + magic, error))
++    {
++      OPENSSL_cleanse (out, TUDOR_PAIRING_SIZE);
++      return FALSE;
++    }
++  memcpy (out + magic + 32, host_cert, TUDOR_CERT_SIZE);
++  memcpy (out + magic + 32 + TUDOR_CERT_SIZE, dev_cert, TUDOR_CERT_SIZE);
++  return TRUE;
++}
++
++EVP_PKEY *
++tudor_pairing_decode (const guint8  *data,
++                      gsize          len,
++                      guint8         host_cert[TUDOR_CERT_SIZE],
++                      guint8         dev_cert[TUDOR_CERT_SIZE],
++                      GError       **error)
++{
++  gsize magic = sizeof (TUDOR_PAIRING_MAGIC) - 1;
++  EVP_PKEY *key;
++
++  if (len != TUDOR_PAIRING_SIZE || memcmp (data, TUDOR_PAIRING_MAGIC, magic) != 0)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Malformed pairing data");
++      return NULL;
++    }
++
++  key = tudor_key_import (data + magic, error);
++  if (!key)
++    return NULL;
++  memcpy (host_cert, data + magic + 32, TUDOR_CERT_SIZE);
++  memcpy (dev_cert, data + magic + 32 + TUDOR_CERT_SIZE, TUDOR_CERT_SIZE);
++  return key;
++}
++
+ gboolean
+ tudor_cert_verify_sensor (const guint8 cert[TUDOR_CERT_SIZE],
+                           guint8       fw_major,
+@@ -398,7 +551,7 @@ tudor_cert_verify_sensor (const guint8 cert[TUDOR_CERT_SIZE],
+   g_autoptr(EVP_PKEY) key = NULL;
+   g_autoptr(EVP_MD_CTX) md = NULL;
+   guint8 point[65];
+-  guint16 sig_len = get_u16le (cert + CERT_OFF_SIGLEN);
++  guint16 sig_len = tudor_get_u16le (cert + CERT_OFF_SIGLEN);
+ 
+   for (gsize i = 0; i < G_N_ELEMENTS (sensor_keys); i++)
+     {
+@@ -452,13 +605,19 @@ tudor_tls_new (EVP_PKEY    *host_key,
+ {
+   TudorTls *tls = g_new0 (TudorTls, 1);
+ 
++  tls->hs_hash = EVP_MD_CTX_new ();
++  if (!tls->hs_hash || EVP_DigestInit_ex (tls->hs_hash, EVP_sha256 (), NULL) != 1)
++    {
++      ERR_clear_error ();
++      tudor_tls_free (tls);
++      return NULL;
++    }
++
+   EVP_PKEY_up_ref (host_key);
+   EVP_PKEY_up_ref (sensor_pubkey);
+   tls->host_key = host_key;
+   tls->sensor_pubkey = sensor_pubkey;
+   memcpy (tls->host_cert, host_cert, TUDOR_CERT_SIZE);
+-  tls->hs_hash = EVP_MD_CTX_new ();
+-  EVP_DigestInit_ex (tls->hs_hash, EVP_sha256 (), NULL);
+   return tls;
+ }
+ 
+@@ -482,7 +641,9 @@ tudor_tls_is_established (TudorTls *tls)
+ }
+ 
+ static void
+-add_record_header (GByteArray *out, guint8 type, gsize len)
++add_record_header (GByteArray *out,
++                   guint8      type,
++                   gsize       len)
+ {
+   guint8 hdr[5] = { type, TLS_VERSION_HI, TLS_VERSION_LO, len >> 8, len & 0xff };
+ 
+@@ -490,7 +651,10 @@ add_record_header (GByteArray *out, guint8 type, gsize len)
+ }
+ 
+ static void
+-add_handshake (GByteArray *out, guint8 type, const guint8 *body, gsize len)
++add_handshake (GByteArray   *out,
++               guint8        type,
++               const guint8 *body,
++               gsize         len)
+ {
+   guint8 hdr[4] = { type };
+ 
+@@ -500,7 +664,8 @@ add_handshake (GByteArray *out, guint8 type, const guint8 *body, gsize len)
+ }
+ 
+ GByteArray *
+-tudor_tls_client_hello (TudorTls *tls)
++tudor_tls_client_hello (TudorTls  *tls,
++                        GError   **error)
+ {
+   /* No compression methods and no length on the extensions, the
+    * sensor wants it that way */
+@@ -512,13 +677,17 @@ tudor_tls_client_hello (TudorTls *tls)
+     0x00, 0x0b, 0x00, 0x02, 0x01, 0x00
+   };
+   g_autoptr(GByteArray) body = g_byte_array_new ();
+-  GByteArray *out = g_byte_array_new ();
++  g_autoptr(GByteArray) hs = g_byte_array_new ();
++  GByteArray *out;
+   guint8 sess_id[8] = { 7 };
+   guint8 ver[2] = { TLS_VERSION_HI, TLS_VERSION_LO };
+   guint8 no_comp = 0;
+-  GByteArray *hs = g_byte_array_new ();
+ 
+-  RAND_bytes (tls->client_random, sizeof (tls->client_random));
++  if (!tls_random (tls->client_random, sizeof (tls->client_random)))
++    {
++      set_ssl_error (error, "Could not get random bytes");
++      return NULL;
++    }
+ 
+   g_byte_array_append (body, ver, sizeof (ver));
+   g_byte_array_append (body, tls->client_random, sizeof (tls->client_random));
+@@ -528,11 +697,15 @@ tudor_tls_client_hello (TudorTls *tls)
+   g_byte_array_append (body, exts, sizeof (exts));
+ 
+   add_handshake (hs, HS_CLIENT_HELLO, body->data, body->len);
+-  EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len);
++  if (EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len) != 1)
++    {
++      set_ssl_error (error, "Could not hash the hello");
++      return NULL;
++    }
+ 
++  out = g_byte_array_new ();
+   add_record_header (out, TLS_HANDSHAKE, hs->len);
+   g_byte_array_append (out, hs->data, hs->len);
+-  g_byte_array_unref (hs);
+ 
+   tls->sent_hello = TRUE;
+   return out;
+@@ -555,7 +728,7 @@ gcm_seal (const guint8 *key,
+   int n, total;
+   gsize start;
+ 
+-  if (!ctx || RAND_bytes (nonce, sizeof (nonce)) != 1)
++  if (!ctx || !tls_random (nonce, sizeof (nonce)))
+     return FALSE;
+ 
+   memcpy (iv, salt, GCM_SALT_SIZE);
+@@ -677,7 +850,9 @@ take_record (const guint8 **data,
+ /* The sensor only takes signatures of exactly 70 bytes, a DER sequence of
+  * two 32 byte integers, with no extra zero byte when the top bit is set */
+ static gboolean
+-sig_to_fixed (const guint8 *der, gsize der_len, guint8 out[70])
++sig_to_fixed (const guint8 *der,
++              gsize         der_len,
++              guint8        out[70])
+ {
+   const guint8 *p = der;
+   ECDSA_SIG *sig = d2i_ECDSA_SIG (NULL, &p, der_len);
+@@ -758,8 +933,13 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+       return NULL;
+     }
+ 
+-  /* Whole record goes into the transcript as it came */
+-  EVP_DigestUpdate (tls->hs_hash, payload, payload_len);
++  /* Whole record goes into the transcript as it came, after a failure the
++   * object must not be used again */
++  if (!snap || EVP_DigestUpdate (tls->hs_hash, payload, payload_len) != 1)
++    {
++      set_ssl_error (error, "Could not hash the server hello");
++      return NULL;
++    }
+ 
+   for (gsize off = 0; off < payload_len;)
+     {
+@@ -787,7 +967,7 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+               goto proto;
+             memcpy (tls->server_random, m + 2, RANDOM_SIZE);
+             sid_len = m[2 + RANDOM_SIZE];
+-            if (mlen < 2 + RANDOM_SIZE + 1 + sid_len + 3)
++            if (sid_len > 32 || mlen < (gsize) 2 + RANDOM_SIZE + 1 + sid_len + 3)
+               goto proto;
+             suite = (m[3 + RANDOM_SIZE + sid_len] << 8) | m[4 + RANDOM_SIZE + sid_len];
+             if (suite != SUITE_ECDH_ECDSA_AES256_GCM_SHA384)
+@@ -831,9 +1011,10 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+   add_handshake (hs, HS_CERTIFICATE, cert_body->data, cert_body->len);
+ 
+   /* Client key exchange is just the ephemeral point */
+-  eph = EVP_PKEY_Q_keygen (NULL, NULL, "EC", "P-256");
+-  if (!eph ||
+-      !EVP_PKEY_get_octet_string_param (eph, OSSL_PKEY_PARAM_PUB_KEY,
++  eph = tls_new_ec_key (error);
++  if (!eph)
++    return NULL;
++  if (!EVP_PKEY_get_octet_string_param (eph, OSSL_PKEY_PARAM_PUB_KEY,
+                                         point, sizeof (point), &point_len) ||
+       point_len != sizeof (point))
+     {
+@@ -853,12 +1034,17 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+     }
+ 
+   /* Certificate verify signs the digest so far as it is */
+-  EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len);
+-  EVP_MD_CTX_copy_ex (snap, tls->hs_hash);
+-  EVP_DigestFinal_ex (snap, digest, &dlen);
++  if (EVP_DigestUpdate (tls->hs_hash, hs->data, hs->len) != 1 ||
++      EVP_MD_CTX_copy_ex (snap, tls->hs_hash) != 1 ||
++      EVP_DigestFinal_ex (snap, digest, &dlen) != 1)
++    {
++      set_ssl_error (error, "Could not hash the handshake");
++      return NULL;
++    }
+ 
+   sctx = EVP_PKEY_CTX_new (tls->host_key, NULL);
+   if (!sctx || EVP_PKEY_sign_init (sctx) <= 0 ||
++      (tls_set_sign_params (sctx, TRUE), FALSE) ||
+       EVP_PKEY_sign (sctx, sig, &sig_len, digest, dlen) <= 0)
+     {
+       set_ssl_error (error, "Could not sign handshake");
+@@ -874,7 +1060,11 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+         return NULL;
+       }
+     add_handshake (hs, HS_CERT_VERIFY, fixed, sizeof (fixed));
+-    EVP_DigestUpdate (tls->hs_hash, hs->data + before, hs->len - before);
++    if (EVP_DigestUpdate (tls->hs_hash, hs->data + before, hs->len - before) != 1)
++      {
++        set_ssl_error (error, "Could not hash the handshake");
++        return NULL;
++      }
+   }
+ 
+   add_record_header (flight, TLS_HANDSHAKE, hs->len);
+@@ -896,8 +1086,12 @@ tudor_tls_handle_server_hello (TudorTls     *tls,
+   memcpy (tls->c_salt, block + 64, GCM_SALT_SIZE);
+   memcpy (tls->s_salt, block + 64 + GCM_SALT_SIZE, GCM_SALT_SIZE);
+ 
+-  EVP_MD_CTX_copy_ex (snap, tls->hs_hash);
+-  EVP_DigestFinal_ex (snap, digest, &dlen);
++  if (EVP_MD_CTX_copy_ex (snap, tls->hs_hash) != 1 ||
++      EVP_DigestFinal_ex (snap, digest, &dlen) != 1)
++    {
++      set_ssl_error (error, "Could not hash the handshake");
++      return NULL;
++    }
+   if (!tls_prf (EVP_sha384 (), master, sizeof (master), "client finished",
+                 digest, dlen, verify, VERIFY_SIZE) ||
+       !tls_prf (EVP_sha384 (), master, sizeof (master), "server finished",
+@@ -939,10 +1133,33 @@ proto:
+   return NULL;
+ }
+ 
++/* Alerts that mean the sensor does not accept our certificate, as opposed
++ * to a record that got garbled on the way */
++static gboolean
++alert_is_rejection (guint8 desc)
++{
++  switch (desc)
++    {
++    case 40: /* handshake_failure */
++    case 42: /* bad_certificate */
++    case 43: /* unsupported_certificate */
++    case 44: /* certificate_revoked */
++    case 45: /* certificate_expired */
++    case 46: /* certificate_unknown */
++    case 48: /* unknown_ca */
++    case 49: /* access_denied */
++      return TRUE;
++
++    default:
++      return FALSE;
++    }
++}
++
+ gboolean
+ tudor_tls_handle_server_finished (TudorTls     *tls,
+                                   const guint8 *data,
+                                   gsize         len,
++                                  gboolean     *rejected,
+                                   GError      **error)
+ {
+   const guint8 *payload;
+@@ -957,8 +1174,17 @@ tudor_tls_handle_server_finished (TudorTls     *tls,
+       return FALSE;
+     }
+ 
++  *rejected = FALSE;
+   if (!take_record (&data, &len, &type, &payload, &payload_len, error))
+     return FALSE;
++  if (type == TLS_ALERT && payload_len == 2)
++    {
++      *rejected = payload[0] == 2 && alert_is_rejection (payload[1]);
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Sensor sent TLS alert level %u description %u",
++                   payload[0], payload[1]);
++      return FALSE;
++    }
+   if (type != TLS_CCS || payload_len != 1 || payload[0] != 1)
+     {
+       g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+@@ -994,7 +1220,9 @@ tudor_tls_handle_server_finished (TudorTls     *tls,
+ }
+ 
+ GByteArray *
+-tudor_tls_wrap (TudorTls *tls, const guint8 *data, gsize len)
++tudor_tls_wrap (TudorTls     *tls,
++                const guint8 *data,
++                gsize         len)
+ {
+   g_autoptr(GByteArray) frag = g_byte_array_new ();
+   GByteArray *out;
+@@ -1012,7 +1240,10 @@ tudor_tls_wrap (TudorTls *tls, const guint8 *data, gsize len)
+ }
+ 
+ GByteArray *
+-tudor_tls_unwrap (TudorTls *tls, const guint8 *data, gsize len, GError **error)
++tudor_tls_unwrap (TudorTls     *tls,
++                  const guint8 *data,
++                  gsize         len,
++                  GError      **error)
+ {
+   const guint8 *payload;
+   gsize payload_len;
+@@ -1023,6 +1254,12 @@ tudor_tls_unwrap (TudorTls *tls, const guint8 *data, gsize len, GError **error)
+ 
+   if (!take_record (&data, &len, &type, &payload, &payload_len, error))
+     return NULL;
++  if (len != 0)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "More than one TLS record in the reply");
++      return NULL;
++    }
+ 
+   if (type != TLS_APPDATA && type != TLS_ALERT)
+     {
+diff --git a/libfprint/drivers/synaptics_tudor/tudor_tls.h b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+index 50b671e3..f6da0c26 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor_tls.h
++++ b/libfprint/drivers/synaptics_tudor/tudor_tls.h
+@@ -1,5 +1,6 @@
+ /*
+  * Synaptics Tudor match-on-chip driver for libfprint
++ * Copyright (C) 2026 Lars Grahmann <lars.grahmann@googlemail.com>
+  * TLS 1.2 client as spoken by the sensor (not standard compliant)
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -35,13 +36,17 @@ typedef struct _TudorTls TudorTls;
+ #define TUDOR_TLS_RECORD_ALERT     21
+ #define TUDOR_TLS_RECORD_APPDATA   23
+ 
++/* With a seed all random values come out the same each time, for emulated
++ * devices and the unit tests. NULL goes back to real randomness. */
++void tudor_tls_set_seed (const guint8 seed[32]);
++
+ /* Pairing certificates */
+ EVP_PKEY *tudor_cert_new_host_key (GError **error);
+ EVP_PKEY *tudor_key_import (const guint8 secret[32],
+-                           GError     **error);
++                            GError     **error);
+ gboolean  tudor_key_export (EVP_PKEY *key,
+-                           guint8    secret[32],
+-                           GError  **error);
++                            guint8    secret[32],
++                            GError  **error);
+ gboolean  tudor_cert_make_host (EVP_PKEY    *host_key,
+                                 guint8       cert[TUDOR_CERT_SIZE],
+                                 GError     **error);
+@@ -53,13 +58,30 @@ gboolean  tudor_cert_verify_sensor (const guint8 cert[TUDOR_CERT_SIZE],
+ EVP_PKEY *tudor_cert_get_pubkey (const guint8 cert[TUDOR_CERT_SIZE],
+                                  GError     **error);
+ 
++/* The pairing as it is kept on disk: magic, host key secret, host cert and
++ * sensor cert */
++#define TUDOR_PAIRING_MAGIC "TUDORPAIR1"
++#define TUDOR_PAIRING_SIZE  (sizeof (TUDOR_PAIRING_MAGIC) - 1 + 32 + 2 * TUDOR_CERT_SIZE)
++
++gboolean  tudor_pairing_encode (EVP_PKEY    *host_key,
++                                const guint8 host_cert[TUDOR_CERT_SIZE],
++                                const guint8 dev_cert[TUDOR_CERT_SIZE],
++                                guint8       out[TUDOR_PAIRING_SIZE],
++                                GError     **error);
++EVP_PKEY *tudor_pairing_decode (const guint8 *data,
++                                gsize         len,
++                                guint8        host_cert[TUDOR_CERT_SIZE],
++                                guint8        dev_cert[TUDOR_CERT_SIZE],
++                                GError      **error);
++
+ /* Session */
+ TudorTls *tudor_tls_new (EVP_PKEY    *host_key,
+                          const guint8 host_cert[TUDOR_CERT_SIZE],
+                          EVP_PKEY    *sensor_pubkey);
+ void      tudor_tls_free (TudorTls *tls);
+ 
+-GByteArray *tudor_tls_client_hello (TudorTls *tls);
++GByteArray *tudor_tls_client_hello (TudorTls  *tls,
++                                    GError   **error);
+ GByteArray *tudor_tls_handle_server_hello (TudorTls     *tls,
+                                            const guint8 *data,
+                                            gsize         len,
+@@ -67,6 +89,7 @@ GByteArray *tudor_tls_handle_server_hello (TudorTls     *tls,
+ gboolean    tudor_tls_handle_server_finished (TudorTls     *tls,
+                                               const guint8 *data,
+                                               gsize         len,
++                                              gboolean     *rejected,
+                                               GError      **error);
+ gboolean    tudor_tls_is_established (TudorTls *tls);
+ 

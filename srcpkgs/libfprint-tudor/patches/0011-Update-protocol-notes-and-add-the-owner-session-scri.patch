@@ -1,0 +1,298 @@
+From ace5740ca5ce22fff9edbb02a3f0d45434dc705b Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:20:38 +0100
+Subject: [PATCH 11/15] Update protocol notes and add the owner session script
+ (not for upstream)
+
+---
+ PROTOCOL.md                     | 154 +++++++++++++++++++++-----------
+ examples/tudor-owner-session.sh |  59 ++++++++++++
+ 2 files changed, 161 insertions(+), 52 deletions(-)
+ create mode 100755 examples/tudor-owner-session.sh
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 19de4413..17646284 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -48,8 +48,10 @@ in-session commands.
+ ### Reply format
+ 
+ Cleartext commands and in-session commands: 2 byte little endian status,
+-then payload. Seen as success: 0x0000 (0x0412 and 0x05cc come from the
+-prototype). TLS_DATA (0x44) replies are raw TLS records with no status.
++then payload. Success is 0x0000. Seen otherwise on this firmware: 0x0509
++(identify, no match) and 0x0683 (object info of an id the sensor does not
++have). The prototype for older firmware also took 0x0412 and 0x05cc as
++success, never seen here and not accepted by the driver. TLS_DATA (0x44) replies are raw TLS records with no status.
+ 
+ Right after a previous session ended without a close_notify (process
+ killed), the first command gets an encrypted TLS alert record
+@@ -69,22 +71,24 @@ Opcodes as seen on the wire. Names come from the vendor driver's own log
+ | 0x9e | DB2_GET_DB_INFO | `01` | 38 bytes payload, see below |
+ | 0x9f | DB2_GET_OBJECT_LIST | type u8, 3 zero bytes, parent id (16) | count u16, then ids (16 each) |
+ 
+-Seen in the Windows traces but not sent by this driver (not needed to get
+-a session): 0x8e IOTA_FIND (`8e <id u16> 02 00 + zeros`, ids 0x09 and
+-0x1a, 26 and 78 byte replies), 0xaf (`af 01 00 00 00`, 10 byte reply,
+-unknown), 0x19 GET_STARTINFO (68 byte reply), 0x82 FRAME_STATE_GET.
+-
+-### Opcode names for 0x9d..0xa4
+-
+-The task description had 0x9d GET_DB_INFO, 0x9e OBJECT_LIST, 0x9f
+-OBJECT_INFO, 0xa0 OBJECT_DATA. The live vendor driver log disagrees: the
+-command that goes out as 0x9e is logged as DB2_GET_DB_INFO and 0x9f as
+-DB2_GET_OBJECT_LIST, the same as proto.txt in the prototype repo. So the
+-numbering from proto.txt (0x9e info, 0x9f list, 0xa0 object info, 0xa1
+-object data, 0xa3 delete or cleanup, 0xa5 format) looks right and the
+-0x9d-0xa4 table is shifted by one. The driver only sends 0x9e and 0x9f
+-and refuses everything else, see tudor_cmd_allowed(). Nothing from 0xa0
+-upwards is ever sent, so the safety rules hold under either numbering.
++The driver also sends what the vendor driver sends around an open: 0x8e
++IOTA_FIND (`8e <id u16> 02 00 + zeros`, ids 0x09 and 0x1a, 26 and 78 byte
++replies), 0xaf (`af 01 00 00 00`, 10 byte reply, unknown), 0x19
++GET_STARTINFO (68 byte reply), 0x82 FRAME_STATE_GET. Whether the session
++needs them was never tried without, see "Open points". The capture and enroll
++commands are below, the db2 ones in the table above and under "Storage".
++
++### Opcode names for the db2 commands
++
++0x9e DB2_GET_DB_INFO, 0x9f GET_OBJECT_LIST, 0xa0 GET_OBJECT_INFO, 0xa1
++GET_OBJECT_DATA, 0xa2 WRITE_OBJECT, 0xa3 DELETE_OBJECT, 0xa4 CLEANUP, 0xa5
++FORMAT. The first four are confirmed by the traces. 0xa4 and 0xa5 are from
++the vendor driver binary (synaWudfBioUsb132.dll 6.0.11.1132): its log name
++switch maps opcode - 1 through a jump table to the names, and the function
++logged as tudorCmdCleanup builds `a4 <partition>` itself. Cleanup is not in
++any trace because the traces went through the emulation's own storage.
++tudor_cmd_allowed() in the driver lets through the commands listed under
++"Safety", nothing from 0xa2 and 0xa5 on, ever.
+ 
+ ### GET_VERSION reply (38 bytes with status)
+ 
+@@ -137,18 +141,36 @@ db info twice and the object lists (cross-identify.trace).
+ The driver keeps host key (32 bytes), countersigned host cert and sensor
+ cert per sensor in `$FP_TUDOR_PAIRING_DIR` or
+ `/var/lib/fprint/synaptics_tudor/<sensor id>.pairing` (file 0600,
+-directory 0700), see tudor_pairing_load/save/forget in tudor.c. If the
+-handshake with the stored pairing fails the file is dropped and the
+-sensor is paired again (all the old templates are lost then).
+-
+-Upstream question: libfprint has no per-device persistent data API, so
+-this is a private file next to fprintd's. A proper API would be better.
+-
+-Seen in the reused-pairing trace and not used yet: after the template list
+-the Windows driver lists the payloads of a template (`9f 03 ..`), asks
+-object info (`a0 03 <payload id>`) and reads the data (`a1 03 <payload
+-id>`, reply starts with the same type/length/data list as the commit).
+-That is the missing read command, it would give list real prints.
++directory 0700), see tudor_pairing_* in tudor.c and tudor_tls.c.
++
++Rules the driver follows: the directory must be writable before the sensor
++is paired, a failed save fails the open. The stored pairing is only given
++up when the handshake ends in a plaintext fatal alert about the certificate
++(handshake_failure, bad_certificate and relatives, never seen so far), the
++file then moves to `<id>.pairing.old` and the sensor is paired again with a
++warning. A garbled reply, a bad tag or a timeout never touch the file. A
++first pairing of a sensor that was paired before (Windows, a lost file)
++makes its templates unusable and is only logged as a warning.
++
++Upstream question, for the issue: libfprint has no per-device persistent
++data API, and no driver touches the file system. Options: (a) a small core
++API for driver state with the directory from STATE_DIRECTORY (fprintd's unit
++sets it) or a meson option, (b) a driver-local file under a meson
++`-Dstate_dir`, with the env override allowed only in emulation mode (the env
++var is a development aid here), (c) derive the host key from the sensor id
++and a built-in secret, which removes the file but makes the pairing public.
++
++Emulation mode (FP_DEVICE_EMULATION, tests only): no pairing file is read
++or written, all randomness comes from a fixed seed (tudor_tls_set_seed),
++ECDSA uses RFC 6979 nonces, so a recording replays byte for byte. The
++recording itself needs a sensor that is paired from scratch, see
++tests/synaptics_tudor/README.md.
++
++After the template list the Windows driver lists the payloads of a
++template (`9f 03 00 00 00 <template id>`), asks object info (`a0 03 00 00
++00 <payload id>`) and reads the data (`a1 03 00 00 00 <payload id>`). List
++does the same, see "Storage". On a sensor with 3 templates only the one
++enrolled by the Windows driver had a payload below it.
+ 
+ ### Certificate format (400 bytes)
+ 
+@@ -174,8 +196,19 @@ public key.
+ HS key: P-256 private key, derived as the TLS 1.2 PRF (SHA-256) with
+ secret `717cd72d0962bc4a2846138dbb2c2419`, label `HS_KEY_PAIR_GEN`, seed
+ `2512a76407065f383846139d4bec2033aaaa`, first 32 bytes read as a little
+-endian integer. The constants come from the Windows driver. Upstream may
+-not like shipping them, needs a decision.
++endian integer.
++
++Origin of the constants, as far as it can be shown. The label
++`HS_KEY_PAIR_GEN` and both sensor public points are static data in the
++vendor driver binary (synaWudfBioUsb132.dll 6.0.11.1132, the points at file
++offsets 0x1355f3 and 0x1357f9). The 16 byte secret and the 18 byte seed are
++NOT stored as a contiguous byte string in either vendor DLL, so they came
++from the earlier reverse engineering notes (the python prototype) or from
++observation at run time. The author has to state which before this goes
++upstream, and that no vendor code was copied. Nothing here is a secret of
++the sensor: the host signing key is what makes the sensor accept any host,
++the same way for every VeriMark of this firmware. Only firmware 10.1 is
++covered.
+ 
+ Sensor keys are known for firmware 10.1 with and without the key flag
+ (public points are embedded in tudor_tls.c, from the prototype's .tsk
+@@ -303,11 +336,16 @@ length (u32), data:
+ | 3 | payload, 17 bytes in Windows: the guid and the finger |
+ 
+ The driver makes a new random guid per print so each print is a user of
+-its own, and puts the libfprint user id string in the payload (cut at 64
+-bytes, whether the sensor takes other sizes than 17 is untested).
++its own. The payload is 17 bytes like Windows (guid and finger). The
++libfprint user id string ("FP1-date-finger-random-username", zero
++terminated) is stored in the identity, behind the type word and the guid:
++the identity is always 76 bytes, bytes 20 to 75 are free, so at most 55
++characters (about 31 for the user name). The sensor was never shown to
++accept a non-zero tail there, the first run of the owner session decides.
++Prints enrolled before have a zero tail and are listed without user name.
+ 
+ The Windows driver also asks DB info between commit and end, the driver
+-now does too. The payload is 17 bytes like Windows (guid and finger).
++does too.
+ 
+ DB info after an enroll: users, templates and payloads all go up by one.
+ 
+@@ -333,34 +371,41 @@ match, nothing else in the reply. LED success or failure after it.
+ 
+ ### Storage and the print mapping
+ 
+-The sensor only gives the payload back inside an identify reply, so the
+-template to print mapping (username, finger) cannot be listed without a
+-finger. Nothing in the trace reads an object's data (0xa1 in proto.txt).
+-The driver treats the template id as the print: prints carry the id as
+-data, verify and identify compare the id the sensor reports to the one in
+-the print, list gives one print per template without username or finger.
++DB info counts users, templates and payloads as current, deleted and
++available. A delete only raises "deleted", nothing is reclaimed until the
++cleanup `a4 <n>` runs, n being the object type (1 users, 2 templates, 3
++payloads). The vendor driver runs all three right after a delete. Without
++it a sensor runs dry: the owner's sensor sat at 1 template, 10 deleted, 0
++available. The driver checks DB info before an enroll, reclaims when
++something deleted is there and otherwise fails with DATA_FULL, and does
++the cleanup after each delete. Cleanup is untested on hardware until the
++owner session ran.
++
++The reply to `a1 03 00 00 00 <payload id>` is a reserved u16, the u32
++length and then the list of entries the commit had (template id, identity,
++finger, payload). Prints carry the template id as data, verify and
++identify compare the id the sensor reports to it. List reads the payload of
++each template to fill in finger and, if the identity carries one, the user
++id string.
+ 
+ ## Safety
+ 
+-tudor_cmd_allowed() lets through only commands seen in the traces: the
+-ones for open and listing above, LED, events, frame acquire and finish,
+-enroll 0x96 01..04, identify, object info on templates and the delete of a
+-user. The driver never sends bootloader patch, peek/poke, provision,
+-ownership commands, storage writes or formats, request 0x15, or anything
+-else not seen in the traces.
++tudor_cmd_allowed() lets through only: the commands for open and listing
++above, LED, events, frame acquire and finish, enroll 0x96 01..04, identify,
++object info on templates and payloads, object data on payloads, the delete
++of a user and the cleanup of partitions 1 to 3. The driver never sends
++bootloader patch, peek/poke, provision, ownership commands, storage writes
++or formats, request 0x15, or anything else.
+ 
+ ## Unknowns
+ 
+ - Meaning of request 0x19/0x1a (a probe the Windows driver always does),
+   0x1b (session end).
+ - Opcode 0xaf (`af 01 00 00 00`, 10 byte reply, after the status `0de2a15901ffffff`).
+-- How to read a payload object (data command not in any trace) and which
+-  object the payload hangs below (listing it below the templates gave
+-  nothing for the owner's templates).
+ - The ff bytes in the object info reply and the fields after the user id.
+ - Meaning of the FRAME_ACQ argument, of the 0x3c in the enroll reply and of
+   the other fields in the identify reply.
+-- Status values other than 0.
++- Status values other than 0, 0x0509 and 0x0683.
+ - The 32 byte signature scheme of the countersigned host cert, and whether
+   the sensor checks anything in the junk bytes of the Certificate message.
+ - Whether other firmware versions use other TLS details. Only 10.1 tested.
+@@ -369,7 +414,12 @@ else not seen in the traces.
+ 
+ ## Open points for the hardware test
+ 
+-- Does the sensor take payloads other than 17 bytes.
++- Does the sensor take a non-zero tail in the identity (user id string).
++- Does the open need the IOTA, af and startinfo probes and the database
++  read, or only version, pairing and TLS. Try without, then identify.
++- Does cleanup change anything but the deleted counters.
++- Duplicate check: does identify work inside an open enroll session.
++- Labelled rejects (too short, off centre, wet) to map retry reasons.
+ - Is the user id offset in the object info reply right (the driver
+   refuses to delete unless the parent filter query agrees).
+ - What a rejected capture does in an enroll.
+diff --git a/examples/tudor-owner-session.sh b/examples/tudor-owner-session.sh
+new file mode 100755
+index 00000000..b4d6b978
+--- /dev/null
++++ b/examples/tudor-owner-session.sh
+@@ -0,0 +1,59 @@
++#!/bin/sh
++# One terminal session for everything that needs a finger (not for upstream).
++# Run it from the libfprint-tudor checkout after building with ninja -C build.
++#
++# It stops fprintd while it runs (sudo, polkit and the lock use the password
++# meanwhile) and always gives the sensor back, also when it fails or is
++# interrupted. It only deletes the one print it enrolls itself. Logs go to
++# ~/.cache/tudor-traces/owner-session/.
++#
++# Fingers: the TEST finger is the LEFT INDEX finger, which must not be
++# enrolled on the sensor. The USUAL finger is one that already is.
++# Needs 7 touches for the enroll, about 20 touches all in all.
++
++set -u
++
++root=$(cd "$(dirname "$0")/.." && pwd)
++bin=$root/build/examples/tudor-session
++devmode=/usr/local/libexec/velarium/tudor-devmode
++logdir=$HOME/.cache/tudor-traces/owner-session
++stamp=$(date +%Y%m%d-%H%M%S)
++
++[ -x "$bin" ] || { echo "build first: ninja -C build"; exit 1; }
++mkdir -p "$logdir"
++
++restore() {
++    sudo -n "$devmode" off >/dev/null 2>&1 || sudo "$devmode" off
++    echo "sensor given back to fprintd"
++}
++trap restore EXIT
++trap 'exit 130' INT TERM
++
++sudo "$devmode" on || exit 1
++export FP_TUDOR_PAIRING_DIR=$HOME/.cache/tudor-pairing
++export G_MESSAGES_DEBUG=all
++
++echo "Step 1 of 3: read only checks, do not touch the sensor"
++env G_MESSAGES_DEBUG=all "$bin" 2> "$logdir/$stamp-readonly.debug" | tee "$logdir/$stamp-readonly.log"
++
++echo
++echo "Step 2 of 3: an enroll that dies half way, nothing to touch"
++echo "  If the sensor has no free slots this reclaims the deleted ones first (the"
++echo "  vendor cleanup), that is wanted and shows in the log."
++env G_MESSAGES_DEBUG=all "$bin" --abandon-enroll 2> "$logdir/$stamp-abandon.debug" | tee "$logdir/$stamp-abandon.log"
++
++echo
++echo "Step 3 of 3: finger tests. You will be told which finger and when."
++echo "  TEST finger  = LEFT INDEX (must not be enrolled yet)"
++echo "  USUAL finger = a finger that is enrolled already"
++printf "Press enter to start, ctrl-c to stop: "
++read -r _
++
++env G_MESSAGES_DEBUG=all "$bin" --finger-tests 2> "$logdir/$stamp-fingers.debug" | tee "$logdir/$stamp-fingers.log"
++grep -q "^PASSED" "$logdir/$stamp-fingers.log"
++rc=$?
++
++echo
++echo "Logs are in $logdir, files starting with $stamp"
++echo "Send back: $stamp-fingers.log and $stamp-fingers.debug"
++exit $rc

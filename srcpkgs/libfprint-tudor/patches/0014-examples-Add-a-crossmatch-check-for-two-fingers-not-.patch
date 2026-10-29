@@ -1,0 +1,51 @@
+From 6c3939a217b25ff8f4a2a4876ff7948427183b17 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 18:36:33 +0100
+Subject: [PATCH 14/15] examples: Add a crossmatch check for two fingers (not
+ for upstream)
+
+---
+ examples/tudor-crossmatch.sh | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+ create mode 100755 examples/tudor-crossmatch.sh
+
+diff --git a/examples/tudor-crossmatch.sh b/examples/tudor-crossmatch.sh
+new file mode 100755
+index 00000000..ccaeeb9b
+--- /dev/null
++++ b/examples/tudor-crossmatch.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++# Does the sensor confuse two fingers? Enrolls a temporary print on one
++# finger, then identifies five times with another, enrolled finger, and
++# deletes the temporary print again (not for upstream).
++root=$(dirname "$(readlink -f "$0")")/..
++ex=$root/build/examples
++devmode=/usr/local/libexec/velarium/tudor-devmode
++logdir=$HOME/.cache/tudor-traces/owner-session
++mkdir -p "$logdir"
++log=$logdir/$(date +%Y%m%d-%H%M%S)-crossmatch.log
++export FP_TUDOR_PAIRING_DIR=$HOME/.cache/tudor-pairing
++
++restore() { sudo -n "$devmode" off >/dev/null 2>&1 || sudo "$devmode" off; }
++trap restore EXIT
++trap 'exit 130' INT TERM
++sudo "$devmode" on || exit 1
++
++echo ">>> RIGHT MIDDLE finger for this whole first part: enroll (touch, lift, repeat),"
++echo "    then one touch for VERIFY and one for IDENTIFY"
++"$ex/tudor-test" --keep 2>/dev/null | tee -a "$log" | grep -E 'ENROLL|VERIFY|IDENTIFY|enrolled|result|tudor-template'
++new=$(grep -o 'tudor-template-[0-9a-f]*' "$log" | sort | uniq -c | awk '$1==2{print $2}' | head -1)
++echo "temporary print: ${new:-unknown}" | tee -a "$log"
++
++for i in 1 2 3 4 5; do
++    echo ">>> $i/5: touch ONCE with your LEFT INDEX"
++    "$ex/tudor-match" 2>/dev/null | grep 'identify result' | tee -a "$log"
++done
++
++if [ -n "$new" ]; then
++    "$ex/tudor-delete" "$new" 2>/dev/null | tee -a "$log"
++else
++    echo "could not tell which print was new, not deleting anything" | tee -a "$log"
++fi
++echo "log: $log"
