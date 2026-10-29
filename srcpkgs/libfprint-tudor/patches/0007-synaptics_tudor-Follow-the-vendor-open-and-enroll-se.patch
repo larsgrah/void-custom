@@ -1,7 +1,7 @@
 From 0a5cf2d32b725acbfe8a6e95a8a89b639c3e73d1 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 16:53:23 +0100
-Subject: [PATCH 07/15] synaptics_tudor: Follow the vendor open and enroll
+Subject: [PATCH 07/20] synaptics_tudor: Follow the vendor open and enroll
  sequence exactly
 
 A template enrolled in one session did not match in a later one. Open

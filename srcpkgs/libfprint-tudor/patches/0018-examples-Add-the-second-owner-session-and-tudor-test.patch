@@ -1,0 +1,243 @@
+From fdd85989ae132c84276e21aeab3ba10f231092ad Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 19:40:18 +0100
+Subject: [PATCH 18/20] examples: Add the second owner session and tudor-test
+ --enroll-only (not for upstream)
+
+---
+ PROTOCOL.md                      |  26 +++++-
+ examples/tudor-owner-session2.sh | 147 +++++++++++++++++++++++++++++++
+ examples/tudor-test.c            |  15 +++-
+ 3 files changed, 185 insertions(+), 3 deletions(-)
+ create mode 100755 examples/tudor-owner-session2.sh
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 78eb23d1..61ac1b11 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -418,8 +418,30 @@ or formats, request 0x15, or anything else.
+ - Does the open need the IOTA, af and startinfo probes and the database
+   read, or only version, pairing and TLS. Try without, then identify.
+ - Does cleanup change anything but the deleted counters.
+-- Duplicate check: does identify work inside an open enroll session.
+-- Labelled rejects (too short, off centre, wet) to map retry reasons.
++- Duplicate check: the driver identifies once before the enroll (extra
++  touch, tested by tudor-owner-session2.sh part A). The vendor trace has
++  no command for it: the engine's CheckForDuplicate in synaFpAdapter132.dll
++  calls the same internal identify as verify and expects NO_MATCH, but
++  cross-enroll.trace shows no 0x99 between the last 0x96 02 and the
++  commit. The only host side duplicate check seen (identity already in
++  the record store, WINBIO_E_DUPLICATE_ENROLLMENT) is keyed by identity,
++  not by finger. Whether identify works inside an open enroll session is
++  still untested, it would save the extra touch.
++- Rejects: the frame event only has bit 31 of the flags, nothing else was
++  ever set. The vendor "reject detail 0x7" is WinBio POOR_QUALITY, a
++  constant for a flagged frame, so too short / off centre cannot be told
++  apart and the driver says RETRY_GENERAL. A very short tap was accepted
++  by the sensor (owner session 1, B8). Part B of the second session logs
++  the flags of odd touches.
++- A 0x96 02 reply whose capture mask did not grow (cross-enroll.trace has
++  one, mask 3 twice) is a capture the sensor took without using. The driver
++  reports it as a retry, not a stage.
++- Open sequence: FP_TUDOR_OPEN_TRIM=1..4 (dev knob) drops, cumulatively,
++  the second probe pass, the iota/af/startinfo probes, the database read
++  and the frame state. Open plus list works at all four levels with the
++  kept pairing (read-only test). Identify and enroll after a trimmed open
++  are part C of the second session. The vendor sequence stays until that
++  passes.
+ - Is the user id offset in the object info reply right (the driver
+   refuses to delete unless the parent filter query agrees).
+ - What a rejected capture does in an enroll.
+diff --git a/examples/tudor-owner-session2.sh b/examples/tudor-owner-session2.sh
+new file mode 100755
+index 00000000..8369e918
+--- /dev/null
++++ b/examples/tudor-owner-session2.sh
+@@ -0,0 +1,147 @@
++#!/bin/bash
++# Second owner session (not for upstream). Run it from the libfprint-tudor
++# checkout after ninja -C build. It answers three open questions:
++#   A  does enrolling an enrolled finger fail with a duplicate error (F1)
++#   B  what does the sensor say about rejected touches (F6)
++#   C  do identify and enroll still work with a trimmed open sequence (R6)
++#
++# Fingers: LEFT INDEX is the one enrolled on the sensor (tudor-template-400e9955),
++# RIGHT MIDDLE is the test finger and must not be enrolled. About 28 touches.
++#
++# fprintd is stopped while this runs (dev mode, sudo and the lock use the
++# password meanwhile) and always given back, also on ctrl-c. The script only
++# deletes prints that were not on the sensor when it started, found by diffing
++# the list, so everything it deletes it created itself. Logs go to
++# ~/.cache/tudor-traces/owner-session/.
++set -u
++
++root=$(dirname "$(readlink -f "$0")")/..
++ex=$root/build/examples
++devmode=/usr/local/libexec/velarium/tudor-devmode
++logdir=$HOME/.cache/tudor-traces/owner-session
++stamp=$(date +%Y%m%d-%H%M%S)
++log=$logdir/$stamp-session2.log
++base=$logdir/$stamp-session2.baseline
++mkdir -p "$logdir"
++export FP_TUDOR_PAIRING_DIR=$HOME/.cache/tudor-pairing
++
++[ -x "$ex/tudor-test" ] || { echo "build first: ninja -C build"; exit 1; }
++
++# print names, one per line (descriptions have no spaces)
++names() { "$ex/tudor-list" 2>/dev/null | sed -n 's/^  //p' | sort; }
++# names on the sensor now that were not there at the start
++created() { names | grep -vxFf "$base"; }
++
++delete_created() {
++    local n
++    for n in $(created); do
++        echo "deleting $n, made by this session" | tee -a "$log"
++        "$ex/tudor-delete" "$n" 2>/dev/null | tee -a "$log"
++    done
++}
++
++restore() {
++    [ -s "$base" ] && delete_created
++    sudo -n "$devmode" off >/dev/null 2>&1 || sudo "$devmode" off
++    echo "sensor given back to fprintd"
++}
++trap restore EXIT
++trap 'exit 130' INT TERM
++
++sudo "$devmode" on || exit 1
++
++names > "$base"
++if [ ! -s "$base" ]; then
++    echo "could not read the print list or the sensor is empty, not going on"
++    exit 1
++fi
++{
++    echo "prints on the sensor at the start:"
++    sed 's/^/  /' "$base"
++} | tee -a "$log"
++pass=0
++fail=0
++result() {
++    if [ "$1" = ok ]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
++    echo "RESULT $1: $2" | tee -a "$log"
++}
++
++# runs a test program with the driver debug output in its own file
++run() { # name, command...
++    local name=$1
++    shift
++    G_MESSAGES_DEBUG=all "$@" 2>&1 | tee "$logdir/$stamp-session2-$name.debug" |
++        grep -vE 'DEBUG|^\(process' | tee -a "$log"
++}
++
++echo
++echo "=== A: duplicate check ==="
++echo ">>> Touch your LEFT INDEX once. The enroll should be refused right after"
++echo "    that touch. If it asks for more touches the check did not work, then"
++echo "    keep touching with the LEFT INDEX until it is over."
++run dup "$ex/tudor-test" --keep --enroll-only
++if grep -q "already enrolled" "$logdir/$stamp-session2-dup.debug" && [ -z "$(created)" ]; then
++    result ok "duplicate refused and nothing new stored"
++else
++    result FAIL "duplicate not refused or something new was stored (cleaned up below)"
++fi
++delete_created
++
++echo
++echo "=== B: rejected touches, with the RIGHT MIDDLE ==="
++echo ">>> One print gets enrolled. The first touch is the duplicate check, then"
++echo "    come the seven enroll touches. Lift between all of them. Do these:"
++echo "      touch 1: normal"
++echo "      touch 2: normal"
++echo "      touch 3: only the very tip of the finger"
++echo "      touch 4: normal"
++echo "      touch 5: barely touching, very light"
++echo "      touch 6: normal"
++echo "      touch 7: finger at the far left edge of the sensor"
++echo "    after that normal touches until it says enrolled. Then one touch for"
++echo "    VERIFY and one for IDENTIFY (normal)."
++run reject "$ex/tudor-test" --keep
++echo "retries the driver reported:" | tee -a "$log"
++grep -E "retry:" "$logdir/$stamp-session2-reject.debug" | sort | uniq -c | tee -a "$log"
++echo "frame event flags seen (a set top bit is a reject):" | tee -a "$log"
++grep -o "event type 24 number [0-9]* flags 0x[0-9a-f]*" "$logdir/$stamp-session2-reject.debug" |
++    awk '{print $NF}' | sort | uniq -c | tee -a "$log"
++if grep -q "^enrolled" "$logdir/$stamp-session2-reject.debug"; then
++    result ok "enroll with odd touches finished"
++else
++    result FAIL "enroll with odd touches did not finish"
++fi
++delete_created
++
++echo
++echo "=== C: trimmed open sequence (FP_TUDOR_OPEN_TRIM=4) ==="
++echo ">>> Touch your LEFT INDEX once, it should be found."
++run trim-identify env FP_TUDOR_OPEN_TRIM=4 "$ex/tudor-match"
++if grep -q "identify result: tudor-template-400e9955" "$logdir/$stamp-session2-trim-identify.debug"; then
++    result ok "identify after the trimmed open found the left index"
++else
++    result FAIL "identify after the trimmed open did not find the left index"
++fi
++echo ">>> RIGHT MIDDLE now: enroll it (touch once for the duplicate check, then"
++echo "    seven normal touches), then one touch for VERIFY and one for IDENTIFY."
++run trim-enroll env FP_TUDOR_OPEN_TRIM=4 "$ex/tudor-test" --keep
++if grep -q "^enrolled" "$logdir/$stamp-session2-trim-enroll.debug" &&
++    grep -q "verify result: match" "$logdir/$stamp-session2-trim-enroll.debug" &&
++    grep -q "identify result: found the print" "$logdir/$stamp-session2-trim-enroll.debug"; then
++    result ok "enroll, verify and identify after the trimmed open"
++else
++    result FAIL "enroll, verify or identify failed after the trimmed open"
++fi
++delete_created
++
++echo
++echo "prints on the sensor at the end (should be the start list):"
++names | sed 's/^/  /' | tee -a "$log"
++if [ -z "$(created)" ] && [ "$(names)" = "$(cat "$base")" ]; then
++    echo "list is as it was at the start" | tee -a "$log"
++else
++    echo "LIST DIFFERS from the start, look at $log" | tee -a "$log"
++fi
++echo "$pass ok, $fail failed" | tee -a "$log"
++echo "Send back: $stamp-session2.log and the $stamp-session2-*.debug files in $logdir"
++[ "$fail" = 0 ]
+diff --git a/examples/tudor-test.c b/examples/tudor-test.c
+index f2c88d3c..0625a313 100644
+--- a/examples/tudor-test.c
++++ b/examples/tudor-test.c
+@@ -68,7 +68,8 @@ count_prints (FpDevice *dev)
+ int
+ main (int argc, char **argv)
+ {
+-  gboolean keep = argc > 1 && g_strcmp0 (argv[1], "--keep") == 0;
++  gboolean keep = FALSE;
++  gboolean enroll_only = FALSE;
+   g_autoptr(FpContext) ctx = fp_context_new ();
+   g_autoptr(GError) error = NULL;
+   g_autoptr(FpPrint) template = NULL;
+@@ -81,6 +82,12 @@ main (int argc, char **argv)
+   guint before, after;
+   gboolean matched = FALSE;
+ 
++  for (int i = 1; i < argc; i++)
++    {
++      keep |= g_strcmp0 (argv[i], "--keep") == 0;
++      enroll_only |= g_strcmp0 (argv[i], "--enroll-only") == 0;
++    }
++
+   for (guint i = 0; devices && i < devices->len; i++)
+     {
+       FpDevice *d = g_ptr_array_index (devices, i);
+@@ -120,6 +127,12 @@ main (int argc, char **argv)
+   if (before != G_MAXUINT && after != before + 1)
+     g_printerr ("Expected one more print, not going on to delete\n");
+ 
++  if (enroll_only)
++    {
++      ok = TRUE;
++      goto out;
++    }
++
+   for (int tries = 0; tries < 5; tries++)
+     {
+       g_clear_error (&error);

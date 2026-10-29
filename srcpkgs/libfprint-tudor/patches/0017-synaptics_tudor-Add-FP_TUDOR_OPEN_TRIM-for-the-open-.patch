@@ -1,0 +1,85 @@
+From 04db9422078e2d948a2c034ee266b8d4c18d178b Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 19:39:33 +0100
+Subject: [PATCH 17/20] synaptics_tudor: Add FP_TUDOR_OPEN_TRIM for the open
+ sequence A/B test (not for upstream)
+
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 42 +++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 3ed6dc82..50344b01 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1110,6 +1110,17 @@ static const TudorProbeStep probe_steps[] = {
+   { { TUDOR_CMD_GET_STARTINFO }, 1, 68 },
+ };
+ 
++/* Dev knob for the open sequence A/B test (not for upstream). FP_TUDOR_OPEN_TRIM
++ * 1 probes once instead of twice, 2 also only asks for the version, 3 also
++ * skips the database read, 4 also skips the frame state. */
++static guint
++tudor_open_trim (void)
++{
++  const gchar *v = g_getenv ("FP_TUDOR_OPEN_TRIM");
++
++  return v ? (guint) g_ascii_strtoull (v, NULL, 10) : 0;
++}
++
+ static void
+ open_step_done (FpiDeviceSynapticsTudor *self,
+                 FpiSsm                  *ssm)
+@@ -1307,16 +1318,25 @@ open_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case OPEN_PASS:
+-      if (self->probe_idx >= G_N_ELEMENTS (probe_steps))
++      if (self->probe_idx >= (tudor_open_trim () >= 2 ? 1 : G_N_ELEMENTS (probe_steps)))
+         {
+           self->probe_idx = 0;
+           /* Twice before pairing and once after */
+-          if (self->probe_pass++ == 0)
+-            fpi_ssm_jump_to_state (ssm, OPEN_PASS);
+-          else if (self->probe_pass == 2)
+-            open_use_pairing (self, ssm);
++          if (self->probe_pass == 0 && tudor_open_trim () < 1)
++            {
++              self->probe_pass++;
++              fpi_ssm_jump_to_state (ssm, OPEN_PASS);
++            }
++          else if (self->probe_pass < 2)
++            {
++              self->probe_pass = 2;
++              open_use_pairing (self, ssm);
++            }
+           else
+-            fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
++            {
++              self->probe_pass++;
++              fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
++            }
+         }
+       else
+         {
+@@ -1413,11 +1433,19 @@ open_run_state (FpiSsm   *ssm,
+               }
+             self->pairing_from_file = TRUE;
+           }
+-        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++        if (tudor_open_trim () >= 4)
++          fpi_ssm_next_state (ssm);
++        else
++          tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
+       }
+       break;
+ 
+     case OPEN_DB:
++      if (tudor_open_trim () >= 3)
++        {
++          fpi_ssm_jump_to_state (ssm, OPEN_DB_DONE);
++          return;
++        }
+       /* The vendor driver reads the database right after opening, list
+        * does the same */
+       self->prints = g_ptr_array_new_with_free_func (g_object_unref);

@@ -1,0 +1,103 @@
+From dc8136457cf7487326bc850a7d55bc707a6e70e1 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 19:42:11 +0100
+Subject: [PATCH 19/20] synaptics_tudor: Mark unused callback parameters
+
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 50344b01..4a1b950d 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1009,7 +1009,7 @@ list_run_state (FpiSsm   *ssm,
+ }
+ 
+ static void
+-list_done (FpiSsm   *ssm,
++list_done (FpiSsm   *ssm G_GNUC_UNUSED,
+            FpDevice *device,
+            GError   *error)
+ {
+@@ -1501,7 +1501,7 @@ static void
+ tudor_start_close (FpiDeviceSynapticsTudor *self);
+ 
+ static void
+-open_done (FpiSsm   *ssm,
++open_done (FpiSsm   *ssm G_GNUC_UNUSED,
+            FpDevice *device,
+            GError   *error)
+ {
+@@ -1600,7 +1600,7 @@ close_run_state (FpiSsm   *ssm,
+ }
+ 
+ static void
+-close_done (FpiSsm   *ssm,
++close_done (FpiSsm   *ssm G_GNUC_UNUSED,
+             FpDevice *device,
+             GError   *error)
+ {
+@@ -2007,7 +2007,7 @@ clean_run_state (FpiSsm   *ssm,
+ }
+ 
+ static void
+-clean_done (FpiSsm   *ssm,
++clean_done (FpiSsm   *ssm G_GNUC_UNUSED,
+             FpDevice *device,
+             GError   *error)
+ {
+@@ -2367,7 +2367,7 @@ enroll_finish (FpiDeviceSynapticsTudor *self,
+ }
+ 
+ static void
+-en_done (FpiSsm   *ssm,
++en_done (FpiSsm   *ssm G_GNUC_UNUSED,
+          FpDevice *device,
+          GError   *error)
+ {
+@@ -2522,7 +2522,7 @@ identify_finish (FpiDeviceSynapticsTudor *self,
+ }
+ 
+ static void
+-verify_done (FpiSsm   *ssm,
++verify_done (FpiSsm   *ssm G_GNUC_UNUSED,
+              FpDevice *device,
+              GError   *error)
+ {
+@@ -2534,7 +2534,7 @@ verify_done (FpiSsm   *ssm,
+ }
+ 
+ static void
+-identify_done (FpiSsm   *ssm,
++identify_done (FpiSsm   *ssm G_GNUC_UNUSED,
+                FpDevice *device,
+                GError   *error)
+ {
+@@ -2714,7 +2714,7 @@ del_run_state (FpiSsm   *ssm,
+ }
+ 
+ static void
+-del_done (FpiSsm   *ssm,
++del_done (FpiSsm   *ssm G_GNUC_UNUSED,
+           FpDevice *device,
+           GError   *error)
+ {
+@@ -2800,7 +2800,7 @@ clr_run_state (FpiSsm   *ssm,
+ }
+ 
+ static void
+-clr_done (FpiSsm   *ssm,
++clr_done (FpiSsm   *ssm G_GNUC_UNUSED,
+           FpDevice *device,
+           GError   *error)
+ {
+@@ -2823,7 +2823,7 @@ tudor_clear_storage (FpDevice *device)
+ /* Class */
+ 
+ static void
+-fpi_device_synaptics_tudor_init (FpiDeviceSynapticsTudor *self)
++fpi_device_synaptics_tudor_init (FpiDeviceSynapticsTudor *self G_GNUC_UNUSED)
+ {
+ }
+ 

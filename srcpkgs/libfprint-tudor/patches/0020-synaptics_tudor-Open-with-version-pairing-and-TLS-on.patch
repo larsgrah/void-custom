@@ -1,0 +1,334 @@
+From 2a31f36fa880c65e717f77a83cd715023eb7f53b Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:16:29 +0100
+Subject: [PATCH 20/20] synaptics_tudor: Open with version, pairing and TLS
+ only
+
+Owner session 2 showed enroll, verify and identify work without the
+second probe round, the iota/af/startinfo probes, the frame state read
+and the database read the vendor driver does around an open. Drop them
+and the FP_TUDOR_OPEN_TRIM test knob.
+---
+ PROTOCOL.md                               |  36 +++---
+ libfprint/drivers/synaptics_tudor/tudor.c | 131 ++++------------------
+ libfprint/drivers/synaptics_tudor/tudor.h |   4 -
+ 3 files changed, 39 insertions(+), 132 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 61ac1b11..8ef9dd21 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -71,12 +71,14 @@ Opcodes as seen on the wire. Names come from the vendor driver's own log
+ | 0x9e | DB2_GET_DB_INFO | `01` | 38 bytes payload, see below |
+ | 0x9f | DB2_GET_OBJECT_LIST | type u8, 3 zero bytes, parent id (16) | count u16, then ids (16 each) |
+ 
+-The driver also sends what the vendor driver sends around an open: 0x8e
+-IOTA_FIND (`8e <id u16> 02 00 + zeros`, ids 0x09 and 0x1a, 26 and 78 byte
+-replies), 0xaf (`af 01 00 00 00`, 10 byte reply, unknown), 0x19
+-GET_STARTINFO (68 byte reply), 0x82 FRAME_STATE_GET. Whether the session
+-needs them was never tried without, see "Open points". The capture and enroll
+-commands are below, the db2 ones in the table above and under "Storage".
++The Windows driver sends more around an open: two probe passes (version,
++IOTA_FIND ids 0x09 and 0x1a, 0xaf `af 01 00 00 00` with a 10 byte reply,
++GET_STARTINFO 0x19 with a 68 byte reply), FRAME_STATE_GET 0x82 after the
++handshake and a read of the whole database. The driver sends none of it,
++the open is GET_VERSION, the pairing (or the stored one) and the TLS
++handshake. Tried on hardware (owner session 2, part C): enroll, verify and
++identify work after that short open. The capture and enroll commands are
++below, the db2 ones in the table above and under "Storage".
+ 
+ ### Opcode names for the db2 commands
+ 
+@@ -202,10 +204,10 @@ Origin of the constants, as far as it can be shown. The label
+ `HS_KEY_PAIR_GEN` and both sensor public points are static data in the
+ vendor driver binary (synaWudfBioUsb132.dll 6.0.11.1132, the points at file
+ offsets 0x1355f3 and 0x1357f9). The 16 byte secret and the 18 byte seed are
+-NOT stored as a contiguous byte string in either vendor DLL, so they came
+-from the earlier reverse engineering notes (the python prototype) or from
+-observation at run time. The author has to state which before this goes
+-upstream, and that no vendor code was copied. Nothing here is a secret of
++NOT stored as a contiguous byte string in either vendor DLL. They were
++extracted from the vendor driver DLL by analysis (the open-source pydrv
++prototype loads that key from a PEM file that is not published). No vendor
++code is copied. Nothing here is a secret of
+ the sensor: the host signing key is what makes the sensor accept any host,
+ the same way for every VeriMark of this firmware. Only firmware 10.1 is
+ covered.
+@@ -415,8 +417,6 @@ or formats, request 0x15, or anything else.
+ ## Open points for the hardware test
+ 
+ - Does the sensor take a non-zero tail in the identity (user id string).
+-- Does the open need the IOTA, af and startinfo probes and the database
+-  read, or only version, pairing and TLS. Try without, then identify.
+ - Does cleanup change anything but the deleted counters.
+ - Duplicate check: the driver identifies once before the enroll (extra
+   touch, tested by tudor-owner-session2.sh part A). The vendor trace has
+@@ -436,12 +436,12 @@ or formats, request 0x15, or anything else.
+ - A 0x96 02 reply whose capture mask did not grow (cross-enroll.trace has
+   one, mask 3 twice) is a capture the sensor took without using. The driver
+   reports it as a retry, not a stage.
+-- Open sequence: FP_TUDOR_OPEN_TRIM=1..4 (dev knob) drops, cumulatively,
+-  the second probe pass, the iota/af/startinfo probes, the database read
+-  and the frame state. Open plus list works at all four levels with the
+-  kept pairing (read-only test). Identify and enroll after a trimmed open
+-  are part C of the second session. The vendor sequence stays until that
+-  passes.
++- Open sequence: trimmed to version, pairing and TLS, see above. The old
++  FP_TUDOR_OPEN_TRIM knob is gone.
++- Duplicate check and rejects, owner session 2: enrolling the left index
++  again was refused after the first touch and stored nothing. Odd touches
++  (tip, very light, edge) in an enroll gave no reject and no retry, the
++  sensor took them all.
+ - Is the user id offset in the object info reply right (the driver
+   refuses to delete unless the parent filter query agrees).
+ - What a rejected capture does in an enroll.
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 4a1b950d..943115dd 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -81,8 +81,6 @@ struct _FpiDeviceSynapticsTudor
+ 
+   /* Open */
+   guint           version_tries;
+-  guint           probe_idx;
+-  guint           probe_pass;
+   gboolean        pairing_from_file;
+   gboolean        session_end_tried;
+ 
+@@ -146,9 +144,6 @@ tudor_cmd_allowed (const guint8 *cmd,
+   switch (cmd[0])
+     {
+     case TUDOR_CMD_GET_VERSION:
+-    case TUDOR_CMD_GET_STARTINFO:
+-    case TUDOR_CMD_UNKNOWN_AF:
+-    case TUDOR_CMD_FRAME_STATE_GET:
+     case TUDOR_CMD_LED_EX2:
+     case TUDOR_CMD_TLS_DATA:
+     case TUDOR_CMD_FRAME_ACQ:
+@@ -161,9 +156,6 @@ tudor_cmd_allowed (const guint8 *cmd,
+     case TUDOR_CMD_IDENTIFY:
+       return TRUE;
+ 
+-    case TUDOR_CMD_IOTA_FIND:
+-      return len > 1 && (cmd[1] == 0x09 || cmd[1] == 0x1a);
+-
+     case TUDOR_CMD_ENROLL:
+       return len > 1 && cmd[1] >= TUDOR_ENROLL_BEGIN && cmd[1] <= TUDOR_ENROLL_END;
+ 
+@@ -1080,62 +1072,33 @@ tudor_print_get_id (FpPrint *print,
+ enum {
+   OPEN_PROBE_OUT,
+   OPEN_PROBE_IN,
+-  OPEN_PASS,
++  OPEN_VERSION,
+   OPEN_PAIR,
+   OPEN_TLS_STATE,
+   OPEN_TLS_HELLO,
+   OPEN_TLS_FLIGHT,
+   OPEN_TLS_CHECK,
+-  OPEN_FRAME_STATE,
+-  OPEN_DB,
+-  OPEN_DB_DONE,
++  OPEN_SESSION,
+   OPEN_NUM_STATES,
+ };
+ 
+-/* What the vendor driver asks before pairing and again after it, byte for
+- * byte. Only the version is used by this driver, the rest is there because
+- * the sensor might want it. */
+-typedef struct
+-{
+-  guint8 cmd[17];
+-  gsize  len;
+-  gsize  read_cap;
+-} TudorProbeStep;
+-
+-static const TudorProbeStep probe_steps[] = {
+-  { { TUDOR_CMD_GET_VERSION }, 1, TUDOR_VERSION_REPLY_SIZE },
+-  { { TUDOR_CMD_IOTA_FIND, 0x09, 0x00, 0x02 }, 17, 4096 },
+-  { { TUDOR_CMD_IOTA_FIND, 0x1a, 0x00, 0x02 }, 17, 4096 },
+-  { { TUDOR_CMD_UNKNOWN_AF, 0x01 }, 5, 10 },
+-  { { TUDOR_CMD_GET_STARTINFO }, 1, 68 },
+-};
++/* The vendor driver does more around an open: a second round of version
++ * and probe commands (iota find 0x09 and 0x1a, 0xaf, startinfo), a frame
++ * state read and a read of the whole template database. All of it proved
++ * unnecessary on hardware, so only the version, the pairing and the TLS
++ * session are left. */
+ 
+-/* Dev knob for the open sequence A/B test (not for upstream). FP_TUDOR_OPEN_TRIM
+- * 1 probes once instead of twice, 2 also only asks for the version, 3 also
+- * skips the database read, 4 also skips the frame state. */
+-static guint
+-tudor_open_trim (void)
+-{
+-  const gchar *v = g_getenv ("FP_TUDOR_OPEN_TRIM");
+-
+-  return v ? (guint) g_ascii_strtoull (v, NULL, 10) : 0;
+-}
++static void open_use_pairing (FpiDeviceSynapticsTudor *self,
++                              FpiSsm                  *ssm);
+ 
+ static void
+-open_step_done (FpiDeviceSynapticsTudor *self,
++open_version_done (FpiDeviceSynapticsTudor *self,
+                 FpiSsm                  *ssm)
+ {
+   /* Offsets are into the reply with the status bytes taken off */
+   const guint8 *v = self->reply->data;
+   TudorVersion *ver = &self->version;
+ 
+-  if (self->probe_idx != 0)
+-    {
+-      self->probe_idx++;
+-      fpi_ssm_jump_to_state (ssm, OPEN_PASS);
+-      return;
+-    }
+-
+   /* A session from before is still open on the sensor and answers the
+    * first command with its own alert, asking again gets a real reply */
+   if (self->stale_alert)
+@@ -1147,7 +1110,7 @@ open_step_done (FpiDeviceSynapticsTudor *self,
+           return;
+         }
+       fp_dbg ("stale tls alert from the sensor, asking again");
+-      fpi_ssm_jump_to_state (ssm, OPEN_PASS);
++      fpi_ssm_jump_to_state (ssm, OPEN_VERSION);
+       return;
+     }
+ 
+@@ -1169,8 +1132,7 @@ open_step_done (FpiDeviceSynapticsTudor *self,
+   fp_dbg ("sensor firmware %u.%u build %u product '%c' flags %02x %02x provision %u",
+           ver->fw_major, ver->fw_minor, ver->build, ver->product_id,
+           ver->flags1, ver->flags2, ver->provision_state);
+-  self->probe_idx++;
+-  fpi_ssm_jump_to_state (ssm, OPEN_PASS);
++  open_use_pairing (self, ssm);
+ }
+ 
+ static void
+@@ -1215,9 +1177,7 @@ open_pair_done (FpiDeviceSynapticsTudor *self,
+       return;
+     }
+   fp_dbg ("paired");
+-  self->probe_pass = 2;
+-  self->probe_idx = 0;
+-  fpi_ssm_jump_to_state (ssm, OPEN_PASS);
++  fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
+ }
+ 
+ /* With a stored pairing the sensor is not paired again, the session is
+@@ -1317,35 +1277,13 @@ open_run_state (FpiSsm   *ssm,
+       tudor_control (ssm, TRUE, TUDOR_REQ_PROBE_READ, 0, 1);
+       break;
+ 
+-    case OPEN_PASS:
+-      if (self->probe_idx >= (tudor_open_trim () >= 2 ? 1 : G_N_ELEMENTS (probe_steps)))
+-        {
+-          self->probe_idx = 0;
+-          /* Twice before pairing and once after */
+-          if (self->probe_pass == 0 && tudor_open_trim () < 1)
+-            {
+-              self->probe_pass++;
+-              fpi_ssm_jump_to_state (ssm, OPEN_PASS);
+-            }
+-          else if (self->probe_pass < 2)
+-            {
+-              self->probe_pass = 2;
+-              open_use_pairing (self, ssm);
+-            }
+-          else
+-            {
+-              self->probe_pass++;
+-              fpi_ssm_jump_to_state (ssm, OPEN_TLS_STATE);
+-            }
+-        }
+-      else
+-        {
+-          const TudorProbeStep *step = &probe_steps[self->probe_idx];
++    case OPEN_VERSION:
++      {
++        static const guint8 cmd[] = { TUDOR_CMD_GET_VERSION };
+ 
+-          tudor_send_cmd (self, ssm, step->cmd, step->len, step->read_cap,
+-                          self->probe_idx == 0 ? TUDOR_DECODE_CMD_ALLOW_ALERT : TUDOR_DECODE_CMD,
+-                          open_step_done);
+-        }
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), TUDOR_VERSION_REPLY_SIZE,
++                        TUDOR_DECODE_CMD_ALLOW_ALERT, open_version_done);
++      }
+       break;
+ 
+     case OPEN_PAIR:
+@@ -1411,10 +1349,8 @@ open_run_state (FpiSsm   *ssm,
+       tudor_control (ssm, TRUE, TUDOR_REQ_TLS_STATE, 0, 2);
+       break;
+ 
+-    case OPEN_FRAME_STATE:
++    case OPEN_SESSION:
+       {
+-        static const guint8 cmd[] = { TUDOR_CMD_FRAME_STATE_GET, 0, 0, 0, 0, 0, 0, 2, 7 };
+-
+         if (self->raw->len < 1 || self->raw->data[0] != 1)
+           {
+             fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+@@ -1433,33 +1369,10 @@ open_run_state (FpiSsm   *ssm,
+               }
+             self->pairing_from_file = TRUE;
+           }
+-        if (tudor_open_trim () >= 4)
+-          fpi_ssm_next_state (ssm);
+-        else
+-          tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD, NULL);
++        fpi_ssm_mark_completed (ssm);
+       }
+       break;
+ 
+-    case OPEN_DB:
+-      if (tudor_open_trim () >= 3)
+-        {
+-          fpi_ssm_jump_to_state (ssm, OPEN_DB_DONE);
+-          return;
+-        }
+-      /* The vendor driver reads the database right after opening, list
+-       * does the same */
+-      self->prints = g_ptr_array_new_with_free_func (g_object_unref);
+-      self->template_ids = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+-      self->list_full = FALSE;
+-      fpi_ssm_start_subsm (ssm, fpi_ssm_new (device, list_run_state, LIST_NUM_STATES));
+-      break;
+-
+-    case OPEN_DB_DONE:
+-      g_clear_pointer (&self->prints, g_ptr_array_unref);
+-      g_clear_pointer (&self->template_ids, g_ptr_array_unref);
+-      fpi_ssm_mark_completed (ssm);
+-      break;
+-
+     default:
+       g_assert_not_reached ();
+     }
+@@ -1540,8 +1453,6 @@ tudor_open (FpDevice *device)
+   self->raw = g_byte_array_new ();
+   self->reply = g_byte_array_new ();
+   self->version_tries = 0;
+-  self->probe_idx = 0;
+-  self->probe_pass = 0;
+   self->pairing_from_file = FALSE;
+   self->session_dead = FALSE;
+   self->session_end_tried = FALSE;
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.h b/libfprint/drivers/synaptics_tudor/tudor.h
+index 0c19a5fc..d651fcac 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.h
++++ b/libfprint/drivers/synaptics_tudor/tudor.h
+@@ -32,11 +32,7 @@
+ 
+ /* Commands the driver is allowed to send, see tudor_cmd_allowed() in tudor.c */
+ #define TUDOR_CMD_GET_VERSION     0x01
+-#define TUDOR_CMD_GET_STARTINFO   0x19
+ #define TUDOR_CMD_LED_EX2         0x39
+-#define TUDOR_CMD_FRAME_STATE_GET 0x82
+-#define TUDOR_CMD_IOTA_FIND       0x8e
+-#define TUDOR_CMD_UNKNOWN_AF      0xaf
+ #define TUDOR_CMD_TLS_DATA        0x44
+ #define TUDOR_CMD_PAIR            0x93
+ #define TUDOR_CMD_DB2_GET_DB_INFO 0x9e

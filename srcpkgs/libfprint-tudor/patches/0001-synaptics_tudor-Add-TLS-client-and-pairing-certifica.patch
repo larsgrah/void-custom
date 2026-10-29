@@ -1,7 +1,7 @@
 From 8832cf2d2368dc666a82b3d15fb3efc6123da744 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 15:25:45 +0100
-Subject: [PATCH 01/15] synaptics_tudor: Add TLS client and pairing
+Subject: [PATCH 01/20] synaptics_tudor: Add TLS client and pairing
  certificates
 
 The Tudor sensors speak a bent TLS 1.2 (ECDH-ECDSA with AES-256-GCM,

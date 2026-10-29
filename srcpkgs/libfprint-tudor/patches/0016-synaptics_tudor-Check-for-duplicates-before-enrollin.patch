@@ -1,0 +1,145 @@
+From 2d68a8db5c7bb5b733e8690dbf8cadeae0a0ed77 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 19:38:19 +0100
+Subject: [PATCH 16/20] synaptics_tudor: Check for duplicates before enrolling
+
+The sensor has no duplicate check of its own that shows in the vendor
+trace, so identify the finger once before the enroll starts and fail
+with DATA_DUPLICATE on a match. Also report an enroll capture that did
+not move the stage count as a retry instead of a passed stage.
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 74 +++++++++++++++++++++--
+ 1 file changed, 70 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index 3928c865..3ed6dc82 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -43,6 +43,9 @@
+ #define TUDOR_EVENT_FINGER_DOWN 1
+ #define TUDOR_EVENT_FINGER_UP   2
+ #define TUDOR_EVENT_FRAME       24
++/* The only reject signal in a frame event. The vendor driver turns it into
++ * reject detail 7 (poor quality) and nothing else, so there is no telling
++ * a short or off centre touch apart, hence RETRY_GENERAL. */
+ #define TUDOR_EVENT_REJECT      0x80000000
+ #define TUDOR_EVENT_SIZE        12
+ #define TUDOR_PIN_SHORT_MS      1000
+@@ -2017,6 +2020,8 @@ enum {
+   EN_SLOTS,
+   EN_RECLAIM,
+   EN_SLOTS_AGAIN,
++  EN_DUP_CAPTURE,
++  EN_DUP_PROCESS,
+   EN_BEGIN,
+   EN_CAPTURE,
+   EN_PROCESS,
+@@ -2102,7 +2107,7 @@ en_slots_done (FpiDeviceSynapticsTudor *self,
+     }
+ 
+   if (!tudor_db_full (&self->db_info))
+-    fpi_ssm_jump_to_state (ssm, EN_BEGIN);
++    fpi_ssm_jump_to_state (ssm, EN_DUP_CAPTURE);
+   else if (self->db_info.users_deleted + self->db_info.templates_deleted +
+            self->db_info.payloads_deleted > 0)
+     fpi_ssm_next_state (ssm);
+@@ -2149,16 +2154,28 @@ en_add_done (FpiDeviceSynapticsTudor *self,
+     stages += mask & 1;
+   fp_dbg ("enroll %u captures, %u percent%s", stages, tudor_get_u16le (r + 22), done ? ", done" : "");
+ 
+-  self->enroll_stages = stages;
+-  fpi_device_enroll_progress (device, MIN (stages, TUDOR_ENROLL_STAGES), NULL, NULL);
+-
+   if (done)
+     {
++      self->enroll_stages = stages;
++      fpi_device_enroll_progress (device, MIN (stages, TUDOR_ENROLL_STAGES), NULL, NULL);
+       memcpy (self->template_id, r, TUDOR_DB2_ID_SIZE);
+       fpi_ssm_next_state (ssm);
+       return;
+     }
+ 
++  /* The vendor trace has a capture the sensor took without moving on, so
++   * the count did not grow. Not a stage passed then. */
++  if (stages <= self->enroll_stages)
++    {
++      fpi_device_enroll_progress (device, MIN (self->enroll_stages, TUDOR_ENROLL_STAGES), NULL,
++                                  fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++    }
++  else
++    {
++      self->enroll_stages = stages;
++      fpi_device_enroll_progress (device, MIN (stages, TUDOR_ENROLL_STAGES), NULL, NULL);
++    }
++
+   /* The sensor should be done after TUDOR_ENROLL_STAGES, but not forever */
+   if (++self->enroll_captures >= 3 * TUDOR_ENROLL_STAGES)
+     {
+@@ -2169,6 +2186,29 @@ en_add_done (FpiDeviceSynapticsTudor *self,
+   fpi_ssm_jump_to_state (ssm, EN_CAPTURE);
+ }
+ 
++/* The sensor has no duplicate check of its own that we know of, the vendor
++ * trace sends nothing for it. So the finger is identified once before the
++ * enroll starts. */
++static void
++en_dup_done (FpiDeviceSynapticsTudor *self,
++             FpiSsm                  *ssm)
++{
++  if (self->status == TUDOR_STATUS_OK && self->reply->len >= TUDOR_DB2_ID_SIZE)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_DUPLICATE,
++                                                          "This finger is already enrolled"));
++      return;
++    }
++  if (self->status != TUDOR_STATUS_NO_MATCH)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Duplicate check failed with status 0x%04x",
++                                                          self->status));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
+ static void
+ en_run_state (FpiSsm   *ssm,
+               FpDevice *device)
+@@ -2191,6 +2231,31 @@ en_run_state (FpiSsm   *ssm,
+       tudor_send_db_info (self, ssm, en_slots_again_done);
+       break;
+ 
++    case EN_DUP_CAPTURE:
++      /* Nothing to be a duplicate of on an empty sensor */
++      if (self->db_info.templates_current == 0)
++        {
++          fpi_ssm_jump_to_state (ssm, EN_BEGIN);
++          return;
++        }
++      tudor_start_capture (self, ssm, 0x14);
++      break;
++
++    case EN_DUP_PROCESS:
++      {
++        static const guint8 cmd[13] = { TUDOR_CMD_IDENTIFY, 0x01 };
++
++        if (self->cap_rejected)
++          {
++            fpi_device_enroll_progress (device, 0, NULL, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++            fpi_ssm_jump_to_state (ssm, EN_DUP_CAPTURE);
++            return;
++          }
++        tudor_send_cmd (self, ssm, cmd, sizeof (cmd), 4096, TUDOR_DECODE_CMD_ANY_STATUS,
++                        en_dup_done);
++      }
++      break;
++
+     case EN_BEGIN:
+       {
+         static const guint8 cmd[13] = { TUDOR_CMD_ENROLL, TUDOR_ENROLL_BEGIN };
+@@ -2775,4 +2840,5 @@ fpi_device_synaptics_tudor_class_init (FpiDeviceSynapticsTudorClass *klass)
+   dev_class->clear_storage = tudor_clear_storage;
+ 
+   fpi_device_class_auto_initialize_features (dev_class);
++  dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
+ }
