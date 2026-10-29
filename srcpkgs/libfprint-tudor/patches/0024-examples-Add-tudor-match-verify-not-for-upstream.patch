@@ -1,0 +1,83 @@
+From 21512ad13ebab4955c5611b30f75cc0cb1e64714 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:40:48 +0100
+Subject: [PATCH 24/30] examples: Add tudor-match --verify (not for upstream)
+
+---
+ examples/tudor-match.c | 43 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/examples/tudor-match.c b/examples/tudor-match.c
+index 24246ce5..32085773 100644
+--- a/examples/tudor-match.c
++++ b/examples/tudor-match.c
+@@ -1,14 +1,16 @@
+ /*
+  * Identify against the prints listed from the sensor, for debugging a
+- * no-match. Run with G_MESSAGES_DEBUG=all. Not for upstream.
++ * no-match. With --verify NAME it verifies the listed print of that name
++ * instead. Run with G_MESSAGES_DEBUG=all. Not for upstream.
+  */
+ 
+ #include <stdio.h>
+ #include <libfprint/fprint.h>
+ 
+ int
+-main (void)
++main (int argc, char **argv)
+ {
++  const char *verify_name = NULL;
+   g_autoptr(FpContext) ctx = fp_context_new ();
+   g_autoptr(GError) error = NULL;
+   g_autoptr(GPtrArray) prints = NULL;
+@@ -16,6 +18,14 @@ main (void)
+   GPtrArray *devices;
+   FpDevice *dev;
+ 
++  if (argc == 3 && g_strcmp0 (argv[1], "--verify") == 0)
++    verify_name = argv[2];
++  else if (argc != 1)
++    {
++      fprintf (stderr, "usage: tudor-match [--verify NAME]\n");
++      return 2;
++    }
++
+   devices = fp_context_get_devices (ctx);
+   if (!devices || devices->len == 0)
+     return 1;
+@@ -36,6 +46,35 @@ main (void)
+   for (guint i = 0; i < prints->len; i++)
+     printf ("gallery: %s\n", fp_print_get_description (g_ptr_array_index (prints, i)));
+ 
++  if (verify_name)
++    {
++      FpPrint *target = NULL;
++      gboolean matched = FALSE;
++
++      for (guint i = 0; i < prints->len; i++)
++        {
++          FpPrint *print = g_ptr_array_index (prints, i);
++
++          if (g_strcmp0 (fp_print_get_description (print), verify_name) == 0)
++            target = print;
++        }
++      if (!target)
++        {
++          fprintf (stderr, "no print named %s on the sensor\n", verify_name);
++          fp_device_close_sync (dev, NULL, NULL);
++          return 1;
++        }
++
++      printf ("VERIFY: touch once\n");
++      fflush (stdout);
++      if (!fp_device_verify_sync (dev, target, NULL, NULL, NULL, &matched, NULL, &error))
++        printf ("verify error: %s\n", error->message);
++      else
++        printf ("verify result: %s\n", matched ? "match" : "no match");
++      fp_device_close_sync (dev, NULL, NULL);
++      return 0;
++    }
++
+   printf ("IDENTIFY: touch once\n");
+   fflush (stdout);
+   if (!fp_device_identify_sync (dev, prints, NULL, NULL, NULL, &match, NULL, &error))

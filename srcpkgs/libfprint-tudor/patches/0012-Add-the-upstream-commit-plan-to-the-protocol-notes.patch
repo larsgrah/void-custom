@@ -1,7 +1,7 @@
 From 94705adb89acf89b074915791b18540d053562d3 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 18:20:44 +0100
-Subject: [PATCH 12/22] Add the upstream commit plan to the protocol notes
+Subject: [PATCH 12/30] Add the upstream commit plan to the protocol notes
 
 ---
  PROTOCOL.md | 15 +++++++++++++++

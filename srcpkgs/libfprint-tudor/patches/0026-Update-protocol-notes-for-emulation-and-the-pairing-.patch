@@ -1,0 +1,43 @@
+From ebfa00be4e86c44acb7e6146a863d04db86e9ff5 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:42:55 +0100
+Subject: [PATCH 26/30] Update protocol notes for emulation and the pairing dir
+ (not for upstream)
+
+---
+ PROTOCOL.md | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index c874c153..fb3feebd 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -163,9 +163,11 @@ var is a development aid here), (c) derive the host key from the sensor id
+ and a built-in secret, which removes the file but makes the pairing public.
+ 
+ Emulation mode (FP_DEVICE_EMULATION, tests only): no pairing file is read
+-or written, all randomness comes from a fixed seed (tudor_tls_set_seed),
+-ECDSA uses RFC 6979 nonces, so a recording replays byte for byte. The
+-recording itself needs a sensor that is paired from scratch, see
++or written and the sensor is always paired again with a fixed, public test
++key. All randomness comes from a fixed seed (tudor_tls_set_seed), ECDSA uses
++RFC 6979 nonces, so a recording replays byte for byte. PAIR replaces
++whatever pairing the sensor had, so recording on a sensor in use orphans its
++templates and leaves it paired with the public key, see
+ tests/synaptics_tudor/README.md.
+ 
+ After the template list the Windows driver lists the payloads of a
+@@ -463,8 +465,11 @@ Other findings from the traces and logs:
+ 
+ ## Debug environment
+ 
+-`FP_TUDOR_PAIRING_DIR` moves the pairing directory. `FP_TUDOR_NEVER_REPAIR`
+-(dev branch only, not upstream) makes an open fail where it would pair the
++`FP_TUDOR_PAIRING_DIR` moves the pairing directory. On this branch it is
++read always, the owner's hardware test scripts depend on that. On
++`synaptics-tudor-upstream` only in emulation mode (option (b) above).
++
++`FP_TUDOR_NEVER_REPAIR` (dev branch only, not upstream) makes an open fail where it would pair the
+ sensor again, also when the sensor refuses the stored pairing, so a test
+ run can never orphan the enrolled templates.
+ 

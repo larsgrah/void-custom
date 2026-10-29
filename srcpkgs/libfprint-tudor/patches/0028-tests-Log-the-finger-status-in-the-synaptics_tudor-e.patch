@@ -1,0 +1,25 @@
+From d29362f7a9e717947eecfc25269bf1fcde1c60e4 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:50:48 +0100
+Subject: [PATCH 28/30] tests: Log the finger status in the synaptics_tudor
+ enroll progress
+
+---
+ tests/synaptics_tudor/custom.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/synaptics_tudor/custom.py b/tests/synaptics_tudor/custom.py
+index 568046d5..c9c3cd1e 100644
+--- a/tests/synaptics_tudor/custom.py
++++ b/tests/synaptics_tudor/custom.py
+@@ -49,7 +49,9 @@ template.set_finger(FINGER)
+ template.set_username('tudor-test')
+ 
+ def enroll_progress(*args):
+-    assert d.get_finger_status() & FPrint.FingerStatusFlags.NEEDED
++    # the finger can still be on the sensor when a stage reports, so the
++    # status is logged rather than asserted, like egismoc does
++    print('finger status: ', d.get_finger_status(), flush=True)
+     print('enroll progress: ' + str(args), flush=True)
+     if args[3] is not None:
+         say('That touch was refused, lift the finger and try again')

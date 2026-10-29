@@ -1,0 +1,47 @@
+From 13554fbbfc221af85fdfdbfcc94cffbb8147e1c7 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:40:48 +0100
+Subject: [PATCH 23/30] synaptics_tudor: Fix alignment, no warning for the test
+ pairing
+
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index a51d5756..e1073799 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -1101,7 +1101,7 @@ tudor_never_repair (void)
+ 
+ static void
+ open_version_done (FpiDeviceSynapticsTudor *self,
+-                FpiSsm                  *ssm)
++                   FpiSsm                  *ssm)
+ {
+   /* Offsets are into the reply with the status bytes taken off */
+   const guint8 *v = self->reply->data;
+@@ -1316,8 +1316,12 @@ open_run_state (FpiSsm   *ssm,
+             return;
+           }
+ 
+-        fp_warn ("pairing the sensor with a new host key, templates enrolled "
+-                 "under an earlier pairing will not match any more");
++        /* Tests run with fatal warnings and pair on purpose */
++        if (fpi_device_emulation_mode_enabled (device))
++          fp_dbg ("pairing the sensor with the test host key");
++        else
++          fp_warn ("pairing the sensor with a new host key, templates enrolled "
++                   "under an earlier pairing will not match any more");
+         g_clear_pointer (&self->host_key, EVP_PKEY_free);
+         self->host_key = tudor_cert_new_host_key (&error);
+         if (!self->host_key || !tudor_cert_make_host (self->host_key, cert, &error))
+@@ -2289,7 +2293,7 @@ enroll_finish (FpiDeviceSynapticsTudor *self,
+   user_id = fpi_print_generate_user_id (print);
+   fp_print_set_description (print, user_id);
+   fpi_device_enroll_complete (device, g_object_ref (tudor_print_new (print, self->template_id)),
+-                             NULL);
++                              NULL);
+ }
+ 
+ static void

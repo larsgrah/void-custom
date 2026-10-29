@@ -1,7 +1,7 @@
 From 2d68a8db5c7bb5b733e8690dbf8cadeae0a0ed77 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 19:38:19 +0100
-Subject: [PATCH 16/22] synaptics_tudor: Check for duplicates before enrolling
+Subject: [PATCH 16/30] synaptics_tudor: Check for duplicates before enrolling
 
 The sensor has no duplicate check of its own that shows in the vendor
 trace, so identify the finger once before the enroll starts and fail

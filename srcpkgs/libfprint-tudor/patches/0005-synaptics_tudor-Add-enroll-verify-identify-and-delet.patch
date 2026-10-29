@@ -1,7 +1,7 @@
 From b419730d992779726d2c4f4d775f50f88a8f1475 Mon Sep 17 00:00:00 2001
 From: Lars Grahmann <lars.grahmann@googlemail.com>
 Date: Thu, 29 Oct 2026 16:34:27 +0100
-Subject: [PATCH 05/22] synaptics_tudor: Add enroll, verify, identify and
+Subject: [PATCH 05/30] synaptics_tudor: Add enroll, verify, identify and
  delete
 
 Done from a trace of the vendor driver with a finger on the sensor.

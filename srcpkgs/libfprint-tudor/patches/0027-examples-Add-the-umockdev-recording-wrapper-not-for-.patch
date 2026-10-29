@@ -1,0 +1,315 @@
+From 4e86069928edb4650398c29eeef64dee1db9aa26 Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:42:55 +0100
+Subject: [PATCH 27/30] examples: Add the umockdev recording wrapper (not for
+ upstream)
+
+---
+ examples/tudor-record-umockdev.sh | 298 ++++++++++++++++++++++++++++++
+ 1 file changed, 298 insertions(+)
+ create mode 100755 examples/tudor-record-umockdev.sh
+
+diff --git a/examples/tudor-record-umockdev.sh b/examples/tudor-record-umockdev.sh
+new file mode 100755
+index 00000000..bb9e8d56
+--- /dev/null
++++ b/examples/tudor-record-umockdev.sh
+@@ -0,0 +1,298 @@
++#!/bin/bash
++# Records the umockdev test for the synaptics_tudor driver (not for upstream).
++# Run it from a terminal in the libfprint-tudor checkout after ninja -C build:
++#
++#   examples/tudor-record-umockdev.sh
++#
++# What happens:
++#   1. fprintd is stopped (dev mode), usbmon is loaded
++#   2. tests/create-driver-test.py runs tests/synaptics_tudor/custom.py as
++#      root, you follow the prompts: your RIGHT MIDDLE finger, 7 enroll
++#      touches, 1 duplicate check, 1 verify, 1 identify (10 touches)
++#   3. the system pairing and the dev copies are deleted. The recording pairs
++#      the sensor with the public test key, that pairing must never be used
++#      for real. fprintd pairs fresh with a random key on its next open.
++#   4. the replay test runs against the new recording
++#
++# After it: enroll your left index again in Settings, the old template does
++# not match under the new pairing. Then, optionally:
++#
++#   examples/tudor-record-umockdev.sh --crossverify
++#
++# which checks that a verify with the left index never matches a right middle
++# print (8 touches left index, 2 right middle, 8 more for the enroll).
++#
++# Logs go to ~/.cache/tudor-traces/umockdev/.
++set -u
++
++root=$(dirname "$(readlink -f "$0")")/..
++root=$(readlink -f "$root")
++build=$root/build
++ex=$build/examples
++testdir=$root/tests/synaptics_tudor
++devmode=/usr/local/libexec/velarium/tudor-devmode
++syspair=/var/lib/fprint/synaptics_tudor
++devpair=$HOME/.cache/tudor-pairing
++logdir=$HOME/.cache/tudor-traces/umockdev
++stamp=$(date +%Y%m%d-%H%M%S)
++mkdir -p "$logdir"
++
++mode=record
++case "${1:-}" in
++    "") ;;
++    --crossverify) mode=crossverify ;;
++    *) echo "usage: $0 [--crossverify]"; exit 2 ;;
++esac
++
++log=$logdir/$stamp-$mode.log
++say() { echo "$@" | tee -a "$log"; }
++ask() { # prompt
++    local a
++    read -r -p "$1 " a
++    echo "$1 $a" >> "$log"
++}
++ask_yes() { # prompt
++    local a
++    read -r -p "$1 [y/N] " a
++    [ "$a" = y ]
++}
++# the devmode helper has a sudo rule, everything else may ask for a password
++sudo_try() { sudo -n "$@" 2>/dev/null || sudo "$@"; }
++
++devmode_on=0
++dev_off() {
++    [ "$devmode_on" = 1 ] || return 0
++    devmode_on=0
++    sudo_try "$devmode" off 2>&1 | tee -a "$log"
++    say "fprintd has the sensor again"
++}
++
++[ -x "$ex/tudor-list" ] || { echo "build first: ninja -C build"; exit 1; }
++lsusb -d 047d:00f2 >/dev/null 2>&1 || { echo "the VeriMark (047d:00f2) is not plugged in"; exit 1; }
++
++##########################################################################
++# --crossverify: does a verify with the left index ever match a right
++# middle print? Needs the pairing fprintd made after the recording and the
++# left index enrolled in Settings.
++##########################################################################
++if [ "$mode" = crossverify ]; then
++    export FP_TUDOR_PAIRING_DIR=$devpair
++    # a run can never pair again, that would orphan the left index
++    export FP_TUDOR_NEVER_REPAIR=1
++    base=$logdir/$stamp-crossverify.baseline
++
++    names() { "$ex/tudor-list" 2>/dev/null | sed -n 's/^  //p' | sort; }
++    created() { names | grep -vxFf "$base"; }
++    delete_created() {
++        local n
++        for n in $(created); do
++            say "deleting $n, made by this run"
++            "$ex/tudor-delete" "$n" 2>&1 | tee -a "$log"
++        done
++    }
++    cleanup() {
++        [ -s "$base" ] && delete_created
++        dev_off
++    }
++    trap cleanup EXIT
++    trap 'exit 130' INT TERM
++
++    say "=== crossverify: needs the left index enrolled in Settings ==="
++    ask_yes "Is the left index enrolled in Settings (after the recording)?" || exit 1
++    sudo_try "$devmode" on 2>&1 | tee -a "$log"
++    devmode_on=1
++    if ! ls "$devpair"/*.pairing >/dev/null 2>&1; then
++        say "no pairing in $devpair, fprintd has not paired the sensor yet"
++        exit 1
++    fi
++
++    names > "$base"
++    if [ ! -s "$base" ]; then
++        say "the sensor lists nothing, enroll the left index first"
++        exit 1
++    fi
++    say "prints on the sensor at the start (never deleted):"
++    sed 's/^/  /' "$base" | tee -a "$log"
++
++    say
++    say ">>> ENROLL a temporary print with your RIGHT MIDDLE finger: one touch for"
++    say "    the duplicate check, then seven touches, lift between all of them."
++    ask "Press Enter to start."
++    "$ex/tudor-test" --keep --enroll-only 2>&1 | grep -vE 'DEBUG|^\(process' | tee -a "$log"
++    temp=$(created | head -n1)
++    if [ -z "$temp" ] || [ "$(created | wc -l)" != 1 ]; then
++        say "FAIL: expected exactly one new print, got: $(created | tr '\n' ' ')"
++        exit 1
++    fi
++    say "temporary print: $temp"
++
++    # one verify, retried when the sensor refused the touch. Only the result
++    # goes to stdout, the rest to the terminal.
++    verify_once() {
++        local tmp
++        tmp=$(mktemp)
++        for _ in 1 2 3; do
++            "$ex/tudor-match" --verify "$temp" 2>&1 | tee -a "$log" "$tmp" >&2
++            if grep -q "verify result: no match" "$tmp"; then
++                echo no-match; rm -f "$tmp"; return
++            elif grep -q "verify result: match" "$tmp"; then
++                echo match; rm -f "$tmp"; return
++            fi
++            echo "  no result, touch again" | tee -a "$log" >&2
++            : > "$tmp"
++        done
++        rm -f "$tmp"
++        echo error
++    }
++
++    bad=0
++    for n in 1 2 3 4 5 6 7 8; do
++        say ">>> VERIFY $n of 8: touch with your LEFT INDEX (must not match)"
++        r=$(verify_once)
++        say "  left index $n: $r"
++        [ "$r" = no-match ] || bad=$((bad + 1))
++    done
++    for n in 1 2; do
++        say ">>> VERIFY $n of 2: touch with your RIGHT MIDDLE (must match)"
++        r=$(verify_once)
++        say "  right middle $n: $r"
++        [ "$r" = match ] || bad=$((bad + 1))
++    done
++
++    if [ "$bad" = 0 ]; then
++        say "RESULT ok: the left index never matched, the right middle always did"
++    else
++        say "RESULT FAIL: $bad of 10 verifies went the wrong way, see $log"
++    fi
++    [ "$bad" = 0 ]
++    exit $?
++fi
++
++##########################################################################
++# record
++##########################################################################
++recorder=$build/tests/create-driver-test.py
++pairing_touched=0
++pairing_cleaned=0
++
++# Deletes the test pairing everywhere, then gives the sensor back. Runs once
++# after the recording and again from the trap if something got in the way.
++finish() {
++    if [ "$pairing_touched" = 1 ] && [ "$pairing_cleaned" = 0 ]; then
++        say
++        say "=== removing the test pairing ==="
++        if sudo_try sh -c "rm -f '$syspair'/*.pairing && ! ls '$syspair'/*.pairing >/dev/null 2>&1" &&
++            rm -f "$devpair"/*.pairing && ! ls "$devpair"/*.pairing >/dev/null 2>&1; then
++            pairing_cleaned=1
++            say "pairing files deleted, fprintd pairs fresh with a random key on its next open"
++        else
++            # devmode off would copy a leftover dev pairing back to the system
++            say "COULD NOT DELETE THE PAIRING FILES. Not giving the sensor back."
++            say "Delete $syspair/*.pairing (root) and $devpair/*.pairing by hand,"
++            say "then run: sudo $devmode off"
++            devmode_on=0
++            return 1
++        fi
++    fi
++    dev_off
++}
++trap finish EXIT
++trap 'exit 130' INT TERM
++
++cat <<EOF | tee -a "$log"
++=== synaptics_tudor umockdev recording ===
++- fprintd is stopped meanwhile, sudo, polkit and the lock use the password
++- the sensor is paired with the PUBLIC TEST KEY, your left index template
++  stops matching (it is deleted by the test). Afterwards the pairing files are
++  deleted and fprintd pairs fresh. Enroll the left index again in Settings.
++- you need: your RIGHT MIDDLE finger, 10 touches (7 enroll, 1 duplicate
++  check, 1 verify, 1 identify), the script says when to touch
++EOF
++if [ -e "$testdir/custom.pcapng" ]; then
++    echo "NOTE: $testdir/custom.pcapng exists and is replaced (a copy goes to $logdir)"
++fi
++ask_yes "Go on?" || exit 1
++
++if ! command -v tshark >/dev/null || ! command -v umockdev-record >/dev/null; then
++    say "tshark and umockdev-record are needed"
++    exit 1
++fi
++
++say
++say "=== dev mode ==="
++sudo_try "$devmode" on 2>&1 | tee -a "$log"
++devmode_on=1
++sudo -v || exit 1
++
++say
++say "=== usbmon ==="
++lsmod | grep -q '^usbmon' || sudo modprobe usbmon || exit 1
++if ! sudo tshark -D 2>/dev/null | grep -q usbmon; then
++    say "tshark sees no usbmon interface"
++    exit 1
++fi
++say "usbmon is loaded"
++
++# Without introspection meson does not make the recorder, so make it from the
++# template. The typelib comes from the installed libfprint, the library from
++# the build tree.
++if [ ! -x "$recorder" ]; then
++    sed -e "s|@BUILDDIR@|$build|" -e "s|@SRCDIR@|$root|" \
++        "$root/tests/create-driver-test.py.in" > "$recorder"
++    chmod +x "$recorder"
++fi
++for f in custom.pcapng device; do
++    [ -e "$testdir/$f" ] && cp -p "$testdir/$f" "$logdir/$stamp-prev-$f"
++done
++
++say
++say "=== recording ==="
++say "Touch only when the prompts say so. The sensor is reset first, give it a moment."
++ask "Press Enter, then keep your RIGHT MIDDLE finger ready."
++# tee ignores ctrl-c so the marker below survives it
++sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin "$recorder" --test custom synaptics_tudor 2>&1 | tee -i -a "$log"
++rc=${PIPESTATUS[0]}
++# custom.py opens the sensor right after this line, which pairs it
++grep -q "Running the custom fingerprint capture" "$log" && pairing_touched=1
++sudo chown -R "$(id -u):$(id -g)" "$testdir"
++
++if [ "$rc" != 0 ]; then
++    say "the recording FAILED (exit $rc)"
++    if [ "$pairing_touched" = 1 ]; then
++        # the test may have left a print behind, every template on the sensor
++        # is orphaned by the test pairing anyway
++        say "clearing what the test left on the sensor"
++        sudo env FP_DEVICE_EMULATION=1 FP_DRIVERS_ALLOWLIST=synaptics_tudor \
++            LD_LIBRARY_PATH="$build/libfprint" "$ex/clear-storage" 2>&1 | tee -a "$log"
++    fi
++fi
++
++finish
++fin=$?
++[ "$rc" = 0 ] || exit 1
++[ "$fin" = 0 ] || exit 1
++
++say
++say "=== replay test ==="
++# what meson test does for the driver tests. Without introspection there is no
++# meson test, the typelib comes from the installed libfprint.
++if env G_DEBUG=fatal-warnings G_MESSAGES_DEBUG=all NO_AT_BRIDGE=1 \
++    LD_LIBRARY_PATH="$build/libfprint" GI_TYPELIB_PATH="$build/libfprint" \
++    FP_DEVICE_EMULATION=1 FP_DRIVERS_ALLOWLIST=synaptics_tudor \
++    python3 "$root/tests/umockdev-test.py" "$testdir" --test custom > "$logdir/$stamp-replay.log" 2>&1; then
++    say "REPLAY PASS (log: $logdir/$stamp-replay.log)"
++    result=0
++else
++    say "REPLAY FAIL (log: $logdir/$stamp-replay.log)"
++    tail -n 15 "$logdir/$stamp-replay.log" | tee -a "$log"
++    result=1
++fi
++
++cat <<EOF | tee -a "$log"
++
++Next:
++- enroll your left index again in Settings (the old template is orphaned)
++- optional: $0 --crossverify
++- anonymize the serial in $testdir/device, then commit device and custom.pcapng
++EOF
++exit $result

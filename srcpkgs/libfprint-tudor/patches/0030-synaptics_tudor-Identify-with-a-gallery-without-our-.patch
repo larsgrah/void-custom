@@ -1,0 +1,43 @@
+From c01e294c6d0b861173a8e870c39c637645d6619b Mon Sep 17 00:00:00 2001
+From: Lars Grahmann <lars.grahmann@googlemail.com>
+Date: Thu, 29 Oct 2026 22:56:30 +0100
+Subject: [PATCH 30/30] synaptics_tudor: Identify with a gallery without our
+ prints ends in no match
+
+fprintd identifies against every stored print before an enroll to catch
+duplicates. With nothing enrolled yet the gallery is empty, and failing
+that with DATA_INVALID aborted every first enroll.
+---
+ libfprint/drivers/synaptics_tudor/tudor.c | 19 +++----------------
+ 1 file changed, 3 insertions(+), 16 deletions(-)
+
+diff --git a/libfprint/drivers/synaptics_tudor/tudor.c b/libfprint/drivers/synaptics_tudor/tudor.c
+index e1073799..e6b83004 100644
+--- a/libfprint/drivers/synaptics_tudor/tudor.c
++++ b/libfprint/drivers/synaptics_tudor/tudor.c
+@@ -2494,22 +2494,9 @@ tudor_verify (FpDevice *device)
+ static void
+ tudor_identify (FpDevice *device)
+ {
+-  GPtrArray *gallery = NULL;
+-  gboolean valid = FALSE;
+-
+-  fpi_device_get_identify_data (device, &gallery);
+-  for (guint i = 0; i < gallery->len && !valid; i++)
+-    {
+-      guint8 id[TUDOR_DB2_ID_SIZE];
+-
+-      valid = tudor_print_get_id (g_ptr_array_index (gallery, i), id);
+-    }
+-  if (!valid)
+-    {
+-      fpi_device_identify_complete (device, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+-                                                                      "No print in the gallery has a template id"));
+-      return;
+-    }
++  /* An empty gallery, or one without any of our prints, still gets a capture
++   * and simply ends in no match. fprintd runs exactly that before an enroll
++   * to look for duplicates, an error here would abort the enroll */
+   fpi_ssm_start (fpi_ssm_new (device, id_run_state, ID_NUM_STATES), identify_done);
+ }
+ 
