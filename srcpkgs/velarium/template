@@ -1,9 +1,11 @@
 # Template file for 'velarium'
 pkgname=velarium
 version=0.1.0
-revision=2
-_commit=4af4ba2977a9d0da78d2aeaccd0defcdf17eed5f
-hostmakedepends="zig-bin"
+revision=4
+_commit=e3c0b94a8736695ef58e91ad38627411a09138e9
+hostmakedepends="zig-bin cmake ninja qt6-base qt6-declarative-host-tools"
+# kino's Velarium.Mpv, a cmake subproject in mpv/
+makedepends="qt6-declarative-devel mpvqt-devel"
 # the pyicloud scripts point at a venv in ~, the package gets system python
 python_version=3
 # the shell's qml imports, what the bar, overlay and session start call, and
@@ -14,7 +16,7 @@ depends="quickshell hyprland xdg-desktop-portal-hyprland xdg-desktop-portal
  qt6-websockets python3 python3-numpy python3-Pillow python3-dbus
  python3-gobject bash iproute2 calcurse jq grim slurp wf-recorder wl-clipboard pipewire wireplumber
  pulseaudio-utils playerctl libnotify xdg-utils polkit dbus foot
- nerd-fonts-ttf font-inter noto-fonts-emoji"
+ nerd-fonts-ttf font-inter noto-fonts-emoji yt-dlp"
 short_desc="Velarium desktop shell for Hyprland, on Quickshell"
 maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
 license="custom:private"
@@ -23,7 +25,7 @@ homepage="https://git.grahmann.family/lars/velarium"
 #   git -C ~/code/private/velarium archive --format=tar.gz --prefix=velarium/ \
 #     -o hostdir/sources/velarium-${version}/velarium-${_commit}.tar.gz ${_commit}
 distfiles="https://git.grahmann.family/lars/velarium/archive/${_commit}.tar.gz>velarium-${_commit}.tar.gz"
-checksum=fb476d19a9ac1d58d27f16eea757741fea59518a77e6dc20854d5252ac3ae628
+checksum=8f347be05e9f0fef5a6c0784d6ee4e888aced4d3e8b44b319066b2fad3a043fe
 archs="x86_64"
 create_wrksrc=yes
 build_wrksrc=velarium
@@ -32,9 +34,12 @@ nostrip=yes
 do_build() {
 	export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
 	zig build -Drelease
+	cmake -S mpv -B mpv/build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
+	cmake --build mpv/build
 }
 
 do_install() {
 	export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
 	zig build install -Drelease --prefix "${DESTDIR}/usr"
+	DESTDIR="${DESTDIR}" cmake --install mpv/build
 }

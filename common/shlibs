@@ -2380,6 +2380,7 @@ librrd_th.so.4 rrdtool-1.4.9_1
 libmosquitto.so.1 libmosquitto-1.6.3_5
 libmosquittopp.so.1 libmosquittopp-1.6.3_5
 libmpv.so.2 mpv-0.35.0_1
+libMpvQt.so.4 mpvqt-1.2.1_1
 libmbedtls.so.21 mbedtls-3.6.0_1
 libmbedcrypto.so.16 mbedtls-3.6.0_1
 libmbedx509.so.7 mbedtls-3.6.0_1
