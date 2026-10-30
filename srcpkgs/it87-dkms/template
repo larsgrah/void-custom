@@ -1,0 +1,24 @@
+# Template file for 'it87-dkms'
+pkgname=it87-dkms
+version=20261002
+revision=1
+_commit=bd7a566c8a60fe0308d67e26761e16260368191a
+depends="dkms"
+short_desc="Out-of-tree it87 hwmon driver with IT8688E support (dkms)"
+maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
+license="GPL-2.0-or-later"
+homepage="https://github.com/frankcrawford/it87"
+distfiles="https://github.com/frankcrawford/it87/archive/${_commit}.tar.gz"
+checksum=41be5663d46dd79e2697c342987fb80c4a83cc9bd7dc441021c872ea21192ef9
+dkms_modules="it87 ${version}"
+
+do_install() {
+	vsed -i dkms.conf -e "s/#MODULE_VERSION#/${version}/"
+	echo "${_commit:0:7}" > VERSION
+	vmkdir usr/src/it87-${version}
+	for f in Makefile compat.h it87.c dkms.conf VERSION; do
+		vcopy $f usr/src/it87-${version}
+	done
+	vmkdir usr/lib/modules-load.d
+	echo it87 > ${DESTDIR}/usr/lib/modules-load.d/it87.conf
+}
