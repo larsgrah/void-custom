@@ -1,0 +1,24 @@
+# Template file for 'jdtls'
+pkgname=jdtls
+version=1.63.0
+revision=1
+_stamp=202610191322
+depends="python3 openjdk21-jre"
+short_desc="Eclipse JDT language server for Java"
+maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
+license="EPL-2.0"
+homepage="https://github.com/eclipse-jdtls/eclipse.jdt.ls"
+distfiles="https://download.eclipse.org/jdtls/milestones/${version}/jdt-language-server-${version}-${_stamp}.tar.gz"
+checksum=b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4
+create_wrksrc=yes
+noarch=yes
+
+do_install() {
+	vmkdir usr/lib/jdtls
+	vcopy bin usr/lib/jdtls
+	vcopy features usr/lib/jdtls
+	vcopy plugins usr/lib/jdtls
+	vcopy config_linux usr/lib/jdtls
+	vmkdir usr/bin
+	ln -s /usr/lib/jdtls/bin/jdtls ${DESTDIR}/usr/bin/jdtls
+}
