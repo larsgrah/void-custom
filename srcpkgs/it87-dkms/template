@@ -1,7 +1,7 @@
 # Template file for 'it87-dkms'
 pkgname=it87-dkms
 version=20261002
-revision=1
+revision=2
 _commit=bd7a566c8a60fe0308d67e26761e16260368191a
 depends="dkms"
 short_desc="Out-of-tree it87 hwmon driver with IT8688E support (dkms)"
@@ -11,6 +11,7 @@ homepage="https://github.com/frankcrawford/it87"
 distfiles="https://github.com/frankcrawford/it87/archive/${_commit}.tar.gz"
 checksum=41be5663d46dd79e2697c342987fb80c4a83cc9bd7dc441021c872ea21192ef9
 dkms_modules="it87 ${version}"
+conf_files="/etc/sensors.d/gigabyte-it87-amd.conf"
 
 do_install() {
 	vsed -i dkms.conf -e "s/#MODULE_VERSION#/${version}/"
@@ -21,4 +22,5 @@ do_install() {
 	done
 	vmkdir usr/lib/modules-load.d
 	echo it87 > ${DESTDIR}/usr/lib/modules-load.d/it87.conf
+	vinstall "Sensors configs/Gigabyte/configs/gigabyte-it87-amd.conf" 644 etc/sensors.d
 }
