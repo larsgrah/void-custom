@@ -1,8 +1,8 @@
 # Template file for 'velarium'
 pkgname=velarium
 version=0.1.0
-revision=4
-_commit=e3c0b94a8736695ef58e91ad38627411a09138e9
+revision=5
+_commit=b5c208f484d3c3f850afb85bb43c8af2bfcd0eca
 hostmakedepends="zig-bin cmake ninja qt6-base qt6-declarative-host-tools"
 # kino's Velarium.Mpv, a cmake subproject in mpv/
 makedepends="qt6-declarative-devel mpvqt-devel"
@@ -25,7 +25,7 @@ homepage="https://git.grahmann.family/lars/velarium"
 #   git -C ~/code/private/velarium archive --format=tar.gz --prefix=velarium/ \
 #     -o hostdir/sources/velarium-${version}/velarium-${_commit}.tar.gz ${_commit}
 distfiles="https://git.grahmann.family/lars/velarium/archive/${_commit}.tar.gz>velarium-${_commit}.tar.gz"
-checksum=8f347be05e9f0fef5a6c0784d6ee4e888aced4d3e8b44b319066b2fad3a043fe
+checksum=b436618d732bed55b5d6fba67b48588858110081238e0fbea88abb8b7165bcb5
 archs="x86_64"
 create_wrksrc=yes
 build_wrksrc=velarium
