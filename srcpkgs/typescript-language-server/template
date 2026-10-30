@@ -1,0 +1,33 @@
+# Template file for 'typescript-language-server'
+pkgname=typescript-language-server
+version=6.0.2
+revision=2
+# TS 7 is the native port and ships no tsserver, stay on 6
+_tsver=6.0.3
+hostmakedepends="nodejs"
+depends="nodejs"
+short_desc="Language server for TypeScript and JavaScript, bundled tsserver"
+maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
+license="Apache-2.0"
+homepage="https://github.com/typescript-language-server/typescript-language-server"
+distfiles="https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-${version}.tgz
+ https://registry.npmjs.org/typescript/-/typescript-${_tsver}.tgz"
+checksum="d225b223a8a4764ecbd94bdba85d2ef185eaa7b9842a1a31c38c2bbe7f2fe9b9
+ 33cd0ee1beaa8c9e9d15a9da836c62ddea4c34a42d7c2d349dbc80d94165d22a"
+skip_extraction="typescript-language-server-${version}.tgz typescript-${_tsver}.tgz"
+create_wrksrc=yes
+noarch=yes
+
+do_install() {
+	local dest=${DESTDIR}/usr/lib/typescript-language-server
+	vmkdir usr/lib/typescript-language-server/node_modules/typescript
+	vmkdir usr/lib/typescript-language-server/node_modules/typescript-language-server
+	bsdtar -xf ${XBPS_SRCDISTDIR}/${pkgname}-${version}/typescript-language-server-${version}.tgz \
+		-C ${dest}/node_modules/typescript-language-server --strip-components 1
+	bsdtar -xf ${XBPS_SRCDISTDIR}/${pkgname}-${version}/typescript-${_tsver}.tgz \
+		-C ${dest}/node_modules/typescript --strip-components 1
+	chmod 755 ${dest}/node_modules/typescript-language-server/lib/cli.mjs
+	vmkdir usr/bin
+	ln -s /usr/lib/typescript-language-server/node_modules/typescript-language-server/lib/cli.mjs \
+		${DESTDIR}/usr/bin/typescript-language-server
+}
