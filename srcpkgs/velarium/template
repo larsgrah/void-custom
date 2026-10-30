@@ -1,0 +1,40 @@
+# Template file for 'velarium'
+pkgname=velarium
+version=0.1.0
+revision=2
+_commit=4af4ba2977a9d0da78d2aeaccd0defcdf17eed5f
+hostmakedepends="zig-bin"
+# the pyicloud scripts point at a venv in ~, the package gets system python
+python_version=3
+# the shell's qml imports, what the bar, overlay and session start call, and
+# the fonts Theme.qml names. chats, kino, meeting and the icloud bits pull
+# in more, they stay off until a machine opts in
+depends="quickshell hyprland xdg-desktop-portal-hyprland xdg-desktop-portal
+ qt6-declarative qt6-wayland qt6-svg qt6-imageformats qt6-multimedia
+ qt6-websockets python3 python3-numpy python3-Pillow python3-dbus
+ python3-gobject bash iproute2 calcurse jq grim slurp wf-recorder wl-clipboard pipewire wireplumber
+ pulseaudio-utils playerctl libnotify xdg-utils polkit dbus foot
+ nerd-fonts-ttf font-inter noto-fonts-emoji"
+short_desc="Velarium desktop shell for Hyprland, on Quickshell"
+maintainer="Lars Grahmann <lars.grahmann@googlemail.com>"
+license="custom:private"
+homepage="https://git.grahmann.family/lars/velarium"
+# private repo, the chroot can't fetch it. Drop the archive in place first:
+#   git -C ~/code/private/velarium archive --format=tar.gz --prefix=velarium/ \
+#     -o hostdir/sources/velarium-${version}/velarium-${_commit}.tar.gz ${_commit}
+distfiles="https://git.grahmann.family/lars/velarium/archive/${_commit}.tar.gz>velarium-${_commit}.tar.gz"
+checksum=fb476d19a9ac1d58d27f16eea757741fea59518a77e6dc20854d5252ac3ae628
+archs="x86_64"
+create_wrksrc=yes
+build_wrksrc=velarium
+nostrip=yes
+
+do_build() {
+	export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
+	zig build -Drelease
+}
+
+do_install() {
+	export ZIG_GLOBAL_CACHE_DIR="${wrksrc}/.zig-cache"
+	zig build install -Drelease --prefix "${DESTDIR}/usr"
+}
